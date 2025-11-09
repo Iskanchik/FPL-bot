@@ -1,21 +1,17 @@
 import requests
-import asyncio
+import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from flask import Flask, request
+from flask import Flask
 from threading import Thread
 import os
-import json
 
 # Настройки
 BOT_TOKEN = "8340413924:AAHpWBHdQxpiyuQIRvzafb-qe2CYLY491IY"
 LEAGUE_ID = 980121
 
-# Flask приложение
+# Flask приложение для Render (чтобы не засыпал)
 app = Flask(__name__)
-
-# Глобальная переменная для приложения
-telegram_app = None
 
 @app.route('/')
 def home():
@@ -25,20 +21,26 @@ def home():
 def health():
     return {"status": "healthy", "bot": "running"}
 
-@app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
-def webhook():
-    """Handle incoming updates via webhook"""
+def run_flask():
+    """Запуск Flask в отдельном потоке"""
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+def clear_webhook():
+    """Принудительно очищаем webhook"""
     try:
-        if telegram_app:
-            update_data = request.get_json()
-            if update_data:
-                update = Update.de_json(update_data, telegram_app.bot)
-                # Запускаем обработку в новом event loop
-                asyncio.create_task(telegram_app.process_update(update))
-        return 'OK'
+        delete_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        response = requests.post(delete_url)
+        print(f"Webhook deleted: {response.json()}")
+        
+        # Дополнительно очищаем pending updates
+        get_updates_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        params = {'offset': -1, 'limit': 1}
+        response = requests.get(get_updates_url, params=params)
+        print(f"Pending updates cleared: {response.json()}")
+        
     except Exception as e:
-        print(f"Webhook error: {e}")
-        return 'ERROR', 500
+        print(f"Error clearing webhook: {e}")
 
 # FPL API функции
 def get_current_gameweek():
@@ -260,59 +262,55 @@ The bot will show all players organized by their real Premier League teams with 
     """
     await update.message.reply_text(welcome_text)
 
-def setup_webhook(app_url):
-    """Setup webhook for the bot"""
-    webhook_url = f"{app_url}/webhook/{BOT_TOKEN}"
-    
-    # Удаляем webhook
-    delete_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-    requests.post(delete_url)
-    
-    # Устанавливаем новый webhook
-    set_webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    response = requests.post(set_webhook_url, json={'url': webhook_url})
-    
-    print(f"Webhook setup response: {response.json()}")
-
-def run_bot():
-    """Запуск бота в отдельном потоке"""
-    global telegram_app
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    
-    telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("points", points_command))
-    telegram_app.add_handler(CommandHandler("debug", debug_command))
-    
-    print("Bot handlers added")
-
 def main():
     """Start the bot"""
-    print("Starting FPL Bot with webhook...")
+    print("Starting FPL Bot...")
     
-    # Запускаем настройку бота в отдельном потоке
-    bot_thread = Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
+    # Принудительно очищаем webhook
+    clear_webhook()
+    time.sleep(2)  # Ждем немного
     
-    # Получаем URL приложения
-    app_url = os.environ.get('RENDER_EXTERNAL_URL')
-    if not app_url:
-        # Fallback для получения URL
-        service_name = os.environ.get('RENDER_SERVICE_NAME', 'fpl-bot')
-        app_url = f"https://{service_name}.onrender.com"
+    # Запускаем Flask в отдельном потоке
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    print("Flask server started")
     
-    # Настраиваем webhook
-    setup_webhook(app_url)
-    
-    print(f"Webhook set to: {app_url}/webhook/{BOT_TOKEN}")
-    
-    # Запускаем Flask
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Запускаем Telegram бота
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"Bot start attempt {attempt + 1}/{max_retries}")
+            
+            application = Application.builder().token(BOT_TOKEN).build()
+            
+            application.add_handler(CommandHandler("start", start_command))
+            application.add_handler(CommandHandler("points", points_command))
+            application.add_handler(CommandHandler("debug", debug_command))
+            
+            print("Bot handlers added")
+            print("Starting polling...")
+            
+            # Запускаем с дополнительными параметрами
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                timeout=20,
+                pool_timeout=20,
+                connect_timeout=20,
+                read_timeout=20,
+                write_timeout=20
+            )
+            break  # Если успешно запустился, выходим из цикла
+            
+        except Exception as e:
+            print(f"Error starting bot (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                print("Retrying in 5 seconds...")
+                time.sleep(5)
+                clear_webhook()  # Очищаем webhook перед повторной попыткой
+            else:
+                print("Failed to start bot after all attempts")
 
 if __name__ == '__main__':
     main()
