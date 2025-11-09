@@ -7,10 +7,16 @@ from threading import Thread
 import os
 import json
 import asyncio
+import signal
+import sys
 
 # Настройки
 BOT_TOKEN = "8554755843:AAFpoM3sRxuvgSutlQLrObjquNt2xdJAT9k"
 LEAGUE_ID = 980121
+
+# Глобальная переменная для контроля работы бота
+bot_running = True
+application = None
 
 # Flask приложение для Render (чтобы не засыпал)
 app = Flask(__name__)
@@ -28,40 +34,50 @@ def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-async def aggressive_clear_bot():
-    """Агрессивная очистка всех подключений бота"""
+async def force_clear_webhook_and_updates():
+    """Принудительная очистка webhook и pending updates"""
     try:
-        print("🔥 Starting aggressive bot cleanup...")
+        print("🧹 Force clearing webhook and updates...")
         
-        # 1. Удаляем webhook
-        delete_webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        response = requests.post(delete_webhook_url, json={'drop_pending_updates': True}, timeout=10)
-        print(f"Webhook delete response: {response.json()}")
+        # Удаляем webhook с принудительной очисткой
+        webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        response = requests.post(webhook_url, json={'drop_pending_updates': True}, timeout=15)
+        print(f"Webhook deletion: {response.json()}")
         
-        # 2. Получаем и очищаем все pending updates
-        for i in range(3):  # Уменьшаем количество попыток
-            get_updates_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-            params = {'offset': -1, 'limit': 100, 'timeout': 1}
-            response = requests.get(get_updates_url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('ok') and data.get('result'):
-                    print(f"Cleared {len(data['result'])} pending updates (attempt {i+1})")
-                    if len(data['result']) == 0:
-                        break
+        await asyncio.sleep(2)
+        
+        # Очищаем все pending updates агрессивно
+        for attempt in range(3):
+            try:
+                updates_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+                params = {
+                    'offset': -1,
+                    'limit': 100,
+                    'timeout': 1
+                }
+                
+                response = requests.get(updates_url, params=params, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('ok'):
+                        updates_count = len(data.get('result', []))
+                        print(f"Cleared {updates_count} updates (attempt {attempt + 1})")
+                        if updates_count == 0:
+                            break
+                    else:
+                        print(f"API error: {data}")
                 else:
-                    print(f"No pending updates (attempt {i+1})")
-                    break
-            else:
-                print(f"Error getting updates: {response.status_code}")
+                    print(f"HTTP error {response.status_code}: {response.text}")
+                    
+            except Exception as e:
+                print(f"Error clearing updates (attempt {attempt + 1}): {e}")
             
-            await asyncio.sleep(2)  # Используем asyncio.sleep
+            await asyncio.sleep(2)
         
-        print("✅ Bot cleanup completed")
+        print("✅ Webhook and updates cleared")
         
     except Exception as e:
-        print(f"Error during bot cleanup: {e}")
+        print(f"Error during cleanup: {e}")
 
 def make_fpl_request(url, max_retries=3):
     """Делает запрос к FPL API с повторными попытками"""
@@ -76,39 +92,26 @@ def make_fpl_request(url, max_retries=3):
     
     for attempt in range(max_retries):
         try:
-            print(f"Making request to {url} (attempt {attempt + 1})")
-            
-            # Увеличиваем задержку между попытками
             if attempt > 0:
-                wait_time = min(30, 10 * (2 ** attempt))  # Экспоненциальная задержка, максимум 30 сек
-                print(f"Waiting {wait_time} seconds before retry...")
+                wait_time = min(30, 10 * (2 ** attempt))
                 time.sleep(wait_time)
             
             response = requests.get(url, headers=headers, timeout=30)
-            
-            print(f"Response status: {response.status_code}")
-            print(f"Response headers: {dict(response.headers)}")
             
             if response.status_code == 200:
                 if response.text.strip():
                     try:
                         data = response.json()
-                        print(f"Successfully parsed JSON data")
                         return data
                     except json.JSONDecodeError as e:
                         print(f"JSON decode error: {e}")
-                        print(f"Response text: {response.text[:200]}...")
                 else:
                     print("Empty response body")
             elif response.status_code == 403:
-                print(f"HTTP 403 Forbidden - possible rate limiting or IP block")
                 if attempt < max_retries - 1:
-                    wait_time = 60  # Ждем минуту при 403
-                    print(f"Waiting {wait_time} seconds due to 403 error...")
-                    time.sleep(wait_time)
+                    time.sleep(60)
             else:
                 print(f"HTTP error: {response.status_code}")
-                print(f"Response text: {response.text[:200]}...")
                 
         except requests.exceptions.Timeout:
             print(f"Timeout on attempt {attempt + 1}")
@@ -117,50 +120,37 @@ def make_fpl_request(url, max_retries=3):
         except Exception as e:
             print(f"Unexpected error on attempt {attempt + 1}: {e}")
     
-    print(f"Failed to get data from {url} after {max_retries} attempts")
     return None
 
-# FPL API функции (остаются без изменений)
 def get_current_gameweek():
     """Get current gameweek number"""
     try:
         data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
         
         if not data or 'events' not in data:
-            print("No events data found")
             return None
-        
-        print(f"Found {len(data['events'])} events")
         
         current_gw = None
         
-        # Вариант 1: is_current = True
         for event in data['events']:
             if event.get('is_current', False):
                 current_gw = event['id']
-                print(f"Found current gameweek (is_current): {current_gw}")
                 break
         
-        # Вариант 2: is_next = False и finished = False
         if not current_gw:
             for event in data['events']:
                 if not event.get('finished', True) and not event.get('is_next', False):
                     current_gw = event['id']
-                    print(f"Found current gameweek (not finished): {current_gw}")
                     break
         
-        # Вариант 3: берем первый незавершенный
         if not current_gw:
             for event in data['events']:
                 if not event.get('finished', True):
                     current_gw = event['id']
-                    print(f"Found current gameweek (first unfinished): {current_gw}")
                     break
         
-        # Вариант 4: если все завершены, берем последний
         if not current_gw:
             current_gw = data['events'][-1]['id']
-            print(f"Using last gameweek: {current_gw}")
         
         return current_gw
         
@@ -174,7 +164,6 @@ def get_league_managers():
         data = make_fpl_request(f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/")
         
         if not data or 'standings' not in data or 'results' not in data['standings']:
-            print("No league standings data found")
             return []
             
         return data['standings']['results']
@@ -188,7 +177,6 @@ def get_manager_picks(manager_id, gameweek):
         data = make_fpl_request(f"https://fantasy.premierleague.com/api/entry/{manager_id}/event/{gameweek}/picks/")
         
         if not data or 'picks' not in data:
-            print(f"No picks data found for manager {manager_id}")
             return {'picks': []}
             
         return data
@@ -202,7 +190,6 @@ def get_live_data(gameweek):
         data = make_fpl_request(f"https://fantasy.premierleague.com/api/event/{gameweek}/live/")
         
         if not data or 'elements' not in data:
-            print(f"No live data found for gameweek {gameweek}")
             return {'elements': []}
             
         return data
@@ -216,7 +203,6 @@ def get_bootstrap_data():
         data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
         
         if not data or 'elements' not in data or 'teams' not in data:
-            print("No bootstrap data found")
             return {'elements': [], 'teams': []}
             
         return data
@@ -224,7 +210,6 @@ def get_bootstrap_data():
         print(f"Error getting bootstrap data: {e}")
         return {'elements': [], 'teams': []}
 
-# Telegram bot команды (остаются без изменений)
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Debug command to check API data"""
     try:
@@ -374,9 +359,19 @@ The bot will show all players organized by their real Premier League teams with 
     """
     await update.message.reply_text(welcome_text)
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors"""
+    print(f"Exception while handling an update: {context.error}")
+    
+    if "Conflict" in str(context.error) and "getUpdates" in str(context.error):
+        print("🔄 Detected bot conflict, restarting in 10 seconds...")
+        await asyncio.sleep(10)
+
 async def main():
     """Start the bot"""
-    print("🚀 Starting FPL Bot with improved error handling...")
+    global bot_running, application
+    
+    print("🚀 Starting FPL Bot...")
     
     # Запускаем Flask в отдельном потоке
     flask_thread = Thread(target=run_flask)
@@ -384,25 +379,28 @@ async def main():
     flask_thread.start()
     print("Flask server started")
     
-    # Агрессивная очистка всех подключений
-    await aggressive_clear_bot()
+    # Принудительная очистка
+    await force_clear_webhook_and_updates()
     await asyncio.sleep(3)
     
-    # Создаем приложение с улучшенными настройками
+    # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Добавляем обработчики
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("points", points_command))
     application.add_handler(CommandHandler("debug", debug_command))
+    application.add_error_handler(error_handler)
     
     print("Bot handlers added")
-    print("Starting polling...")
     
-    # Запускаем с оптимизированными настройками
+    # Инициализируем и запускаем
     await application.initialize()
     await application.start()
     
     try:
+        print("Starting polling...")
+        
         await application.updater.start_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
@@ -416,17 +414,45 @@ async def main():
         print("✅ Bot started successfully!")
         
         # Держим бота запущенным
-        while True:
+        while bot_running:
             await asyncio.sleep(1)
             
     except Exception as e:
         print(f"❌ Error during bot operation: {e}")
+        
+        # При ошибке конфликта пытаемся перезапустить
+        if "Conflict" in str(e):
+            print("🔄 Attempting to resolve conflict...")
+            await force_clear_webhook_and_updates()
+            await asyncio.sleep(10)
+            
+            # Пытаемся запустить снова
+            try:
+                await application.updater.start_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=Update.ALL_TYPES,
+                    timeout=20,
+                    pool_timeout=20,
+                    connect_timeout=20,
+                    read_timeout=20,
+                    write_timeout=20
+                )
+                
+                while bot_running:
+                    await asyncio.sleep(1)
+                    
+            except Exception as e2:
+                print(f"❌ Failed to restart after conflict: {e2}")
+                
     finally:
-        await application.stop()
-        await application.shutdown()
+        print("🛑 Shutting down bot...")
+        try:
+            await application.stop()
+            await application.shutdown()
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
 
 if __name__ == '__main__':
-    # Запускаем основную функцию
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
