@@ -26,12 +26,19 @@ def health():
     return {"status": "healthy", "bot": "running"}
 
 @app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
-async def webhook():
+def webhook():
     """Handle incoming updates via webhook"""
-    if telegram_app:
-        update = Update.de_json(request.get_json(), telegram_app.bot)
-        await telegram_app.process_update(update)
-    return 'OK'
+    try:
+        if telegram_app:
+            update_data = request.get_json()
+            if update_data:
+                update = Update.de_json(update_data, telegram_app.bot)
+                # Запускаем обработку в новом event loop
+                asyncio.create_task(telegram_app.process_update(update))
+        return 'OK'
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return 'ERROR', 500
 
 # FPL API функции
 def get_current_gameweek():
@@ -267,26 +274,40 @@ def setup_webhook(app_url):
     
     print(f"Webhook setup response: {response.json()}")
 
-def main():
-    """Start the bot"""
+def run_bot():
+    """Запуск бота в отдельном потоке"""
     global telegram_app
     
-    print("Starting FPL Bot with webhook...")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Создаем приложение
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("points", points_command))
     telegram_app.add_handler(CommandHandler("debug", debug_command))
     
+    print("Bot handlers added")
+
+def main():
+    """Start the bot"""
+    print("Starting FPL Bot with webhook...")
+    
+    # Запускаем настройку бота в отдельном потоке
+    bot_thread = Thread(target=run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
     # Получаем URL приложения
-    app_url = os.environ.get('RENDER_EXTERNAL_URL', 'https://your-app.onrender.com')
+    app_url = os.environ.get('RENDER_EXTERNAL_URL')
+    if not app_url:
+        # Fallback для получения URL
+        service_name = os.environ.get('RENDER_SERVICE_NAME', 'fpl-bot')
+        app_url = f"https://{service_name}.onrender.com"
     
     # Настраиваем webhook
     setup_webhook(app_url)
     
-    print("Bot handlers added")
     print(f"Webhook set to: {app_url}/webhook/{BOT_TOKEN}")
     
     # Запускаем Flask
