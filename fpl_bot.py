@@ -11,7 +11,7 @@ import signal
 import sys
 
 # Настройки
-BOT_TOKEN = "8554755843:AAFpoM3sRxuvgSutlQLrObjquNt2xdJAT9k"
+BOT_TOKEN = "8554755843:AAHZrdxLhNTDkr4P_G-zreyH2Poa_gsL6XY"
 LEAGUE_ID = 980121
 
 # Глобальная переменная для контроля работы бота
