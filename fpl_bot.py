@@ -1,18 +1,17 @@
 """
-FPL Telegram Bot (PTB v21+):
-- Request headers (anti-403), optional HTTP/2
-- Optional Cloudflare Worker proxy via FPL_PROXY_BASE
-- Caching bootstrap-static with TTL
-- Concurrency limiting via semaphore
-- Last finished GW detection (/points)
-- Pagination of league standings
-- /gw <number> for explicit gameweek points
-- /rank to show current league standings
-- /help and Telegram command descriptions (set_my_commands)
-- Message splitting (Telegram 4096 chars limit)
-- Graceful shutdown (run_polling handles signals)
-- Health endpoint (/healthz)
-- Optional fallback of events from env FPL_EVENTS_JSON
+FPL Telegram Bot (Variant 1, PTB v21 manual polling):
+- python-telegram-bot >=21 (без использования run_polling внутри уже работающего event loop)
+- Ручная инициализация: initialize() + start() + updater.start_polling()
+- Request headers (анти 403) + опциональный HTTP/2
+- Опциональный Cloudflare Worker proxy (FPL_PROXY_BASE)
+- Fallback: события из переменной окружения FPL_EVENTS_JSON (если сеть недоступна / 403)
+- Кэш bootstrap-static с TTL
+- Ограничение конкуренции запросов через Semaphore
+- Определение последнего завершённого тура (/points)
+- Команды: /gw, /rank, /help (+ описания команд через setMyCommands)
+- Разбиение длинных сообщений (лимит Telegram ~4096)
+- Graceful shutdown через stop_event (можно дернуть извне) + корректное закрытие клиента
+- Flask health endpoint (/healthz) параллельно в отдельном потоке
 """
 
 import os
@@ -37,13 +36,13 @@ if not BOT_TOKEN:
 
 ENABLE_KILL = os.environ.get("ENABLE_KILL", "0") == "1"
 FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))            # minutes
-FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))        # conservative default
+FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))        # чтобы не спамить
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
-USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"               # placeholder, run_polling used
+USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"               # placeholder
 LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")
-FPL_PROXY_BASE = os.environ.get("FPL_PROXY_BASE", "").rstrip("/")    # e.g., https://<worker>.workers.dev
-ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "1") == "1"            # can disable if needed
+FPL_PROXY_BASE = os.environ.get("FPL_PROXY_BASE", "").rstrip("/")
+ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "1") == "1"
 
 stop_event = asyncio.Event()
 
@@ -173,7 +172,6 @@ async def get_bootstrap() -> Optional[Dict]:
     async with bootstrap_lock:
         if bootstrap_cache_valid():
             return bootstrap_cache
-    # try network
     data = await fetch_json(fpl_url(bootstrap_path))
     if data:
         async with bootstrap_lock:
@@ -182,7 +180,6 @@ async def get_bootstrap() -> Optional[Dict]:
             global bootstrap_cache_ts
             bootstrap_cache_ts = time.time()
         return data
-    # fallback to env
     env_events = get_events_from_env()
     if env_events:
         logger.warning("Using FPL_EVENTS_JSON fallback for bootstrap.events")
@@ -234,12 +231,12 @@ async def fetch_all_league_results(league_id: str) -> Optional[List[Dict]]:
             return None
     return all_results
 
-# ---------- 5. Utility: split long messages ----------
+# ---------- 5. Utility ----------
 def split_message_chunks(text: str, limit: int = 4000) -> List[str]:
     if len(text) <= limit:
         return [text]
     lines = text.splitlines(keepends=True)
-    chunks = []
+    chunks: List[str] = []
     buf = ""
     for ln in lines:
         if len(buf) + len(ln) > limit:
@@ -250,8 +247,7 @@ def split_message_chunks(text: str, limit: int = 4000) -> List[str]:
         chunks.append(buf)
     return chunks
 
-# ---------- 6. Telegram Handlers ----------
-
+# ---------- 6. Handlers ----------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я FPL-бот 🚀")
 
@@ -274,17 +270,14 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(err)
         await update.message.reply_text(err)
         return
-
     events = bootstrap.get("events", [])
     if not events:
         await update.message.reply_text("Не удалось получить список туров.")
         return
-
     last_finished_gw = choose_last_finished_gw(events)
     if not last_finished_gw:
         await update.message.reply_text("Не удалось определить завершённый тур.")
         return
-
     await send_league_points(update, league_id, last_finished_gw, events, header_override=None)
 
 async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -293,43 +286,34 @@ async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text("Использование: /gw <номер_тура>. Например: /gw 14")
         return
-
     gw_str = args[0].strip()
     if not gw_str.isdigit():
         await update.message.reply_text("Номер тура должен быть целым числом. Пример: /gw 12")
         return
-
     gw_num = int(gw_str)
-
     bootstrap = await get_bootstrap()
     if not bootstrap:
         await update.message.reply_text("Не удалось обновить bootstrap-static.")
         return
-
     events = bootstrap.get("events", [])
     if not events:
         await update.message.reply_text("Нет данных о турах.")
         return
-
     max_gw = max(e.get("id", 0) for e in events)
     if gw_num < 1 or gw_num > max_gw:
         await update.message.reply_text(f"Тур {gw_num} вне диапазона (1..{max_gw}).")
         return
-
     event_map = {e["id"]: e for e in events}
     selected_event = event_map.get(gw_num)
     finished = selected_event.get("finished") if selected_event else False
     is_current = selected_event.get("is_current") if selected_event else False
-
     if not finished and not is_current and not selected_event.get("data_checked", False):
         await update.message.reply_text("Этот тур ещё не стартовал или нет данных.")
         return
-
     header = f"*Очки за тур {gw_num}*"
     if not finished:
         header += " (тур ещё не завершён)"
     header += "\n\n"
-
     await send_league_points(update, league_id, gw_num, events, header_override=header)
 
 async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -340,9 +324,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(err)
         await update.message.reply_text(err)
         return
-
     results_sorted = sorted(results, key=lambda r: r.get("rank", 10**9))
-
     header = "*Текущее положение в лиге:*\n\n"
     lines: List[str] = []
     for r in results_sorted:
@@ -351,7 +333,6 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = r.get("total")
         entry_name = r.get("entry_name")
         player_name = r.get("player_name")
-
         change = ""
         if isinstance(last_rank, int) and isinstance(rank, int) and last_rank > 0 and rank > 0:
             delta = last_rank - rank
@@ -361,9 +342,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 change = f" ↓{abs(delta)}"
             else:
                 change = " →0"
-
         lines.append(f"{rank}. {player_name} — {entry_name}: {total} pts{change}")
-
     full_text = header + "\n".join(lines)
     for chunk in split_message_chunks(full_text):
         try:
@@ -384,7 +363,6 @@ async def send_league_points(
         logger.error(err)
         await update.message.reply_text(err)
         return
-
     header = header_override or f"*Очки за тур {gw_num}:*\n\n"
     lines: List[str] = []
 
@@ -445,12 +423,11 @@ async def setup_bot_commands(bot):
         pass
     logger.info("Telegram command menu set.")
 
-# ---------- 8. Run Bot (PTB v21 run_polling, без Updater) ----------
+# ---------- 8. run_bot (Variant 1 manual polling) ----------
 async def run_bot():
     global http_client
     logger.info("Starting bot...")
 
-    # HTTP client with optional HTTP/2
     limits = httpx.Limits(max_keepalive_connections=10, max_connections=50)
     use_http2 = ENABLE_HTTP2
     if use_http2:
@@ -471,24 +448,79 @@ async def run_bot():
     application.add_handler(CommandHandler("rank", rank_command))
     application.add_error_handler(error_handler)
 
-    # Настроим меню команд до старта polling
+    # Initialize + start
+    await application.initialize()
+    await application.start()
+
+    # Commands menu
     try:
         await setup_bot_commands(application.bot)
     except Exception:
         logger.exception("Failed to set bot commands")
 
-    # В v21 используем run_polling (обрабатывает сигналы и корректное завершение)
-    try:
-        await application.run_polling()
-    finally:
+    # Start polling manually
+    if USE_WEBHOOK:
+        await _register_webhook_if_needed()
+    else:
         try:
-            await http_client.aclose()
+            await application.updater.start_polling()
+            logger.info("Polling started")
+        except Exception:
+            logger.exception("Failed to start polling")
+            # cleanup early
+            try:
+                await application.stop()
+                await application.shutdown()
+            except Exception:
+                logger.exception("Error shutting down application after polling failure")
+            try:
+                await http_client.aclose()
+            except Exception:
+                logger.exception("Error closing HTTP client early")
+            return
+
+    # Bot identity
+    try:
+        me = await application.bot.get_me()
+        logger.info("Bot started as @%s (id=%s)", getattr(me, 'username', 'unknown'), getattr(me, 'id', 'unknown'))
+    except Exception:
+        logger.exception("Failed to get_me")
+
+    logger.info("Bot started, waiting for stop_event...")
+    try:
+        await stop_event.wait()
+    finally:
+        logger.info("Shutdown initiated")
+
+        if not USE_WEBHOOK:
+            try:
+                await application.updater.stop()
+                logger.info("Updater stopped")
+            except Exception:
+                logger.exception("Error stopping updater")
+
+        try:
+            await application.stop()
+            await application.shutdown()
+        except Exception:
+            logger.exception("Error shutting down application")
+
+        try:
+            if http_client:
+                await http_client.aclose()
         except Exception:
             logger.exception("Error closing HTTP client")
 
-# ---------- 9. Signals (необязательно, run_polling сам ловит SIGINT/SIGTERM) ----------
+        logger.info("SHUTDOWN COMPLETE")
+
+# ---------- 9. Signals ----------
 def handle_sigterm(signum, frame):
-    logger.info("SIGTERM/SIGINT received")
+    logger.info("SIGTERM/SIGINT received, initiating shutdown...")
+    try:
+        loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(stop_event.set)
+    except RuntimeError:
+        pass
 
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
