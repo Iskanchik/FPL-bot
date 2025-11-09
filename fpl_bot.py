@@ -4,6 +4,7 @@ import threading
 import logging
 import time
 import signal
+import random
 from typing import Any, Dict, Optional, List
 
 from flask import Flask, jsonify
@@ -13,17 +14,18 @@ from telegram import Update, BotCommand
 
 """
 FPL Telegram Bot:
-- Request headers (anti-403)
+- Request headers (anti-403), HTTP/2
 - Caching bootstrap-static with TTL
 - Concurrency limiting via semaphore
 - Last finished GW detection (/points)
 - Pagination of league standings
 - /gw <number> for explicit gameweek points
 - /rank to show current league standings
-- /help and Telegram command descriptions (set_my_commands)
+- /help + Telegram command descriptions (set_my_commands)
 - Message splitting (Telegram 4096 chars limit)
 - Graceful shutdown (SIGTERM/SIGINT)
 - Health endpoint (/healthz)
+- Optional proxy (FPL_PROXY_BASE) to bypass Cloudflare blocks on PaaS
 """
 
 # ---------- 1. ENV ----------
@@ -33,11 +35,12 @@ if not BOT_TOKEN:
 
 ENABLE_KILL = os.environ.get("ENABLE_KILL", "0") == "1"
 FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))            # minutes
-FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "6"))
+FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))        # снизили по умолчанию
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"
-LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")                    # default league id
+LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")
+FPL_PROXY_BASE = os.environ.get("FPL_PROXY_BASE", "").rstrip("/")    # если задан, используем как базовый хост
 
 stop_event = asyncio.Event()
 
@@ -64,7 +67,8 @@ def health():
         "ok": True,
         "bootstrap_cached": bootstrap_cache_ts is not None,
         "bootstrap_cache_age_min": age_min,
-        "concurrency_limit": FPL_CONCURRENCY
+        "concurrency_limit": FPL_CONCURRENCY,
+        "proxy_base": FPL_PROXY_BASE or None
     })
 
 def start_flask():
@@ -76,15 +80,24 @@ def kill_existing_instances():
 
 # ---------- 4. HTTP / Cache / Headers ----------
 
+# Если нужен прокси, будем собирать URL из базового префикса + путь.
+def fpl_url(path: str) -> str:
+    base = FPL_PROXY_BASE or "https://fantasy.premierleague.com"
+    return f"{base}{path}"
+
 FPL_BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://fantasy.premierleague.com/",
     "Origin": "https://fantasy.premierleague.com",
+    # Доп. заголовки, чтобы походить на браузер
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
 }
 
 http_client: Optional[httpx.AsyncClient] = None
@@ -92,9 +105,10 @@ bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
 bootstrap_lock = asyncio.Lock()
 
-bootstrap_url = "https://fantasy.premierleague.com/api/bootstrap-static/"
-league_url_template = "https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/?page_standings={page}"
-entry_picks_template = "https://fantasy.premierleague.com/api/entry/{entry_id}/event/{gw}/picks/"
+# Ходим по путям (а не по полным URL), чтобы легко подменять базу
+bootstrap_path = "/api/bootstrap-static/"
+league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
+entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
 
 fpl_semaphore = asyncio.Semaphore(FPL_CONCURRENCY)
 
@@ -107,6 +121,8 @@ async def fetch_json(
     attempt = 0
     while attempt < max_attempts:
         attempt += 1
+        # немного рандома перед запросом, чтобы не бить в одинаковые интервалы
+        await asyncio.sleep(random.uniform(0.05, 0.2))
         try:
             async with fpl_semaphore:
                 resp = await http_client.get(url, headers=FPL_BASE_HEADERS, timeout=timeout)
@@ -118,12 +134,12 @@ async def fetch_json(
                     logger.warning(f"JSON decode error for {url}: {jex}")
                     return None
 
-            body_preview = resp.text[:300].replace("\n", " ")
+            body_preview = (resp.text or "")[:300].replace("\n", " ")
             logger.warning(f"Attempt {attempt}: status={status} url={url} body='{body_preview}'")
 
             if status in (403, 429) or 500 <= status < 600:
                 if attempt < max_attempts:
-                    sleep_time = min(backoff_base ** attempt, 8.0)
+                    sleep_time = min(backoff_base ** attempt + random.uniform(0, 0.5), 8.0)
                     await asyncio.sleep(sleep_time)
                     continue
             return None
@@ -148,7 +164,7 @@ async def get_bootstrap() -> Optional[Dict]:
     async with bootstrap_lock:
         if bootstrap_cache_valid():
             return bootstrap_cache
-    data = await fetch_json(bootstrap_url)
+    data = await fetch_json(fpl_url(bootstrap_path))
     if data:
         async with bootstrap_lock:
             bootstrap_cache.clear()
@@ -178,7 +194,7 @@ async def fetch_all_league_results(league_id: str) -> Optional[List[Dict]]:
     all_results: List[Dict] = []
     page = 1
     while True:
-        url = league_url_template.format(league_id=league_id, page=page)
+        url = fpl_url(league_path_tpl.format(league_id=league_id, page=page))
         data = await fetch_json(url)
         if not data:
             return None
@@ -361,7 +377,7 @@ async def send_league_points(
     lines: List[str] = []
 
     async def fetch_points(entry_id: int, entry_name: str, player_name: str) -> str:
-        url = entry_picks_template.format(entry_id=entry_id, gw=gw_num)
+        url = fpl_url(entry_picks_path_tpl.format(entry_id=entry_id, gw=gw_num))
         data = await fetch_json(url)
         points = None
         if data:
@@ -410,13 +426,10 @@ async def setup_bot_commands(bot):
         BotCommand("gw", "Очки за указанный тур: /gw <номер>"),
         BotCommand("rank", "Текущее положение в лиге"),
     ]
-    # По умолчанию (для всех языков)
     await bot.set_my_commands(commands)
-    # Опционально: локализация для русскоязычных клиентов
     try:
         await bot.set_my_commands(commands, language_code="ru")
     except Exception:
-        # Не критично, если Telegram не поддержит язык/скоуп
         pass
     logger.info("Telegram command menu set.")
 
@@ -426,7 +439,8 @@ async def run_bot():
     logger.info("Starting bot...")
 
     limits = httpx.Limits(max_keepalive_connections=10, max_connections=50)
-    http_client = httpx.AsyncClient(limits=limits, timeout=10.0)
+    # Включаем HTTP/2 — иногда помогает против 403/CF
+    http_client = httpx.AsyncClient(http2=True, limits=limits, timeout=15.0)
 
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
     application.add_handler(CommandHandler("start", start_command))
@@ -445,7 +459,6 @@ async def run_bot():
     except Exception:
         logger.exception("Failed to get_me")
 
-    # Устанавливаем описания команд в меню Telegram
     try:
         await setup_bot_commands(application.bot)
     except Exception:
