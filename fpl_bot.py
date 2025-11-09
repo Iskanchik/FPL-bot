@@ -197,7 +197,8 @@ def get_league_standings():
         
     except Exception as e:
         logger.error(f"Error getting league standings: {e}")
-        return []def get_manager_picks_batch(manager_ids, gameweek):
+        return []
+        def get_manager_picks_batch(manager_ids, gameweek):
     """Получить составы менеджеров параллельно с улучшенной обработкой"""
     def fetch_picks(manager_id):
         try:
