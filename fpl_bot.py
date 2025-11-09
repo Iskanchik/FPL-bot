@@ -7,7 +7,7 @@ from threading import Thread
 import os
 
 # Настройки
-BOT_TOKEN = "8340413924:AAHpWBHdQxpiyuQIRvzafb-qe2CYLY491IY"
+BOT_TOKEN = "8554755843:AAFpoM3sRxuvgSutlQLrObjquNt2xdJAT9k"
 LEAGUE_ID = 980121
 
 # Flask приложение для Render (чтобы не засыпал)
