@@ -1,25 +1,30 @@
-"""
-FPL Telegram Bot with:
-- Proper request headers to avoid 403 from FPL API
-- Caching of bootstrap-static
-- Concurrency limiting for FPL requests
-- Selection of last finished gameweek
-- Graceful shutdown
-- Optional webhook placeholder
-- Simple health endpoint
-"""
-
 import os
 import asyncio
 import threading
 import logging
 import time
+import signal
 from typing import Any, Dict, Optional, List
 
 from flask import Flask, jsonify
 import httpx
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram import Update
+from telegram import Update, BotCommand
+
+"""
+FPL Telegram Bot:
+- Request headers (anti-403)
+- Caching bootstrap-static with TTL
+- Concurrency limiting via semaphore
+- Last finished GW detection (/points)
+- Pagination of league standings
+- /gw <number> for explicit gameweek points
+- /rank to show current league standings
+- /help and Telegram command descriptions (set_my_commands)
+- Message splitting (Telegram 4096 chars limit)
+- Graceful shutdown (SIGTERM/SIGINT)
+- Health endpoint (/healthz)
+"""
 
 # ---------- 1. ENV ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -67,10 +72,9 @@ def start_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
 
 def kill_existing_instances():
-    # Placeholder for any external coordination (pid file, etc.)
-    logger.info("ENABLE_KILL is set, killing existing instances (placeholder)")
+    logger.info("ENABLE_KILL is set (placeholder for external coordination)")
 
-# ---------- 4. HTTP Client / Headers / Cache ----------
+# ---------- 4. HTTP / Cache / Headers ----------
 
 FPL_BASE_HEADERS = {
     "User-Agent": (
@@ -78,6 +82,7 @@ FPL_BASE_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     ),
     "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://fantasy.premierleague.com/",
     "Origin": "https://fantasy.premierleague.com",
 }
@@ -85,9 +90,10 @@ FPL_BASE_HEADERS = {
 http_client: Optional[httpx.AsyncClient] = None
 bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
+bootstrap_lock = asyncio.Lock()
 
 bootstrap_url = "https://fantasy.premierleague.com/api/bootstrap-static/"
-league_url_template = "https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
+league_url_template = "https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_template = "https://fantasy.premierleague.com/api/entry/{entry_id}/event/{gw}/picks/"
 
 fpl_semaphore = asyncio.Semaphore(FPL_CONCURRENCY)
@@ -96,13 +102,8 @@ async def fetch_json(
     url: str,
     timeout: float = 15.0,
     max_attempts: int = 3,
-    backoff_base: float = 2.0
+    backoff_base: float = 1.5
 ) -> Optional[Dict]:
-    """
-    Fetch JSON with headers, concurrency semaphore, and simple exponential backoff on 403/429/5xx.
-    Returns dict or None.
-    """
-    global http_client
     attempt = 0
     while attempt < max_attempts:
         attempt += 1
@@ -111,33 +112,30 @@ async def fetch_json(
                 resp = await http_client.get(url, headers=FPL_BASE_HEADERS, timeout=timeout)
             status = resp.status_code
             if status == 200:
-                # Attempt JSON decode guarded
                 try:
                     return resp.json()
                 except Exception as jex:
                     logger.warning(f"JSON decode error for {url}: {jex}")
                     return None
 
-            body_preview = resp.text[:400].replace("\n", " ")
+            body_preview = resp.text[:300].replace("\n", " ")
             logger.warning(f"Attempt {attempt}: status={status} url={url} body='{body_preview}'")
 
-            # Determine if we should backoff
             if status in (403, 429) or 500 <= status < 600:
                 if attempt < max_attempts:
-                    sleep_time = backoff_base ** attempt
+                    sleep_time = min(backoff_base ** attempt, 8.0)
                     await asyncio.sleep(sleep_time)
                     continue
-            # For other non-200 statuses no retry
             return None
 
         except httpx.TimeoutException:
             logger.error(f"Timeout fetching {url} (attempt {attempt})")
             if attempt < max_attempts:
-                await asyncio.sleep(backoff_base ** attempt)
+                await asyncio.sleep(min(backoff_base ** attempt, 8.0))
         except Exception as ex:
             logger.exception(f"Unexpected error fetching {url} (attempt {attempt}): {ex}")
             if attempt < max_attempts:
-                await asyncio.sleep(backoff_base ** attempt)
+                await asyncio.sleep(min(backoff_base ** attempt, 8.0))
     return None
 
 def bootstrap_cache_valid() -> bool:
@@ -147,19 +145,19 @@ def bootstrap_cache_valid() -> bool:
     return age < FPL_CACHE_TTL
 
 async def get_bootstrap() -> Optional[Dict]:
-    global bootstrap_cache, bootstrap_cache_ts
-    if bootstrap_cache_valid():
-        return bootstrap_cache
+    async with bootstrap_lock:
+        if bootstrap_cache_valid():
+            return bootstrap_cache
     data = await fetch_json(bootstrap_url)
     if data:
-        bootstrap_cache = data
-        bootstrap_cache_ts = time.time()
+        async with bootstrap_lock:
+            bootstrap_cache.clear()
+            bootstrap_cache.update(data)
+            global bootstrap_cache_ts
+            bootstrap_cache_ts = time.time()
     return data
 
 def choose_last_finished_gw(events: List[Dict]) -> Optional[int]:
-    """
-    Choose last fully finished gameweek (finished=True). If none, fallback logic.
-    """
     finished = [e for e in events if e.get("finished")]
     if finished:
         try:
@@ -176,18 +174,69 @@ def choose_last_finished_gw(events: List[Dict]) -> Optional[int]:
     except Exception:
         return None
 
-# ---------- 5. Telegram Handlers ----------
+async def fetch_all_league_results(league_id: str) -> Optional[List[Dict]]:
+    all_results: List[Dict] = []
+    page = 1
+    while True:
+        url = league_url_template.format(league_id=league_id, page=page)
+        data = await fetch_json(url)
+        if not data:
+            return None
+        try:
+            standings = data["standings"]
+            results = standings["results"]
+            all_results.extend(results)
+            if not standings.get("has_next"):
+                break
+            page += 1
+            if page > 30:
+                logger.warning("Stopped pagination after 30 pages (safety cutoff).")
+                break
+        except Exception as ex:
+            logger.error(f"League standings decode error: {ex}")
+            return None
+    return all_results
+
+# ---------- 5. Utility: split long messages ----------
+def split_message_chunks(text: str, limit: int = 4000) -> List[str]:
+    if len(text) <= limit:
+        return [text]
+    lines = text.splitlines(keepends=True)
+    chunks = []
+    buf = ""
+    for ln in lines:
+        if len(buf) + len(ln) > limit:
+            chunks.append(buf)
+            buf = ""
+        buf += ln
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+# ---------- 6. Telegram Handlers ----------
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я FPL-бот 🚀")
 
-async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    league_id = LEAGUE_ID
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Доступные команды:\n"
+        "/start — приветствие\n"
+        f"/points — очки за последний завершённый тур лиги {LEAGUE_ID}\n"
+        "/gw <номер> — очки за указанный тур (например: /gw 14)\n"
+        f"/rank — текущее положение в лиге {LEAGUE_ID}\n"
+        "/help — эта справка"
+    )
+    await update.message.reply_text(text)
 
-    # 1. bootstrap-static
+async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /points => очки за последний завершённый тур
+    """
+    league_id = LEAGUE_ID
     bootstrap = await get_bootstrap()
     if not bootstrap:
-        err = "FPL API bootstrap-static недоступен (403/timeout/другая ошибка)"
+        err = "FPL API bootstrap-static недоступен (ошибка/таймаут)"
         logger.error(err)
         await update.message.reply_text(err)
         return
@@ -202,55 +251,176 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не удалось определить завершённый тур.")
         return
 
-    # 2. standings
-    league_url = league_url_template.format(league_id=league_id)
-    league_json = await fetch_json(league_url)
-    if not league_json:
-        err = "FPL API standings недоступен (403/timeout/другая ошибка)"
+    await send_league_points(update, league_id, last_finished_gw, events, header_override=None)
+
+async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /gw <номер> => очки за конкретный тур
+    """
+    league_id = LEAGUE_ID
+    args = context.args
+    if not args:
+        await update.message.reply_text("Использование: /gw <номер_тура>. Например: /gw 14")
+        return
+
+    gw_str = args[0].strip()
+    if not gw_str.isdigit():
+        await update.message.reply_text("Номер тура должен быть целым числом. Пример: /gw 12")
+        return
+
+    gw_num = int(gw_str)
+
+    bootstrap = await get_bootstrap()
+    if not bootstrap:
+        await update.message.reply_text("Не удалось обновить bootstrap-static.")
+        return
+
+    events = bootstrap.get("events", [])
+    if not events:
+        await update.message.reply_text("Нет данных о турах.")
+        return
+
+    max_gw = max(e.get("id", 0) for e in events)
+    if gw_num < 1 or gw_num > max_gw:
+        await update.message.reply_text(f"Тур {gw_num} вне диапазона (1..{max_gw}).")
+        return
+
+    event_map = {e["id"]: e for e in events}
+    selected_event = event_map.get(gw_num)
+    finished = selected_event.get("finished") if selected_event else False
+    is_current = selected_event.get("is_current") if selected_event else False
+
+    if not finished and not is_current and not selected_event.get("data_checked", False):
+        await update.message.reply_text("Этот тур ещё не стартовал или нет данных.")
+        return
+
+    header = f"*Очки за тур {gw_num}*"
+    if not finished:
+        header += " (тур ещё не завершён)"
+    header += "\n\n"
+
+    await send_league_points(update, league_id, gw_num, events, header_override=header)
+
+async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /rank => текущее положение (классическая лига)
+    """
+    league_id = LEAGUE_ID
+    results = await fetch_all_league_results(league_id)
+    if results is None:
+        err = "Не удалось получить участников лиги (standings)."
         logger.error(err)
         await update.message.reply_text(err)
         return
 
-    try:
-        results = league_json["standings"]["results"]
-    except Exception as ex:
-        logger.error(f"Ошибка декодирования standings: {ex}")
-        await update.message.reply_text("Ошибка при обработке участников лиги.")
+    results_sorted = sorted(results, key=lambda r: r.get("rank", 10**9))
+
+    header = "*Текущее положение в лиге:*\n\n"
+    lines: List[str] = []
+    for r in results_sorted:
+        rank = r.get("rank")
+        last_rank = r.get("last_rank")
+        total = r.get("total")
+        entry_name = r.get("entry_name")
+        player_name = r.get("player_name")
+
+        change = ""
+        if isinstance(last_rank, int) and isinstance(rank, int) and last_rank > 0 and rank > 0:
+            delta = last_rank - rank
+            if delta > 0:
+                change = f" ↑{delta}"
+            elif delta < 0:
+                change = f" ↓{abs(delta)}"
+            else:
+                change = " →0"
+
+        lines.append(f"{rank}. {player_name} — {entry_name}: {total} pts{change}")
+
+    full_text = header + "\n".join(lines)
+    for chunk in split_message_chunks(full_text):
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(chunk)
+
+async def send_league_points(
+    update: Update,
+    league_id: str,
+    gw_num: int,
+    events: List[Dict],
+    header_override: Optional[str] = None
+):
+    results = await fetch_all_league_results(league_id)
+    if results is None:
+        err = "Не удалось получить участников лиги (standings)."
+        logger.error(err)
+        await update.message.reply_text(err)
         return
 
-    reply_lines = [f"*Очки за тур {last_finished_gw}:*\n"]
+    header = header_override or f"*Очки за тур {gw_num}:*\n\n"
+    lines: List[str] = []
 
     async def fetch_points(entry_id: int, entry_name: str, player_name: str) -> str:
-        url = entry_picks_template.format(entry_id=entry_id, gw=last_finished_gw)
+        url = entry_picks_template.format(entry_id=entry_id, gw=gw_num)
         data = await fetch_json(url)
-        points = data.get("points") if data else None
+        points = None
+        if data:
+            points = data.get("entry_history", {}).get("points")
         return f"{player_name} — {entry_name}: {points if points is not None else 'нет данных'}"
 
     tasks = [
-        asyncio.create_task(
-            fetch_points(r["entry"], r["entry_name"], r["player_name"])
-        )
+        asyncio.create_task(fetch_points(r["entry"], r["entry_name"], r["player_name"]))
         for r in results
     ]
-
-    fetched_lines = await asyncio.gather(*tasks, return_exceptions=True)
-    for line in fetched_lines:
-        if isinstance(line, Exception):
-            reply_lines.append("Не удалось получить данные участника.\n")
+    fetched = await asyncio.gather(*tasks, return_exceptions=True)
+    for item in fetched:
+        if isinstance(item, Exception):
+            lines.append("Ошибка участника: нет данных")
         else:
-            reply_lines.append(line + "\n")
+            lines.append(item)
 
-    final_reply = "".join(reply_lines)
-    try:
-        await update.message.reply_text(final_reply, parse_mode="Markdown")
-    except Exception:
-        # Fallback if Markdown fails
-        await update.message.reply_text(final_reply)
+    full_text = header + "\n".join(lines)
+    chunks = split_message_chunks(full_text)
+    for chunk in chunks:
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(chunk)
 
 async def _register_webhook_if_needed():
-    logger.info("Webhook registration is not implemented (placeholder)")
+    logger.info("Webhook registration placeholder (not implemented)")
 
-# ---------- 6. Run Bot ----------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception in handler", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Произошла внутренняя ошибка. Сообщите администратору."
+            )
+        except Exception:
+            pass
+
+# ---------- 7. Setup Telegram command menu ----------
+async def setup_bot_commands(bot):
+    commands = [
+        BotCommand("start", "Приветствие"),
+        BotCommand("help", "Справка по командам"),
+        BotCommand("points", "Очки за последний завершённый тур"),
+        BotCommand("gw", "Очки за указанный тур: /gw <номер>"),
+        BotCommand("rank", "Текущее положение в лиге"),
+    ]
+    # По умолчанию (для всех языков)
+    await bot.set_my_commands(commands)
+    # Опционально: локализация для русскоязычных клиентов
+    try:
+        await bot.set_my_commands(commands, language_code="ru")
+    except Exception:
+        # Не критично, если Telegram не поддержит язык/скоуп
+        pass
+    logger.info("Telegram command menu set.")
+
+# ---------- 8. Run Bot ----------
 async def run_bot():
     global http_client
     logger.info("Starting bot...")
@@ -260,22 +430,30 @@ async def run_bot():
 
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("points", points_command))
+    application.add_handler(CommandHandler("gw", gw_command))
+    application.add_handler(CommandHandler("rank", rank_command))
+    application.add_error_handler(error_handler)
 
     await application.initialize()
     await application.start()
 
-    # Identity check
     try:
         me = await application.bot.get_me()
         logger.info("Bot started as @%s (id=%s)", getattr(me, "username", "unknown"), getattr(me, "id", "unknown"))
     except Exception:
         logger.exception("Failed to get_me")
 
+    # Устанавливаем описания команд в меню Telegram
+    try:
+        await setup_bot_commands(application.bot)
+    except Exception:
+        logger.exception("Failed to set bot commands")
+
     if USE_WEBHOOK:
         await _register_webhook_if_needed()
     else:
-        # For python-telegram-bot v20+, polling via updater attribute still works; else use application.run_polling()
         try:
             await application.updater.start_polling()
             logger.info("Polling started")
@@ -299,7 +477,7 @@ async def run_bot():
             await application.stop()
             await application.shutdown()
         except Exception:
-            logger.exception("Error shutting down bot")
+            logger.exception("Error shutting down application")
 
         try:
             if http_client:
@@ -309,7 +487,19 @@ async def run_bot():
 
         logger.info("SHUTDOWN COMPLETE")
 
-# ---------- 7. Entrypoint ----------
+# ---------- 9. Signals ----------
+def handle_sigterm(signum, frame):
+    logger.info("SIGTERM/SIGINT received, initiating shutdown...")
+    try:
+        loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(stop_event.set)
+    except RuntimeError:
+        pass
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)
+
+# ---------- 10. Entrypoint ----------
 if __name__ == "__main__":
     print("Main entrypoint start")
 
