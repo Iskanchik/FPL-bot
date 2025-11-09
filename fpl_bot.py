@@ -264,39 +264,47 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
-async def main():
-    """Запуск бота"""
-    logger.info("🚀 Запуск FPL Bot...")
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    async def bot_main():
+        logger.info("🚀 Запуск FPL Bot...")
+        
+        # Очистка webhook
+        try:
+            webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+            requests.post(webhook_url, json={'drop_pending_updates': True}, timeout=5)
+            logger.info("✅ Webhook очищен")
+        except:
+            pass
+        
+        # Простой способ запуска
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Добавление обработчиков
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("points", points_command))
+        
+        logger.info("✅ Бот успешно запущен!")
+        
+        # Запуск polling
+        await application.run_polling(drop_pending_updates=True)
     
-    # Запуск Flask в отдельном потоке
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # Создаем новый event loop для бота
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bot_main())
+
+def main():
+    """Главная функция"""
+    # Запуск бота в отдельном потоке
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
     
-    # Очистка webhook
-    try:
-        webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        requests.post(webhook_url, json={'drop_pending_updates': True}, timeout=5)
-        logger.info("✅ Webhook очищен")
-    except:
-        pass
-    
-    # Простой способ запуска без Updater
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Добавление обработчиков
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("points", points_command))
-    
-    logger.info("✅ Бот успешно запущен!")
-    
-    # Запуск polling
-    await application.run_polling(
-        drop_pending_updates=True,
-        close_loop=False
-    )
+    # Запуск Flask (блокирующий)
+    run_flask()
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print("Бот остановлен")
