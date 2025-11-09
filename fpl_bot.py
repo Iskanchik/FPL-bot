@@ -265,7 +265,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def run_bot():
-    """Запуск бота"""
+    """Запуск бота с ручным управлением"""
     logger.info("🚀 Запуск FPL Bot...")
     
     # Очистка webhook
@@ -276,32 +276,62 @@ async def run_bot():
     except:
         pass
     
-    # Создание приложения
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Создание приложения БЕЗ updater
+    application = Application.builder().token(BOT_TOKEN).updater(None).build()
     
     # Добавление обработчиков
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("points", points_command))
     
+    # Инициализация
+    await application.initialize()
+    await application.start()
+    
     logger.info("✅ Бот успешно запущен!")
     
-    # Запуск polling БЕЗ обработки сигналов
-    await application.run_polling(
-        drop_pending_updates=True,
-        stop_signals=None  # Отключаем обработку сигналов
-    )
+    # Ручной polling loop
+    try:
+        while True:
+            try:
+                # Получаем обновления
+                updates = await application.bot.get_updates(
+                    offset=getattr(run_bot, 'last_update_id', 0) + 1,
+                    timeout=10,
+                    limit=100
+                )
+                
+                # Обрабатываем каждое обновление
+                for update in updates:
+                    run_bot.last_update_id = update.update_id
+                    
+                    # Обрабатываем обновление
+                    await application.process_update(update)
+                
+                # Небольшая пауза если нет обновлений
+                if not updates:
+                    await asyncio.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Ошибка в polling loop: {e}")
+                await asyncio.sleep(5)
+                
+    except KeyboardInterrupt:
+        logger.info("Получен сигнал остановки")
+    finally:
+        await application.stop()
+        await application.shutdown()
 
-async def main():
-    """Главная функция"""
+def main():
+    """Главная функция - синхронная"""
     # Запуск Flask в отдельном потоке
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Запуск бота в главном потоке
-    await run_bot()
-
-if __name__ == '__main__':
+    # Запуск бота в основном потоке
     try:
-        asyncio.run(main())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("Бот остановлен")
+
+if __name__ == '__main__':
+    main()
