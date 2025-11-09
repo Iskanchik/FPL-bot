@@ -31,20 +31,59 @@ def get_current_gameweek():
     """Get current gameweek number"""
     try:
         response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+        response.raise_for_status()  # Проверка на HTTP ошибки
         data = response.json()
         
+        print(f"API Response status: {response.status_code}")
+        
+        # Проверяем разные варианты определения текущего gameweek
+        current_gw = None
+        
+        # Вариант 1: is_current = True
         for event in data['events']:
-            if event['is_current']:
-                return event['id']
+            if event.get('is_current', False):
+                current_gw = event['id']
+                print(f"Found current gameweek (is_current): {current_gw}")
+                break
+        
+        # Вариант 2: is_next = False и finished = False
+        if not current_gw:
+            for event in data['events']:
+                if not event.get('finished', True) and not event.get('is_next', False):
+                    current_gw = event['id']
+                    print(f"Found current gameweek (not finished): {current_gw}")
+                    break
+        
+        # Вариант 3: берем первый незавершенный
+        if not current_gw:
+            for event in data['events']:
+                if not event.get('finished', True):
+                    current_gw = event['id']
+                    print(f"Found current gameweek (first unfinished): {current_gw}")
+                    break
+        
+        # Вариант 4: если все завершены, берем последний
+        if not current_gw:
+            current_gw = data['events'][-1]['id']
+            print(f"Using last gameweek: {current_gw}")
+        
+        return current_gw
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Network error getting gameweek: {e}")
+        return None
+    except KeyError as e:
+        print(f"Data structure error: {e}")
         return None
     except Exception as e:
-        print(f"Error getting gameweek: {e}")
+        print(f"Unexpected error getting gameweek: {e}")
         return None
 
 def get_league_managers():
     """Get all managers in the league"""
     try:
         response = requests.get(f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/")
+        response.raise_for_status()
         data = response.json()
         return data['standings']['results']
     except Exception as e:
@@ -55,6 +94,7 @@ def get_manager_picks(manager_id, gameweek):
     """Get manager's picks for specific gameweek"""
     try:
         response = requests.get(f"https://fantasy.premierleague.com/api/entry/{manager_id}/event/{gameweek}/picks/")
+        response.raise_for_status()
         return response.json()
     except Exception as e:
         print(f"Error getting picks for manager {manager_id}: {e}")
@@ -64,6 +104,7 @@ def get_live_data(gameweek):
     """Get live points data for gameweek"""
     try:
         response = requests.get(f"https://fantasy.premierleague.com/api/event/{gameweek}/live/")
+        response.raise_for_status()
         return response.json()
     except Exception as e:
         print(f"Error getting live data: {e}")
@@ -73,12 +114,37 @@ def get_bootstrap_data():
     """Get player and team data"""
     try:
         response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+        response.raise_for_status()
         return response.json()
     except Exception as e:
         print(f"Error getting bootstrap data: {e}")
         return {'elements': [], 'teams': []}
 
 # Telegram bot команды
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug command to check API data"""
+    try:
+        response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+        data = response.json()
+        
+        debug_info = "🔍 Debug Info:\n\n"
+        debug_info += f"API Status: {response.status_code}\n"
+        debug_info += f"Total events: {len(data['events'])}\n\n"
+        
+        debug_info += "Recent gameweeks:\n"
+        for event in data['events'][-5:]:  # Последние 5 gameweek
+            status = []
+            if event.get('is_current'): status.append('CURRENT')
+            if event.get('is_next'): status.append('NEXT')
+            if event.get('finished'): status.append('FINISHED')
+            
+            debug_info += f"GW{event['id']}: {event['name']} - {', '.join(status) if status else 'ACTIVE'}\n"
+        
+        await update.message.reply_text(debug_info)
+        
+    except Exception as e:
+        await update.message.reply_text(f"Debug error: {str(e)}")
+
 async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /points command"""
     await update.message.reply_text("🔄 Fetching league points data...")
@@ -190,6 +256,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Commands:
 /points - Get current gameweek points for league {LEAGUE_ID}
+/debug - Show gameweek debug info
 
 The bot will show all players organized by their real Premier League teams with points and manager names.
     """
@@ -211,6 +278,7 @@ def main():
         
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("points", points_command))
+        application.add_handler(CommandHandler("debug", debug_command))
         
         print("Bot handlers added")
         print("Starting polling...")
