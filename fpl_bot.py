@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 # Настройки
-BOT_TOKEN = "8554755843:AAHZrdxLhNTDkr4P_G-zreyH2Poa_gsL6XY"
+BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"  # ← ЗАМЕНИТЕ НА СВОЙ ТОКЕН!
 LEAGUE_ID = 980121
 
 # Flask приложение для Render
@@ -287,27 +287,21 @@ async def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("points", points_command))
     
-    # Запуск бота
+    # Запуск бота (исправленная версия)
     await application.initialize()
     await application.start()
     
-    await application.updater.start_polling(
-        drop_pending_updates=True,
-        timeout=15,
-        pool_timeout=15,
-        read_timeout=15,
-        write_timeout=15,
-        connect_timeout=15
-    )
+    # Простой polling без дополнительных параметров
+    await application.updater.start_polling()
     
     logger.info("✅ Бот успешно запущен!")
     
     # Держим бота активным
     try:
-        while True:
-            await asyncio.sleep(1)
+        await application.updater.idle()
     except KeyboardInterrupt:
         logger.info("Бот остановлен")
+        await application.stop()
 
 if __name__ == '__main__':
     try:
