@@ -1,6 +1,3 @@
-httpx>=0.23.0
-python-telegram-bot>=20.0
-flask
-waitress
-psutil
-python-dotenv
+python-telegram-bot==20.0
+Flask==2.3.0
+httpx==0.25.0
