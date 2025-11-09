@@ -9,11 +9,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
 
 # ---------- 1. Load ENV Variables ----------
-BOT_TOKEN = os.environ.get("FPL_BOT_TOKEN")  # Render: your Telegram Bot Token
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # ИСПОЛЬЗУЙ ИМЯ КАК В ENVIRONMENT
 ENABLE_KILL = os.environ.get("ENABLE_KILL", "0") == "1"
 FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))
 FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "6"))
-PORT = int(os.environ.get("PORT", 10000))  # Render sets PORT automatically
+PORT = int(os.environ.get('PORT', 10000))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"
 stop_event = asyncio.Event()
@@ -38,19 +38,52 @@ def start_flask():
 
 def kill_existing_instances():
     logger.info("ENABLE_KILL is set, killing existing instances (placeholder)")
-    # Реальная логика завершения других процессов по вашему усмотрению (например, через psutil/lsof)
 
 # ---------- 4. Telegram Bot Handlers ----------
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я FPL-бот 🚀")
 
 async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Ваши очки: 42\nFPL_CACHE_TTL={FPL_CACHE_TTL}")
+    league_id = "980121"
+
+    async with httpx.AsyncClient() as client:
+        # Получаем текущий тур
+        gw_resp = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+        events = gw_resp.json()["events"]
+        current_gw = max(event["id"] for event in events if event.get("is_current", False))
+        last_gw = current_gw - 1
+
+        # Получаем участников лиги
+        url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
+        resp = await client.get(url)
+        league = resp.json()
+        results = league["standings"]["results"]
+
+        reply = "*Очки за прошлый тур:*\n\n"
+
+        # Для каждого участника — получение очков
+        for result in results:
+            entry_id = result["entry"]  # team id
+            entry_name = result["entry_name"]  # team name
+            player_name = result["player_name"]  # manager name
+
+            picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{last_gw}/picks/"
+            points = None
+            try:
+                picks_resp = await client.get(picks_url)
+                if picks_resp.status_code == 200:
+                    picks_json = picks_resp.json()
+                    points = picks_json.get("points")
+            except Exception as ex:
+                logger.warning(f"Не удалось получить очки для {entry_name}: {ex}")
+
+            reply += f"{player_name} — {entry_name}: {points if points is not None else 'нет данных'}\n"
+
+        await update.message.reply_text(reply, parse_mode="Markdown")
 
 async def _register_webhook_if_needed():
     logger.info("Webhook registration is not implemented in this example (placeholder)")
-    # Можно добавить логику установки вебхука, если нужно:
-    # await bot_application.bot.set_webhook(url=..., ...)
 
 # ---------- 5. Run Bot ----------
 async def run_bot():
