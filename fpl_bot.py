@@ -7,12 +7,21 @@ from threading import Thread
 import os
 import json
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Отключаем предупреждения werkzeug
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 # Настройки
-BOT_TOKEN = "8554755843:AAHZrdxLhNTDkr4P_G-zreyH2Poa_gsL6XY"  # Замените на ваш новый токен
+BOT_TOKEN = "8554755843:AAHZrdxLhNTDkr4P_G-zreyH2Poa_gsL6XY"
 LEAGUE_ID = 980121
 
-# Flask приложение
+# Flask приложение для Render
 app = Flask(__name__)
 
 @app.route('/')
@@ -24,264 +33,284 @@ def health():
     return {"status": "healthy", "bot": "running"}
 
 def run_flask():
+    """Запуск Flask с production сервером"""
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    
+    try:
+        # Пытаемся использовать waitress (production WSGI server)
+        from waitress import serve
+        logger.info(f"🚀 Starting production server on port {port}")
+        serve(app, host='0.0.0.0', port=port, threads=4)
+    except ImportError:
+        try:
+            # Если waitress нет, пытаемся gunicorn
+            import gunicorn.app.wsgiapp as wsgi
+            logger.info(f"🚀 Starting gunicorn server on port {port}")
+            # Это для случая если gunicorn установлен
+            app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
+        except ImportError:
+            # Fallback на встроенный сервер с отключенными предупреждениями
+            logger.warning("⚠️ Using development server (install waitress for production)")
+            import warnings
+            warnings.filterwarnings("ignore", message=".*development server.*")
+            
+            app.run(
+                host='0.0.0.0', 
+                port=port, 
+                debug=False, 
+                use_reloader=False, 
+                threaded=True
+            )
 
-def make_fpl_request(url, timeout=15, max_retries=2):
-    """Улучшенная функция для запросов к FPL API"""
+def make_fpl_request(url, timeout=10, max_retries=2):
+    """Быстрые запросы к FPL API"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json',
-        'Connection': 'keep-alive',
     }
     
     for attempt in range(max_retries):
         try:
-            print(f"🔄 Request to {url} (attempt {attempt + 1}/{max_retries})")
-            
             response = requests.get(url, headers=headers, timeout=timeout)
-            
             if response.status_code == 200:
-                try:
-                    data = response.json()
-                    print(f"✅ Success: {len(str(data))} chars received")
-                    return data
-                except json.JSONDecodeError:
-                    print("❌ Invalid JSON response")
-                    return None
-            else:
-                print(f"❌ HTTP {response.status_code}")
-                
-        except requests.exceptions.Timeout:
-            print(f"⏰ Timeout on attempt {attempt + 1}")
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Request error: {e}")
-        
-        if attempt < max_retries - 1:
-            time.sleep(3)
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Request failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
     
-    print(f"❌ Failed after {max_retries} attempts")
     return None
 
 def get_current_gameweek():
-    """Get current gameweek with timeout"""
+    """Получить текущий gameweek"""
     try:
-        print("🔄 Getting current gameweek...")
         data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
-        
         if not data or 'events' not in data:
             return None
         
-        # Найти текущий gameweek
         for event in data['events']:
             if event.get('is_current', False):
-                print(f"✅ Current gameweek: {event['id']}")
                 return event['id']
         
-        # Если не найден, взять первый незавершенный
+        # Если текущий не найден, берем первый незавершенный
         for event in data['events']:
             if not event.get('finished', True):
-                print(f"✅ Active gameweek: {event['id']}")
                 return event['id']
         
-        # Последний gameweek
-        gw = data['events'][-1]['id']
-        print(f"✅ Last gameweek: {gw}")
-        return gw
-        
-    except Exception as e:
-        print(f"❌ Error getting gameweek: {e}")
+        return data['events'][-1]['id']
+    except:
         return None
 
-def get_league_managers():
-    """Get league managers with timeout"""
+def get_league_standings():
+    """Получить топ менеджеров лиги"""
     try:
-        print("🔄 Getting league managers...")
         data = make_fpl_request(f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/")
-        
         if not data or 'standings' not in data:
             return []
         
-        managers = data['standings']['results']
-        print(f"✅ Found {len(managers)} managers")
-        return managers
-        
-    except Exception as e:
-        print(f"❌ Error getting managers: {e}")
+        # Берем только топ-10 для быстроты
+        return data['standings']['results'][:10]
+    except:
         return []
 
-def get_bootstrap_data():
-    """Get players and teams data with timeout"""
-    try:
-        print("🔄 Getting bootstrap data...")
-        data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
-        
-        if not data:
-            return {'elements': [], 'teams': []}
-        
-        players_count = len(data.get('elements', []))
-        teams_count = len(data.get('teams', []))
-        print(f"✅ Bootstrap: {players_count} players, {teams_count} teams")
-        
-        return data
-        
-    except Exception as e:
-        print(f"❌ Error getting bootstrap: {e}")
-        return {'elements': [], 'teams': []}
+def get_manager_picks_batch(manager_ids, gameweek):
+    """Получить составы менеджеров параллельно"""
+    def fetch_picks(manager_id):
+        url = f"https://fantasy.premierleague.com/api/entry/{manager_id}/event/{gameweek}/picks/"
+        data = make_fpl_request(url, timeout=8)
+        if data and 'picks' in data:
+            return manager_id, data['picks']
+        return manager_id, []
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_picks, mid): mid for mid in manager_ids}
+        for future in futures:
+            try:
+                manager_id, picks = future.result(timeout=10)
+                results[manager_id] = picks
+            except:
+                results[futures[future]] = []
+    
+    return results
 
 async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /points command with timeout protection"""
-    await update.message.reply_text("🔄 Fetching league points data...")
-    
+    """Команда для получения очков лиги"""
     try:
-        # Шаг 1: Получить текущий gameweek
+        await update.message.reply_text("🔄 Загружаю данные...")
+        
+        # Шаг 1: Получаем базовые данные
         current_gw = get_current_gameweek()
         if not current_gw:
-            await update.message.reply_text("❌ Could not get current gameweek. FPL API might be down.")
+            await update.message.reply_text("❌ Не удалось получить текущий gameweek")
             return
         
-        await update.message.reply_text(f"📅 Current gameweek: {current_gw}")
-        
-        # Шаг 2: Получить данные игроков и команд
-        bootstrap_data = get_bootstrap_data()
-        if not bootstrap_data.get('elements') or not bootstrap_data.get('teams'):
-            await update.message.reply_text("❌ Could not get players/teams data")
+        # Шаг 2: Получаем данные игроков и команд
+        bootstrap_data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
+        if not bootstrap_data:
+            await update.message.reply_text("❌ Не удалось получить данные игроков")
             return
         
         players = {p['id']: p for p in bootstrap_data['elements']}
         teams = {t['id']: t['name'] for t in bootstrap_data['teams']}
         
-        await update.message.reply_text(f"✅ Loaded {len(players)} players and {len(teams)} teams")
-        
-        # Шаг 3: Получить менеджеров лиги
-        managers = get_league_managers()
-        if not managers:
-            await update.message.reply_text("❌ Could not get league managers")
-            return
-        
-        await update.message.reply_text(f"👥 Found {len(managers)} managers")
-        
-        # Шаг 4: Получить live данные
-        print("🔄 Getting live data...")
+        # Шаг 3: Получаем live очки
         live_data = make_fpl_request(f"https://fantasy.premierleague.com/api/event/{current_gw}/live/")
-        
-        if not live_data or 'elements' not in live_data:
-            await update.message.reply_text("❌ Could not get live points data")
+        if not live_data:
+            await update.message.reply_text("❌ Не удалось получить live данные")
             return
         
         live_points = {item['id']: item['stats']['total_points'] for item in live_data['elements']}
-        await update.message.reply_text(f"📊 Live points loaded for {len(live_points)} players")
         
-        # Шаг 5: Обработать данные менеджеров
+        # Шаг 4: Получаем менеджеров лиги
+        managers = get_league_standings()
+        if not managers:
+            await update.message.reply_text("❌ Не удалось получить данные лиги")
+            return
+        
+        await update.message.reply_text(f"📊 Обрабатываю топ-{len(managers)} менеджеров...")
+        
+        # Шаг 5: Получаем составы параллельно
+        manager_ids = [m['entry'] for m in managers]
+        all_picks = get_manager_picks_batch(manager_ids, current_gw)
+        
+        # Шаг 6: Группируем игроков по командам
         team_players = {}
-        processed = 0
+        manager_names = {m['entry']: m['entry_name'] for m in managers}
         
-        for i, manager in enumerate(managers[:10]):  # Ограничиваем до 10 менеджеров для теста
-            manager_name = manager['entry_name']
-            manager_id = manager['entry']
-            
-            print(f"🔄 Processing manager {i+1}/{len(managers[:10])}: {manager_name}")
-            
-            picks_data = make_fpl_request(f"https://fantasy.premierleague.com/api/entry/{manager_id}/event/{current_gw}/picks/")
-            
-            if picks_data and 'picks' in picks_data:
-                processed += 1
+        for manager_id, picks in all_picks.items():
+            if not picks:
+                continue
                 
-                for pick in picks_data['picks'][:11]:  # Только стартовый состав
-                    player_id = pick['element']
-                    if player_id not in players:
-                        continue
-                    
-                    player = players[player_id]
-                    team_name = teams.get(player['team'], 'Unknown')
-                    points = live_points.get(player_id, 0)
-                    
-                    if team_name not in team_players:
-                        team_players[team_name] = []
-                    
-                    team_players[team_name].append({
-                        'name': player['web_name'],
-                        'manager': manager_name,
-                        'points': points
-                    })
+            manager_name = manager_names.get(manager_id, f"Manager {manager_id}")
+            
+            # Берем только стартовый состав (первые 11)
+            for pick in picks[:11]:
+                player_id = pick['element']
+                if player_id not in players:
+                    continue
+                
+                player = players[player_id]
+                team_name = teams.get(player['team'], 'Unknown')
+                points = live_points.get(player_id, 0)
+                
+                if team_name not in team_players:
+                    team_players[team_name] = []
+                
+                team_players[team_name].append({
+                    'name': player['web_name'],
+                    'manager': manager_name,
+                    'points': points,
+                    'multiplier': pick.get('multiplier', 1)
+                })
         
         if not team_players:
-            await update.message.reply_text("❌ No player data found")
+            await update.message.reply_text("❌ Не найдено данных об игроках")
             return
         
         # Формируем ответ
-        message = f"🏆 League {LEAGUE_ID} - GW{current_gw}\n"
-        message += f"📊 Processed {processed} managers\n\n"
+        message = f"🏆 Лига {LEAGUE_ID} - GW{current_gw}\n"
+        message += f"👥 Топ-{len([p for p in all_picks.values() if p])} менеджеров\n\n"
         
-        for team_name in sorted(team_players.keys())[:5]:  # Показываем только 5 команд
-            message += f"⚽ {team_name.upper()}\n"
+        # Показываем топ-5 команд по количеству игроков
+        sorted_teams = sorted(team_players.items(), key=lambda x: len(x[1]), reverse=True)[:5]
+        
+        for team_name, players_list in sorted_teams:
+            message += f"⚽ **{team_name.upper()}**\n"
             
-            sorted_players = sorted(team_players[team_name], key=lambda x: x['points'], reverse=True)[:5]
+            # Сортируем игроков по очкам
+            sorted_players = sorted(players_list, key=lambda x: x['points'] * x['multiplier'], reverse=True)[:5]
             
             for player in sorted_players:
-                message += f"• {player['name']} ({player['manager']}) - {player['points']} pts\n"
+                total_points = player['points'] * player['multiplier']
+                multiplier_text = f" (C)" if player['multiplier'] == 2 else f" (VC)" if player['multiplier'] == 1.5 else ""
+                message += f"• {player['name']}{multiplier_text} - {total_points} pts ({player['manager']})\n"
             
             message += "\n"
         
-        await update.message.reply_text(message)
+        # Разбиваем сообщение если оно слишком длинное
+        if len(message) > 4000:
+            parts = message.split('\n\n')
+            current_message = f"🏆 Лига {LEAGUE_ID} - GW{current_gw}\n"
+            current_message += f"👥 Топ-{len([p for p in all_picks.values() if p])} менеджеров\n\n"
+            
+            for part in parts[1:]:  # Пропускаем заголовок
+                if len(current_message + part) > 3500:
+                    await update.message.reply_text(current_message)
+                    current_message = part + "\n\n"
+                else:
+                    current_message += part + "\n\n"
+            
+            if current_message.strip():
+                await update.message.reply_text(current_message)
+        else:
+            await update.message.reply_text(message)
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-        print(f"Error in points_command: {e}")
+        logger.error(f"Error in points_command: {e}")
+        await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
+    """Команда /start"""
     welcome_text = f"""
-🤖 FPL League Bot
+🤖 **FPL League Bot**
 
-Commands:
-/points - Get current gameweek points for league {LEAGUE_ID}
+**Команды:**
+/points - Получить очки текущего gameweek для лиги {LEAGUE_ID}
 
-The bot shows players organized by Premier League teams with points and manager names.
+Бот показывает игроков, сгруппированных по командам Премьер-лиги, с очками и именами менеджеров.
+
+⚡ Обрабатывается топ-10 менеджеров для быстроты работы.
     """
-    await update.message.reply_text(welcome_text)
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def main():
-    """Start the bot"""
-    print("🚀 Starting FPL Bot...")
+    """Запуск бота"""
+    logger.info("🚀 Запуск FPL Bot...")
     
-    # Запуск Flask
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
+    # Запуск Flask в отдельном потоке
+    flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
     # Очистка webhook
     try:
         webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        requests.post(webhook_url, json={'drop_pending_updates': True}, timeout=10)
-        print("✅ Webhook cleared")
+        requests.post(webhook_url, json={'drop_pending_updates': True}, timeout=5)
+        logger.info("✅ Webhook очищен")
     except:
         pass
     
     # Создание приложения
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Добавление обработчиков
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("points", points_command))
     
-    # Запуск
+    # Запуск бота
     await application.initialize()
     await application.start()
     
     await application.updater.start_polling(
         drop_pending_updates=True,
-        timeout=20,
-        pool_timeout=20
+        timeout=15,
+        pool_timeout=15,
+        read_timeout=15,
+        write_timeout=15,
+        connect_timeout=15
     )
     
-    print("✅ Bot started successfully!")
+    logger.info("✅ Бот успешно запущен!")
     
-    # Держим бота запущенным
-    while True:
-        await asyncio.sleep(1)
+    # Держим бота активным
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен")
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Bot stopped")
+        print("Бот остановлен")
