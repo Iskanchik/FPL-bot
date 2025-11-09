@@ -2,16 +2,20 @@ import requests
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from flask import Flask
+from flask import Flask, request
 from threading import Thread
 import os
+import json
 
 # Настройки
 BOT_TOKEN = "8340413924:AAHpWBHdQxpiyuQIRvzafb-qe2CYLY491IY"
 LEAGUE_ID = 980121
 
-# Flask приложение для Render (чтобы не засыпал)
+# Flask приложение
 app = Flask(__name__)
+
+# Глобальная переменная для приложения
+telegram_app = None
 
 @app.route('/')
 def home():
@@ -21,22 +25,24 @@ def home():
 def health():
     return {"status": "healthy", "bot": "running"}
 
-def run_flask():
-    """Запуск Flask в отдельном потоке"""
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+@app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
+async def webhook():
+    """Handle incoming updates via webhook"""
+    if telegram_app:
+        update = Update.de_json(request.get_json(), telegram_app.bot)
+        await telegram_app.process_update(update)
+    return 'OK'
 
 # FPL API функции
 def get_current_gameweek():
     """Get current gameweek number"""
     try:
         response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        response.raise_for_status()  # Проверка на HTTP ошибки
+        response.raise_for_status()
         data = response.json()
         
         print(f"API Response status: {response.status_code}")
         
-        # Проверяем разные варианты определения текущего gameweek
         current_gw = None
         
         # Вариант 1: is_current = True
@@ -69,14 +75,8 @@ def get_current_gameweek():
         
         return current_gw
         
-    except requests.exceptions.RequestException as e:
-        print(f"Network error getting gameweek: {e}")
-        return None
-    except KeyError as e:
-        print(f"Data structure error: {e}")
-        return None
     except Exception as e:
-        print(f"Unexpected error getting gameweek: {e}")
+        print(f"Error getting gameweek: {e}")
         return None
 
 def get_league_managers():
@@ -132,7 +132,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         debug_info += f"Total events: {len(data['events'])}\n\n"
         
         debug_info += "Recent gameweeks:\n"
-        for event in data['events'][-5:]:  # Последние 5 gameweek
+        for event in data['events'][-5:]:
             status = []
             if event.get('is_current'): status.append('CURRENT')
             if event.get('is_next'): status.append('NEXT')
@@ -150,38 +150,32 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Fetching league points data...")
     
     try:
-        # Get current gameweek
         current_gw = get_current_gameweek()
         if not current_gw:
             await update.message.reply_text("❌ Could not determine current gameweek")
             return
         
-        # Get bootstrap data (players and teams)
         bootstrap_data = get_bootstrap_data()
         players = {p['id']: p for p in bootstrap_data['elements']}
         teams = {t['id']: t['name'] for t in bootstrap_data['teams']}
         
-        # Get league managers
         managers = get_league_managers()
         if not managers:
             await update.message.reply_text("❌ Could not fetch league managers")
             return
         
-        # Get live points data
         live_data = get_live_data(current_gw)
         live_points = {item['id']: item['stats']['total_points'] for item in live_data['elements']}
         
-        # Collect all player data by team
         team_players = {}
         
         for manager in managers:
             manager_name = manager['entry_name']
             manager_id = manager['entry']
             
-            # Get manager's picks
             picks_data = get_manager_picks(manager_id, current_gw)
             
-            for pick in picks_data['picks'][:11]:  # Only starting XI
+            for pick in picks_data['picks'][:11]:
                 player_id = pick['element']
                 if player_id not in players:
                     continue
@@ -205,13 +199,11 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ No player data found")
             return
         
-        # Format message
         message = f"🏆 League {LEAGUE_ID} - Gameweek {current_gw} Points\n\n"
         
         for team_name in sorted(team_players.keys()):
             message += f"⚽ {team_name.upper()}\n"
             
-            # Sort players by points (highest first)
             sorted_players = sorted(team_players[team_name], key=lambda x: x['points'], reverse=True)
             
             for player in sorted_players:
@@ -219,7 +211,6 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             message += "\n"
         
-        # Split message if too long (Telegram limit is 4096 characters)
         if len(message) > 4000:
             messages = []
             current_msg = f"🏆 League {LEAGUE_ID} - Gameweek {current_gw} Points\n\n"
@@ -262,30 +253,45 @@ The bot will show all players organized by their real Premier League teams with 
     """
     await update.message.reply_text(welcome_text)
 
+def setup_webhook(app_url):
+    """Setup webhook for the bot"""
+    webhook_url = f"{app_url}/webhook/{BOT_TOKEN}"
+    
+    # Удаляем webhook
+    delete_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+    requests.post(delete_url)
+    
+    # Устанавливаем новый webhook
+    set_webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+    response = requests.post(set_webhook_url, json={'url': webhook_url})
+    
+    print(f"Webhook setup response: {response.json()}")
+
 def main():
     """Start the bot"""
-    print("Starting FPL Bot...")
+    global telegram_app
     
-    # Запускаем Flask в отдельном потоке
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    print("Flask server started")
+    print("Starting FPL Bot with webhook...")
     
-    # Запускаем Telegram бота
-    try:
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("points", points_command))
-        application.add_handler(CommandHandler("debug", debug_command))
-        
-        print("Bot handlers added")
-        print("Starting polling...")
-        application.run_polling(drop_pending_updates=True)
-        
-    except Exception as e:
-        print(f"Error starting bot: {e}")
+    # Создаем приложение
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("points", points_command))
+    telegram_app.add_handler(CommandHandler("debug", debug_command))
+    
+    # Получаем URL приложения
+    app_url = os.environ.get('RENDER_EXTERNAL_URL', 'https://your-app.onrender.com')
+    
+    # Настраиваем webhook
+    setup_webhook(app_url)
+    
+    print("Bot handlers added")
+    print(f"Webhook set to: {app_url}/webhook/{BOT_TOKEN}")
+    
+    # Запускаем Flask
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 if __name__ == '__main__':
     main()
