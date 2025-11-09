@@ -24,10 +24,10 @@ def health():
 def run_flask():
     """Запуск Flask в отдельном потоке"""
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # FPL API функции
-async def get_current_gameweek():
+def get_current_gameweek():
     """Get current gameweek number"""
     try:
         response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
@@ -41,7 +41,7 @@ async def get_current_gameweek():
         print(f"Error getting gameweek: {e}")
         return None
 
-async def get_league_managers():
+def get_league_managers():
     """Get all managers in the league"""
     try:
         response = requests.get(f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/")
@@ -51,7 +51,7 @@ async def get_league_managers():
         print(f"Error getting managers: {e}")
         return []
 
-async def get_manager_picks(manager_id, gameweek):
+def get_manager_picks(manager_id, gameweek):
     """Get manager's picks for specific gameweek"""
     try:
         response = requests.get(f"https://fantasy.premierleague.com/api/entry/{manager_id}/event/{gameweek}/picks/")
@@ -60,7 +60,7 @@ async def get_manager_picks(manager_id, gameweek):
         print(f"Error getting picks for manager {manager_id}: {e}")
         return {'picks': []}
 
-async def get_live_data(gameweek):
+def get_live_data(gameweek):
     """Get live points data for gameweek"""
     try:
         response = requests.get(f"https://fantasy.premierleague.com/api/event/{gameweek}/live/")
@@ -69,7 +69,7 @@ async def get_live_data(gameweek):
         print(f"Error getting live data: {e}")
         return {'elements': []}
 
-async def get_bootstrap_data():
+def get_bootstrap_data():
     """Get player and team data"""
     try:
         response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
@@ -85,24 +85,24 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Get current gameweek
-        current_gw = await get_current_gameweek()
+        current_gw = get_current_gameweek()
         if not current_gw:
             await update.message.reply_text("❌ Could not determine current gameweek")
             return
         
         # Get bootstrap data (players and teams)
-        bootstrap_data = await get_bootstrap_data()
+        bootstrap_data = get_bootstrap_data()
         players = {p['id']: p for p in bootstrap_data['elements']}
         teams = {t['id']: t['name'] for t in bootstrap_data['teams']}
         
         # Get league managers
-        managers = await get_league_managers()
+        managers = get_league_managers()
         if not managers:
             await update.message.reply_text("❌ Could not fetch league managers")
             return
         
         # Get live points data
-        live_data = await get_live_data(current_gw)
+        live_data = get_live_data(current_gw)
         live_points = {item['id']: item['stats']['total_points'] for item in live_data['elements']}
         
         # Collect all player data by team
@@ -113,7 +113,7 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             manager_id = manager['entry']
             
             # Get manager's picks
-            picks_data = await get_manager_picks(manager_id, current_gw)
+            picks_data = get_manager_picks(manager_id, current_gw)
             
             for pick in picks_data['picks'][:11]:  # Only starting XI
                 player_id = pick['element']
@@ -197,19 +197,27 @@ The bot will show all players organized by their real Premier League teams with 
 
 def main():
     """Start the bot"""
+    print("Starting FPL Bot...")
+    
     # Запускаем Flask в отдельном потоке
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
+    print("Flask server started")
     
     # Запускаем Telegram бота
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("points", points_command))
-    
-    print("Bot is running...")
-    application.run_polling()
+    try:
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("points", points_command))
+        
+        print("Bot handlers added")
+        print("Starting polling...")
+        application.run_polling(drop_pending_updates=True)
+        
+    except Exception as e:
+        print(f"Error starting bot: {e}")
 
 if __name__ == '__main__':
     main()
