@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 # Настройки
-BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"  # ← ЗАМЕНИТЕ НА СВОЙ ТОКЕН!
+BOT_TOKEN = "8554755843:AAHZrdxLhNTDkr4P_G-zreyH2Poa_gsL6XY"  # ← ЗАМЕНИТЕ НА СВОЙ ТОКЕН!
 LEAGUE_ID = 980121
 
 # Flask приложение для Render
@@ -280,28 +280,56 @@ async def main():
     except:
         pass
     
-    # Создание приложения
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Добавление обработчиков
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("points", points_command))
-    
-    # Запуск бота (исправленная версия)
-    await application.initialize()
-    await application.start()
-    
-    # Простой polling без дополнительных параметров
-    await application.updater.start_polling()
-    
-    logger.info("✅ Бот успешно запущен!")
-    
-    # Держим бота активным
     try:
-        await application.updater.idle()
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
-        await application.stop()
+        # Создание приложения БЕЗ updater
+        application = Application.builder().token(BOT_TOKEN).updater(None).build()
+        
+        # Добавление обработчиков
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("points", points_command))
+        
+        # Инициализация
+        await application.initialize()
+        await application.start()
+        
+        # Создаем отдельный updater
+        from telegram.ext import Updater
+        updater = Updater(bot=application.bot, update_queue=application.update_queue)
+        
+        # Запуск polling
+        await updater.start_polling()
+        
+        logger.info("✅ Бот успешно запущен!")
+        
+        # Держим бота активным
+        try:
+            await updater.idle()
+        except KeyboardInterrupt:
+            logger.info("Бот остановлен")
+        finally:
+            await updater.stop()
+            await application.stop()
+            
+    except Exception as e:
+        logger.error(f"Ошибка при создании приложения: {e}")
+        
+        # Альтернативный способ запуска для старых версий
+        try:
+            logger.info("Пробуем альтернативный способ запуска...")
+            
+            from telegram.ext import ApplicationBuilder
+            
+            app = ApplicationBuilder().token(BOT_TOKEN).build()
+            
+            app.add_handler(CommandHandler("start", start_command))
+            app.add_handler(CommandHandler("points", points_command))
+            
+            logger.info("✅ Бот запущен (альтернативный способ)!")
+            await app.run_polling()
+            
+        except Exception as e2:
+            logger.error(f"Альтернативный способ тоже не сработал: {e2}")
+            raise
 
 if __name__ == '__main__':
     try:
