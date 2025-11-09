@@ -1,4 +1,22 @@
+"""
+FPL Telegram Bot (PTB v21+):
+- Request headers (anti-403), optional HTTP/2
+- Optional Cloudflare Worker proxy via FPL_PROXY_BASE
+- Caching bootstrap-static with TTL
+- Concurrency limiting via semaphore
+- Last finished GW detection (/points)
+- Pagination of league standings
+- /gw <number> for explicit gameweek points
+- /rank to show current league standings
+- /help and Telegram command descriptions (set_my_commands)
+- Message splitting (Telegram 4096 chars limit)
+- Graceful shutdown (run_polling handles signals)
+- Health endpoint (/healthz)
+- Optional fallback of events from env FPL_EVENTS_JSON
+"""
+
 import os
+import json
 import asyncio
 import threading
 import logging
@@ -12,22 +30,6 @@ import httpx
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update, BotCommand
 
-"""
-FPL Telegram Bot:
-- Request headers (anti-403), HTTP/2
-- Caching bootstrap-static with TTL
-- Concurrency limiting via semaphore
-- Last finished GW detection (/points)
-- Pagination of league standings
-- /gw <number> for explicit gameweek points
-- /rank to show current league standings
-- /help + Telegram command descriptions (set_my_commands)
-- Message splitting (Telegram 4096 chars limit)
-- Graceful shutdown (SIGTERM/SIGINT)
-- Health endpoint (/healthz)
-- Optional proxy (FPL_PROXY_BASE) to bypass Cloudflare blocks on PaaS
-"""
-
 # ---------- 1. ENV ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -35,12 +37,13 @@ if not BOT_TOKEN:
 
 ENABLE_KILL = os.environ.get("ENABLE_KILL", "0") == "1"
 FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))            # minutes
-FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))        # снизили по умолчанию
+FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))        # conservative default
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
-USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"
+USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"               # placeholder, run_polling used
 LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")
-FPL_PROXY_BASE = os.environ.get("FPL_PROXY_BASE", "").rstrip("/")    # если задан, используем как базовый хост
+FPL_PROXY_BASE = os.environ.get("FPL_PROXY_BASE", "").rstrip("/")    # e.g., https://<worker>.workers.dev
+ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "1") == "1"            # can disable if needed
 
 stop_event = asyncio.Event()
 
@@ -80,7 +83,6 @@ def kill_existing_instances():
 
 # ---------- 4. HTTP / Cache / Headers ----------
 
-# Если нужен прокси, будем собирать URL из базового префикса + путь.
 def fpl_url(path: str) -> str:
     base = FPL_PROXY_BASE or "https://fantasy.premierleague.com"
     return f"{base}{path}"
@@ -94,7 +96,6 @@ FPL_BASE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://fantasy.premierleague.com/",
     "Origin": "https://fantasy.premierleague.com",
-    # Доп. заголовки, чтобы походить на браузер
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Connection": "keep-alive",
@@ -105,7 +106,6 @@ bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
 bootstrap_lock = asyncio.Lock()
 
-# Ходим по путям (а не по полным URL), чтобы легко подменять базу
 bootstrap_path = "/api/bootstrap-static/"
 league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
@@ -121,7 +121,6 @@ async def fetch_json(
     attempt = 0
     while attempt < max_attempts:
         attempt += 1
-        # немного рандома перед запросом, чтобы не бить в одинаковые интервалы
         await asyncio.sleep(random.uniform(0.05, 0.2))
         try:
             async with fpl_semaphore:
@@ -160,10 +159,21 @@ def bootstrap_cache_valid() -> bool:
     age = (time.time() - bootstrap_cache_ts) / 60.0
     return age < FPL_CACHE_TTL
 
+def get_events_from_env() -> Optional[List[Dict]]:
+    raw = os.environ.get("FPL_EVENTS_JSON")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception as ex:
+        logger.error(f"Failed to parse FPL_EVENTS_JSON: {ex}")
+        return None
+
 async def get_bootstrap() -> Optional[Dict]:
     async with bootstrap_lock:
         if bootstrap_cache_valid():
             return bootstrap_cache
+    # try network
     data = await fetch_json(fpl_url(bootstrap_path))
     if data:
         async with bootstrap_lock:
@@ -171,7 +181,18 @@ async def get_bootstrap() -> Optional[Dict]:
             bootstrap_cache.update(data)
             global bootstrap_cache_ts
             bootstrap_cache_ts = time.time()
-    return data
+        return data
+    # fallback to env
+    env_events = get_events_from_env()
+    if env_events:
+        logger.warning("Using FPL_EVENTS_JSON fallback for bootstrap.events")
+        fake = {"events": env_events}
+        async with bootstrap_lock:
+            bootstrap_cache.clear()
+            bootstrap_cache.update(fake)
+            bootstrap_cache_ts = time.time()
+        return fake
+    return None
 
 def choose_last_finished_gw(events: List[Dict]) -> Optional[int]:
     finished = [e for e in events if e.get("finished")]
@@ -246,9 +267,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /points => очки за последний завершённый тур
-    """
     league_id = LEAGUE_ID
     bootstrap = await get_bootstrap()
     if not bootstrap:
@@ -270,9 +288,6 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_league_points(update, league_id, last_finished_gw, events, header_override=None)
 
 async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /gw <номер> => очки за конкретный тур
-    """
     league_id = LEAGUE_ID
     args = context.args
     if not args:
@@ -318,9 +333,6 @@ async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_league_points(update, league_id, gw_num, events, header_override=header)
 
 async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /rank => текущее положение (классическая лига)
-    """
     league_id = LEAGUE_ID
     results = await fetch_all_league_results(league_id)
     if results is None:
@@ -433,14 +445,23 @@ async def setup_bot_commands(bot):
         pass
     logger.info("Telegram command menu set.")
 
-# ---------- 8. Run Bot ----------
+# ---------- 8. Run Bot (PTB v21 run_polling, без Updater) ----------
 async def run_bot():
     global http_client
     logger.info("Starting bot...")
 
+    # HTTP client with optional HTTP/2
     limits = httpx.Limits(max_keepalive_connections=10, max_connections=50)
-    # Включаем HTTP/2 — иногда помогает против 403/CF
-    http_client = httpx.AsyncClient(http2=True, limits=limits, timeout=15.0)
+    use_http2 = ENABLE_HTTP2
+    if use_http2:
+        try:
+            import h2  # noqa: F401
+        except ImportError:
+            logger.warning("h2 package not found, disabling HTTP/2. Install httpx[http2] to enable.")
+            use_http2 = False
+
+    http_client = httpx.AsyncClient(http2=use_http2, limits=limits, timeout=15.0)
+    logger.info(f"httpx client created (http2={use_http2})")
 
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
     application.add_handler(CommandHandler("start", start_command))
@@ -450,64 +471,24 @@ async def run_bot():
     application.add_handler(CommandHandler("rank", rank_command))
     application.add_error_handler(error_handler)
 
-    await application.initialize()
-    await application.start()
-
-    try:
-        me = await application.bot.get_me()
-        logger.info("Bot started as @%s (id=%s)", getattr(me, "username", "unknown"), getattr(me, "id", "unknown"))
-    except Exception:
-        logger.exception("Failed to get_me")
-
+    # Настроим меню команд до старта polling
     try:
         await setup_bot_commands(application.bot)
     except Exception:
         logger.exception("Failed to set bot commands")
 
-    if USE_WEBHOOK:
-        await _register_webhook_if_needed()
-    else:
-        try:
-            await application.updater.start_polling()
-            logger.info("Polling started")
-        except Exception:
-            logger.exception("Failed to start polling")
-
-    logger.info("Bot started, waiting for stop_event...")
+    # В v21 используем run_polling (обрабатывает сигналы и корректное завершение)
     try:
-        await stop_event.wait()
+        await application.run_polling()
     finally:
-        logger.info("Shutdown initiated")
-
-        if not USE_WEBHOOK:
-            try:
-                await application.updater.stop()
-                logger.info("Updater stopped")
-            except Exception:
-                logger.exception("Error stopping updater")
-
         try:
-            await application.stop()
-            await application.shutdown()
-        except Exception:
-            logger.exception("Error shutting down application")
-
-        try:
-            if http_client:
-                await http_client.aclose()
+            await http_client.aclose()
         except Exception:
             logger.exception("Error closing HTTP client")
 
-        logger.info("SHUTDOWN COMPLETE")
-
-# ---------- 9. Signals ----------
+# ---------- 9. Signals (необязательно, run_polling сам ловит SIGINT/SIGTERM) ----------
 def handle_sigterm(signum, frame):
-    logger.info("SIGTERM/SIGINT received, initiating shutdown...")
-    try:
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(stop_event.set)
-    except RuntimeError:
-        pass
+    logger.info("SIGTERM/SIGINT received")
 
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
