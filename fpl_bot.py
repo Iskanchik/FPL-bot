@@ -9,7 +9,7 @@ import json
 import asyncio
 
 # Настройки
-BOT_TOKEN = "ВАШ_НОВЫЙ_ТОКЕН"  # Замените на ваш новый токен
+BOT_TOKEN = "8554755843:AAHZrdxLhNTDkr4P_G-zreyH2Poa_gsL6XY"  # Замените на ваш новый токен
 LEAGUE_ID = 980121
 
 # Flask приложение
@@ -252,7 +252,7 @@ async def main():
     
     # Очистка webhook
     try:
-        webhook_url = f"https://api.telegram.org/bot{8554755843:AAHZrdxLhNTDkr4P_G-zreyH2Poa_gsL6XY}/deleteWebhook"
+        webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
         requests.post(webhook_url, json={'drop_pending_updates': True}, timeout=10)
         print("✅ Webhook cleared")
     except:
