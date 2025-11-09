@@ -2,14 +2,13 @@ import os
 import asyncio
 import threading
 import logging
-
 from flask import Flask
 import httpx
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
 
 # ---------- 1. Load ENV Variables ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # ИСПОЛЬЗУЙ ИМЯ КАК В ENVIRONMENT
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Имя переменной как в Render Environment!
 ENABLE_KILL = os.environ.get("ENABLE_KILL", "0") == "1"
 FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))
 FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "6"))
@@ -46,41 +45,63 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     league_id = "980121"
-
-    async with httpx.AsyncClient() as client:
-        # Получаем текущий тур
-        gw_resp = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        events = gw_resp.json()["events"]
-        current_gw = max(event["id"] for event in events if event.get("is_current", False))
-        last_gw = current_gw - 1
-
-        # Получаем участников лиги
-        url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
-        resp = await client.get(url)
-        league = resp.json()
-        results = league["standings"]["results"]
-
-        reply = "*Очки за прошлый тур:*\n\n"
-
-        # Для каждого участника — получение очков
-        for result in results:
-            entry_id = result["entry"]  # team id
-            entry_name = result["entry_name"]  # team name
-            player_name = result["player_name"]  # manager name
-
-            picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{last_gw}/picks/"
-            points = None
+    try:
+        async with httpx.AsyncClient() as client:
+            # Получаем текущий тур
+            gw_resp = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+            if gw_resp.status_code != 200:
+                err_txt = f"FPL API bootstrap-static недоступен ({gw_resp.status_code})"
+                logger.error(err_txt)
+                await update.message.reply_text(err_txt)
+                return
             try:
-                picks_resp = await client.get(picks_url)
-                if picks_resp.status_code == 200:
-                    picks_json = picks_resp.json()
-                    points = picks_json.get("points")
+                events = gw_resp.json()["events"]
             except Exception as ex:
-                logger.warning(f"Не удалось получить очки для {entry_name}: {ex}")
+                logger.error(f"Ошибка декодирования событий FPL GW: {ex}")
+                await update.message.reply_text("Ошибка при обработке ответа от FPL API.")
+                return
+            current_gw = max(event["id"] for event in events if event.get("is_current", False))
+            last_gw = current_gw - 1
 
-            reply += f"{player_name} — {entry_name}: {points if points is not None else 'нет данных'}\n"
+            # Получаем участников лиги
+            url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                err_txt = f"FPL API standings недоступен ({resp.status_code})"
+                logger.error(err_txt)
+                await update.message.reply_text(err_txt)
+                return
+            try:
+                league = resp.json()
+                results = league["standings"]["results"]
+            except Exception as ex:
+                logger.error(f"Ошибка декодирования standings: {ex}")
+                await update.message.reply_text("Ошибка при обработке участников лиги.")
+                return
 
-        await update.message.reply_text(reply, parse_mode="Markdown")
+            reply = "*Очки за прошлый тур:*\n\n"
+
+            # Для каждого участника — получение очков
+            for result in results:
+                entry_id = result["entry"]
+                entry_name = result["entry_name"]
+                player_name = result["player_name"]
+
+                picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{last_gw}/picks/"
+                points = None
+                try:
+                    picks_resp = await client.get(picks_url)
+                    if picks_resp.status_code == 200:
+                        picks_json = picks_resp.json()
+                        points = picks_json.get("points")
+                except Exception as ex:
+                    logger.warning(f"Не удалось получить очки для {entry_name}: {ex}")
+                reply += f"{player_name} — {entry_name}: {points if points is not None else 'нет данных'}\n"
+
+            await update.message.reply_text(reply, parse_mode="Markdown")
+    except Exception as exc:
+        logger.exception("Ошибка в обработчике /points")
+        await update.message.reply_text("Внутренняя ошибка сервера при получении очков!")
 
 async def _register_webhook_if_needed():
     logger.info("Webhook registration is not implemented in this example (placeholder)")
