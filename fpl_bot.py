@@ -6,6 +6,7 @@ from flask import Flask
 from threading import Thread
 import os
 import json
+import asyncio
 
 # Настройки
 BOT_TOKEN = "8554755843:AAFpoM3sRxuvgSutlQLrObjquNt2xdJAT9k"
@@ -27,18 +28,18 @@ def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-def aggressive_clear_bot():
+async def aggressive_clear_bot():
     """Агрессивная очистка всех подключений бота"""
     try:
         print("🔥 Starting aggressive bot cleanup...")
         
         # 1. Удаляем webhook
         delete_webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        response = requests.post(delete_webhook_url, json={'drop_pending_updates': True})
+        response = requests.post(delete_webhook_url, json={'drop_pending_updates': True}, timeout=10)
         print(f"Webhook delete response: {response.json()}")
         
         # 2. Получаем и очищаем все pending updates
-        for i in range(5):  # Делаем несколько попыток
+        for i in range(3):  # Уменьшаем количество попыток
             get_updates_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
             params = {'offset': -1, 'limit': 100, 'timeout': 1}
             response = requests.get(get_updates_url, params=params, timeout=10)
@@ -55,16 +56,7 @@ def aggressive_clear_bot():
             else:
                 print(f"Error getting updates: {response.status_code}")
             
-            time.sleep(2)
-        
-        # 3. Проверяем статус бота
-        get_me_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-        response = requests.get(get_me_url)
-        if response.status_code == 200:
-            bot_info = response.json()
-            print(f"Bot info: {bot_info}")
-        else:
-            print(f"Error getting bot info: {response.status_code}")
+            await asyncio.sleep(2)  # Используем asyncio.sleep
         
         print("✅ Bot cleanup completed")
         
@@ -74,15 +66,28 @@ def aggressive_clear_bot():
 def make_fpl_request(url, max_retries=3):
     """Делает запрос к FPL API с повторными попытками"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
     }
     
     for attempt in range(max_retries):
         try:
             print(f"Making request to {url} (attempt {attempt + 1})")
+            
+            # Увеличиваем задержку между попытками
+            if attempt > 0:
+                wait_time = min(30, 10 * (2 ** attempt))  # Экспоненциальная задержка, максимум 30 сек
+                print(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            
             response = requests.get(url, headers=headers, timeout=30)
             
             print(f"Response status: {response.status_code}")
+            print(f"Response headers: {dict(response.headers)}")
             
             if response.status_code == 200:
                 if response.text.strip():
@@ -95,24 +100,27 @@ def make_fpl_request(url, max_retries=3):
                         print(f"Response text: {response.text[:200]}...")
                 else:
                     print("Empty response body")
+            elif response.status_code == 403:
+                print(f"HTTP 403 Forbidden - possible rate limiting or IP block")
+                if attempt < max_retries - 1:
+                    wait_time = 60  # Ждем минуту при 403
+                    print(f"Waiting {wait_time} seconds due to 403 error...")
+                    time.sleep(wait_time)
             else:
                 print(f"HTTP error: {response.status_code}")
+                print(f"Response text: {response.text[:200]}...")
                 
         except requests.exceptions.Timeout:
             print(f"Timeout on attempt {attempt + 1}")
-        except requests.exceptions.ConnectionError:
-            print(f"Connection error on attempt {attempt + 1}")
+        except requests.exceptions.ConnectionError as e:
+            print(f"Connection error on attempt {attempt + 1}: {e}")
         except Exception as e:
             print(f"Unexpected error on attempt {attempt + 1}: {e}")
-        
-        if attempt < max_retries - 1:
-            print(f"Waiting 5 seconds before retry...")
-            time.sleep(5)
     
     print(f"Failed to get data from {url} after {max_retries} attempts")
     return None
 
-# FPL API функции
+# FPL API функции (остаются без изменений)
 def get_current_gameweek():
     """Get current gameweek number"""
     try:
@@ -216,7 +224,7 @@ def get_bootstrap_data():
         print(f"Error getting bootstrap data: {e}")
         return {'elements': [], 'teams': []}
 
-# Telegram bot команды
+# Telegram bot команды (остаются без изменений)
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Debug command to check API data"""
     try:
@@ -366,13 +374,9 @@ The bot will show all players organized by their real Premier League teams with 
     """
     await update.message.reply_text(welcome_text)
 
-def main():
+async def main():
     """Start the bot"""
-    print("🚀 Starting FPL Bot with aggressive cleanup...")
-    
-    # Агрессивная очистка всех подключений
-    aggressive_clear_bot()
-    time.sleep(5)  # Ждем дольше
+    print("🚀 Starting FPL Bot with improved error handling...")
     
     # Запускаем Flask в отдельном потоке
     flask_thread = Thread(target=run_flask)
@@ -380,46 +384,52 @@ def main():
     flask_thread.start()
     print("Flask server started")
     
-    # Запускаем Telegram бота с увеличенными задержками
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            print(f"🔄 Bot start attempt {attempt + 1}/{max_retries}")
+    # Агрессивная очистка всех подключений
+    await aggressive_clear_bot()
+    await asyncio.sleep(3)
+    
+    # Создаем приложение с улучшенными настройками
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("points", points_command))
+    application.add_handler(CommandHandler("debug", debug_command))
+    
+    print("Bot handlers added")
+    print("Starting polling...")
+    
+    # Запускаем с оптимизированными настройками
+    await application.initialize()
+    await application.start()
+    
+    try:
+        await application.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            timeout=20,
+            pool_timeout=20,
+            connect_timeout=20,
+            read_timeout=20,
+            write_timeout=20
+        )
+        
+        print("✅ Bot started successfully!")
+        
+        # Держим бота запущенным
+        while True:
+            await asyncio.sleep(1)
             
-            # Дополнительная очистка перед каждой попыткой
-            if attempt > 0:
-                aggressive_clear_bot()
-                time.sleep(10)  # Ждем еще дольше
-            
-            application = Application.builder().token(BOT_TOKEN).build()
-            
-            application.add_handler(CommandHandler("start", start_command))
-            application.add_handler(CommandHandler("points", points_command))
-            application.add_handler(CommandHandler("debug", debug_command))
-            
-            print("Bot handlers added")
-            print("Starting polling with extended timeouts...")
-            
-            # Запускаем с максимальными таймаутами
-            application.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
-                timeout=30,
-                pool_timeout=30,
-                connect_timeout=30,
-                read_timeout=30,
-                write_timeout=30
-            )
-            break  # Если успешно запустился, выходим из цикла
-            
-        except Exception as e:
-            print(f"❌ Error starting bot (attempt {attempt + 1}): {e}")
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 10  # Увеличиваем время ожидания
-                print(f"⏳ Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-            else:
-                print("💀 Failed to start bot after all attempts")
+    except Exception as e:
+        print(f"❌ Error during bot operation: {e}")
+    finally:
+        await application.stop()
+        await application.shutdown()
 
 if __name__ == '__main__':
-    main()
+    # Запускаем основную функцию
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user")
+    except Exception as e:
+        print(f"Fatal error: {e}")
