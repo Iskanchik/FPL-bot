@@ -5,6 +5,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask
 from threading import Thread
 import os
+import json
 
 # Настройки
 BOT_TOKEN = "8554755843:AAFpoM3sRxuvgSutlQLrObjquNt2xdJAT9k"
@@ -42,15 +43,60 @@ def clear_webhook():
     except Exception as e:
         print(f"Error clearing webhook: {e}")
 
+def make_fpl_request(url, max_retries=3):
+    """Делает запрос к FPL API с повторными попытками"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"Making request to {url} (attempt {attempt + 1})")
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            print(f"Response status: {response.status_code}")
+            print(f"Response headers: {dict(response.headers)}")
+            
+            if response.status_code == 200:
+                if response.text.strip():
+                    try:
+                        data = response.json()
+                        print(f"Successfully parsed JSON data")
+                        return data
+                    except json.JSONDecodeError as e:
+                        print(f"JSON decode error: {e}")
+                        print(f"Response text: {response.text[:200]}...")
+                else:
+                    print("Empty response body")
+            else:
+                print(f"HTTP error: {response.status_code}")
+                print(f"Response text: {response.text[:200]}...")
+                
+        except requests.exceptions.Timeout:
+            print(f"Timeout on attempt {attempt + 1}")
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error on attempt {attempt + 1}")
+        except Exception as e:
+            print(f"Unexpected error on attempt {attempt + 1}: {e}")
+        
+        if attempt < max_retries - 1:
+            print(f"Waiting 5 seconds before retry...")
+            time.sleep(5)
+    
+    print(f"Failed to get data from {url} after {max_retries} attempts")
+    return None
+
 # FPL API функции
 def get_current_gameweek():
     """Get current gameweek number"""
     try:
-        response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        response.raise_for_status()
-        data = response.json()
+        data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
         
-        print(f"API Response status: {response.status_code}")
+        if not data or 'events' not in data:
+            print("No events data found")
+            return None
+        
+        print(f"Found {len(data['events'])} events")
         
         current_gw = None
         
@@ -91,9 +137,12 @@ def get_current_gameweek():
 def get_league_managers():
     """Get all managers in the league"""
     try:
-        response = requests.get(f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/")
-        response.raise_for_status()
-        data = response.json()
+        data = make_fpl_request(f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/")
+        
+        if not data or 'standings' not in data or 'results' not in data['standings']:
+            print("No league standings data found")
+            return []
+            
         return data['standings']['results']
     except Exception as e:
         print(f"Error getting managers: {e}")
@@ -102,9 +151,13 @@ def get_league_managers():
 def get_manager_picks(manager_id, gameweek):
     """Get manager's picks for specific gameweek"""
     try:
-        response = requests.get(f"https://fantasy.premierleague.com/api/entry/{manager_id}/event/{gameweek}/picks/")
-        response.raise_for_status()
-        return response.json()
+        data = make_fpl_request(f"https://fantasy.premierleague.com/api/entry/{manager_id}/event/{gameweek}/picks/")
+        
+        if not data or 'picks' not in data:
+            print(f"No picks data found for manager {manager_id}")
+            return {'picks': []}
+            
+        return data
     except Exception as e:
         print(f"Error getting picks for manager {manager_id}: {e}")
         return {'picks': []}
@@ -112,9 +165,13 @@ def get_manager_picks(manager_id, gameweek):
 def get_live_data(gameweek):
     """Get live points data for gameweek"""
     try:
-        response = requests.get(f"https://fantasy.premierleague.com/api/event/{gameweek}/live/")
-        response.raise_for_status()
-        return response.json()
+        data = make_fpl_request(f"https://fantasy.premierleague.com/api/event/{gameweek}/live/")
+        
+        if not data or 'elements' not in data:
+            print(f"No live data found for gameweek {gameweek}")
+            return {'elements': []}
+            
+        return data
     except Exception as e:
         print(f"Error getting live data: {e}")
         return {'elements': []}
@@ -122,9 +179,13 @@ def get_live_data(gameweek):
 def get_bootstrap_data():
     """Get player and team data"""
     try:
-        response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        response.raise_for_status()
-        return response.json()
+        data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
+        
+        if not data or 'elements' not in data or 'teams' not in data:
+            print("No bootstrap data found")
+            return {'elements': [], 'teams': []}
+            
+        return data
     except Exception as e:
         print(f"Error getting bootstrap data: {e}")
         return {'elements': [], 'teams': []}
@@ -133,21 +194,29 @@ def get_bootstrap_data():
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Debug command to check API data"""
     try:
-        response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        data = response.json()
+        await update.message.reply_text("🔍 Checking FPL API...")
+        
+        data = make_fpl_request("https://fantasy.premierleague.com/api/bootstrap-static/")
+        
+        if not data:
+            await update.message.reply_text("❌ Failed to connect to FPL API")
+            return
         
         debug_info = "🔍 Debug Info:\n\n"
-        debug_info += f"API Status: {response.status_code}\n"
-        debug_info += f"Total events: {len(data['events'])}\n\n"
+        debug_info += f"✅ API Connection: OK\n"
+        debug_info += f"Total events: {len(data.get('events', []))}\n"
+        debug_info += f"Total players: {len(data.get('elements', []))}\n"
+        debug_info += f"Total teams: {len(data.get('teams', []))}\n\n"
         
-        debug_info += "Recent gameweeks:\n"
-        for event in data['events'][-5:]:
-            status = []
-            if event.get('is_current'): status.append('CURRENT')
-            if event.get('is_next'): status.append('NEXT')
-            if event.get('finished'): status.append('FINISHED')
-            
-            debug_info += f"GW{event['id']}: {event['name']} - {', '.join(status) if status else 'ACTIVE'}\n"
+        if 'events' in data and data['events']:
+            debug_info += "Recent gameweeks:\n"
+            for event in data['events'][-5:]:
+                status = []
+                if event.get('is_current'): status.append('CURRENT')
+                if event.get('is_next'): status.append('NEXT')
+                if event.get('finished'): status.append('FINISHED')
+                
+                debug_info += f"GW{event['id']}: {event['name']} - {', '.join(status) if status else 'ACTIVE'}\n"
         
         await update.message.reply_text(debug_info)
         
@@ -161,22 +230,27 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         current_gw = get_current_gameweek()
         if not current_gw:
-            await update.message.reply_text("❌ Could not determine current gameweek")
+            await update.message.reply_text("❌ Could not determine current gameweek. FPL API might be down.")
             return
         
         bootstrap_data = get_bootstrap_data()
+        if not bootstrap_data['elements'] or not bootstrap_data['teams']:
+            await update.message.reply_text("❌ Could not fetch player/team data from FPL API")
+            return
+            
         players = {p['id']: p for p in bootstrap_data['elements']}
         teams = {t['id']: t['name'] for t in bootstrap_data['teams']}
         
         managers = get_league_managers()
         if not managers:
-            await update.message.reply_text("❌ Could not fetch league managers")
+            await update.message.reply_text("❌ Could not fetch league managers. Check league ID.")
             return
         
         live_data = get_live_data(current_gw)
         live_points = {item['id']: item['stats']['total_points'] for item in live_data['elements']}
         
         team_players = {}
+        processed_managers = 0
         
         for manager in managers:
             manager_name = manager['entry_name']
@@ -184,31 +258,35 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             picks_data = get_manager_picks(manager_id, current_gw)
             
-            for pick in picks_data['picks'][:11]:
-                player_id = pick['element']
-                if player_id not in players:
-                    continue
+            if picks_data['picks']:
+                processed_managers += 1
+                
+                for pick in picks_data['picks'][:11]:
+                    player_id = pick['element']
+                    if player_id not in players:
+                        continue
+                        
+                    player = players[player_id]
+                    team_id = player['team']
+                    team_name = teams.get(team_id, 'Unknown')
                     
-                player = players[player_id]
-                team_id = player['team']
-                team_name = teams.get(team_id, 'Unknown')
-                
-                points = live_points.get(player_id, 0)
-                
-                if team_name not in team_players:
-                    team_players[team_name] = []
-                
-                team_players[team_name].append({
-                    'name': player['web_name'],
-                    'manager': manager_name,
-                    'points': points
-                })
+                    points = live_points.get(player_id, 0)
+                    
+                    if team_name not in team_players:
+                        team_players[team_name] = []
+                    
+                    team_players[team_name].append({
+                        'name': player['web_name'],
+                        'manager': manager_name,
+                        'points': points
+                    })
         
         if not team_players:
-            await update.message.reply_text("❌ No player data found")
+            await update.message.reply_text(f"❌ No player data found. Processed {processed_managers} managers.")
             return
         
-        message = f"🏆 League {LEAGUE_ID} - Gameweek {current_gw} Points\n\n"
+        message = f"🏆 League {LEAGUE_ID} - Gameweek {current_gw} Points\n"
+        message += f"📊 Processed {processed_managers} managers\n\n"
         
         for team_name in sorted(team_players.keys()):
             message += f"⚽ {team_name.upper()}\n"
@@ -222,7 +300,7 @@ async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if len(message) > 4000:
             messages = []
-            current_msg = f"🏆 League {LEAGUE_ID} - Gameweek {current_gw} Points\n\n"
+            current_msg = f"🏆 League {LEAGUE_ID} - Gameweek {current_gw} Points\n📊 Processed {processed_managers} managers\n\n"
             
             for team_name in sorted(team_players.keys()):
                 team_section = f"⚽ {team_name.upper()}\n"
@@ -256,7 +334,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Commands:
 /points - Get current gameweek points for league {LEAGUE_ID}
-/debug - Show gameweek debug info
+/debug - Show API connection debug info
 
 The bot will show all players organized by their real Premier League teams with points and manager names.
     """
