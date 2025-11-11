@@ -1,26 +1,29 @@
 """
 FPL Telegram Bot (PTB v21) + Upstash Redis persistence for realtime events.
 
-Features (summary):
-- Cloudflare Worker proxy support (FPL_PROXY_BASE) to avoid 403
-- Async HTTP via httpx (optional HTTP/2 if h2 installed and ENABLE_HTTP2=1)
+Summary:
+- Proxy support (FPL_PROXY_BASE) to avoid 403
+- Async HTTP (httpx, optional HTTP/2 if h2 installed & ENABLE_HTTP2=1)
 - Caching: bootstrap, standings, picks
-- Realtime monitoring (league players only): goals, assists, yellow cards, red cards, own goals,
-  penalties missed, penalties saved, clean sheets (early + final)
+- Live monitoring (league players only): goals, assists, yellow cards, red cards, own goals,
+  penalties missed, penalties saved, clean sheets (early lock + final)
 - Defensive Contribution (DC) points (official CBIT threshold):
-    * DEF (element_type=2): >=10 CBIT → +2
-    * MID/FWD (3/4): >=12 CBIT → +2
-    * GK (1): 0
-- /gwinfo table (owners REMOVED per request):
+    DEF (element_type=2): >=10 CBIT → +2
+    MID/FWD (3/4):      >=12 CBIT → +2
+    GK (1):             not eligible
+  Field names tried: defensive_contributions, cbit, cbits, def_contributions
+- /gwinfo table (owners removed):
     Columns: Player | Stats | Pts
-    Stat order: G, A, YC, RC, DC, B, CS, OG, PS
-      DC inserted after RC when present (or after preceding highest‑priority stat)
-      B = bonus points (if >0)
-      CS suppressed for forwards (FWD element_type=4)
+    Stat order (priority for insertion & display): G, A, YC, RC, DC, B, CS, OG, PS
+      CS shown as plain 'CS' (no numeric suffix)
+      CS suppressed for FWD (element_type=4)
+      DC inserted after RC (fallback after YC, A, G, else at start)
+      Bonus (B) inserted after DC if present, else after RC/YC/A/G
     Hidden rows:
       - Pure appearance (<=2 pts AND no stats)
-      - MID-only CS row (3 pts: minutes + CS only, no other stats)
-- Live messages group events per fixture.
+      - MID-only CS row (3 pts with only CS, no DC, no Bonus)
+    Alignment: fixed-width columns computed once per output block; monospaced code fence.
+- Live messages: grouped per fixture (goals paired with assists, others as lines)
 - Commands: /start /help /points /gw /rank /deadline /gwinfo /liveon /liveoff /con
 """
 
@@ -137,7 +140,6 @@ FPL_BASE_HEADERS = {
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# Caches
 bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
 bootstrap_lock = asyncio.Lock()
@@ -150,7 +152,6 @@ picks_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
 _picks_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
 _picks_locks_guard = asyncio.Lock()
 
-# FPL paths
 bootstrap_path = "/api/bootstrap-static/"
 league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
@@ -578,7 +579,6 @@ async def diff_new_events(season: str, gw: int,
                 )
             await r_set(key, current_val)
         elif current_val < stored:
-            # reset downward (rare corrections)
             await r_set(key, current_val)
     return new_events_by_fixture
 
@@ -590,10 +590,8 @@ def fixture_team_conceded(fix: Dict, team_id: int) -> int:
     sa = fix.get("team_a_score")
     if sh is None: sh = 0
     if sa is None: sa = 0
-    if team_id == th:
-        return sa
-    if team_id == ta:
-        return sh
+    if team_id == th: return sa
+    if team_id == ta: return sh
     return 0
 
 async def process_clean_sheets(season: str, gw: int, fixtures: List[Dict],
@@ -623,18 +621,15 @@ async def process_clean_sheets(season: str, gw: int, fixtures: List[Dict],
             if not finished and conceded == 0 and 60 <= minutes < 90:
                 if not await r_sismember(cs_locked_key, member):
                     await r_sadd(cs_locked_key, member)
-                    messages.setdefault(fixture_id, []).append(
-                        f"Ранний кленшит: {player_name_map.get(pid, f'Player{pid}')}")
+                    messages.setdefault(fixture_id, []).append(f"Ранний кленшит: {player_name_map.get(pid, f'Player{pid}')}")
             if finished and conceded == 0 and minutes >= 60:
                 if not await r_sismember(cs_final_key, member):
                     await r_sadd(cs_final_key, member)
                     early = await r_sismember(cs_locked_key, member)
                     if early:
-                        messages.setdefault(fixture_id, []).append(
-                            f"Кленшит подтверждён: {player_name_map.get(pid, f'Player{pid}')}")
+                        messages.setdefault(fixture_id, []).append(f"Кленшит подтверждён: {player_name_map.get(pid, f'Player{pid}')}")
                     else:
-                        messages.setdefault(fixture_id, []).append(
-                            f"Кленшит: {player_name_map.get(pid, f'Player{pid}')}")
+                        messages.setdefault(fixture_id, []).append(f"Кленшит: {player_name_map.get(pid, f'Player{pid}')}")
     return messages
 
 # ---------- Event Formatting ----------
@@ -793,7 +788,6 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
 
 # ---------- /gwinfo ----------
-# Base order (without DC and Bonus - they are inserted)
 BASE_DISPLAY_ORDER = [
     "goals_scored",   # G
     "assists",        # A
@@ -809,11 +803,11 @@ LABELS = {
     "assists": "A",
     "yellow_cards": "YC",
     "red_cards": "RC",
-    "clean_sheets": "CS",
+    "clean_sheets": "CS",  # show as 'CS' not 'CS1'
     "own_goals": "OG",
     "penalties_saved": "PS",
-    "bonus": "B",     # added
-    "dc": "DC"        # synthetic key
+    "bonus": "B",
+    "dc": "DC"
 }
 
 async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -846,7 +840,7 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_bootstrap()
     pos_map = build_player_position_map()
 
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for el in live_elements:
         pid = el.get("id")
         if pid not in league_player_ids:
@@ -855,24 +849,22 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_points = int(stats.get("total_points", 0) or 0)
         pos = pos_map.get(pid, 0)
 
-        # Build stats list
         stat_parts: List[str] = []
         present_keys: Set[str] = set()
 
-        # Primary numeric stats following BASE_DISPLAY_ORDER
         for key in BASE_DISPLAY_ORDER:
-            # Suppress CS for forwards
-            if key == "clean_sheets" and pos == 4:
+            if key == "clean_sheets" and pos == 4:  # suppress CS for forwards
                 continue
             val = int(stats.get(key, 0) or 0)
             if val > 0:
                 present_keys.add(key)
-                stat_parts.append(f"{LABELS[key]}{val}")
+                if key == "clean_sheets":
+                    stat_parts.append("CS")  # no number
+                else:
+                    stat_parts.append(f"{LABELS[key]}{val}")
 
-        # Defensive Contribution
         dc_pts = calc_dc_points(stats, pos)
         if dc_pts > 0:
-            # Insert after RC if present, else after YC, else after A, else after G, else at start
             insert_idx = None
             for anchor in ["RC", "YC", "A", "G"]:
                 for i, part in enumerate(stat_parts):
@@ -882,21 +874,18 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if insert_idx is not None:
                     break
             if insert_idx is None:
-                stat_parts.insert(0, f"{LABELS['dc']}{dc_pts}")
+                stat_parts.insert(0, f"DC{dc_pts}")
             else:
-                stat_parts.insert(insert_idx, f"{LABELS['dc']}{dc_pts}")
+                stat_parts.insert(insert_idx, f"DC{dc_pts}")
 
-        # Bonus points (B) included if >0; place after DC if DC present, else after RC/YC/A/G similarly
         bonus_val = int(stats.get("bonus", 0) or 0)
         if bonus_val > 0:
-            # find DC first
             insert_idx = None
             for i, part in enumerate(stat_parts):
                 if part.startswith("DC"):
                     insert_idx = i + 1
                     break
             if insert_idx is None:
-                # fallback anchor chain
                 for anchor in ["RC", "YC", "A", "G"]:
                     for i, part in enumerate(stat_parts):
                         if part.startswith(anchor):
@@ -905,11 +894,10 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if insert_idx is not None:
                         break
             if insert_idx is None:
-                stat_parts.append(f"{LABELS['bonus']}{bonus_val}")
+                stat_parts.append(f"B{bonus_val}")
             else:
-                stat_parts.insert(insert_idx, f"{LABELS['bonus']}{bonus_val}")
+                stat_parts.insert(insert_idx, f"B{bonus_val}")
 
-        # Appearance filters
         only_mid_cs = (
             pos == 3 and
             "clean_sheets" in present_keys and
@@ -935,21 +923,20 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows.sort(key=lambda r: (-r["pts"], r["name"].lower()))
 
-    # Table formatting
+    # Alignment: compute widths once
     name_w = max(len(r["name"]) for r in rows)
     stats_w = max(len(r["stats"]) for r in rows)
     pts_w = max(len(str(r["pts"])) for r in rows)
-
     header = f"{'Player'.ljust(name_w)}  {'Stats'.ljust(stats_w)}  {'Pts'.rjust(pts_w)}"
     sep = "-" * len(header)
+
     lines = [f"*GW {gw} — Игроки лиги (live)*", "```", header, sep]
     for r in rows:
-        line = (
+        lines.append(
             f"{r['name'].ljust(name_w)}  "
             f"{r['stats'].ljust(stats_w)}  "
             f"{str(r['pts']).rjust(pts_w)}"
         )
-        lines.append(line)
     lines.append("```")
 
     full_text = "\n".join(lines)
@@ -1191,7 +1178,6 @@ async def run_bot():
     http_client = httpx.AsyncClient(http2=use_http2, limits=limits, timeout=15.0)
     logger.info(f"httpx client created (http2={use_http2})")
 
-    # Telegram application
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -1213,13 +1199,12 @@ async def run_bot():
     except Exception:
         logger.exception("Failed set commands")
 
-    # Preload bootstrap
     bs = await get_bootstrap()
     if bs:
         player_name_map.update(build_player_name_map())
 
     if USE_WEBHOOK:
-        logger.info("Webhook mode not implemented; running polling fallback.")
+        logger.info("Webhook mode not implemented; using polling.")
     else:
         try:
             await application.updater.start_polling()
