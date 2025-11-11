@@ -14,16 +14,15 @@ Summary:
   Field names tried: defensive_contributions, cbit, cbits, def_contributions
 - /gwinfo table (owners removed):
     Columns: Player | Stats | Pts
-    Stat order (priority for insertion & display): G, A, YC, RC, DC, B, CS, OG, PS
-      CS shown as plain 'CS' (no numeric suffix)
-      CS suppressed for FWD (element_type=4)
-      DC inserted after RC (fallback after YC, A, G, else at start)
-      Bonus (B) inserted after DC if present, else after RC/YC/A/G
+    Stat order (display priority): G, A, YC, RC, DC, CS, OG, PS, B
+      CS shown as 'CS' (no numeric suffix). Forward (FWD element_type=4) suppressed (not shown).
+      DC inserted after RC if present, fallback after YC, then A, then G, else at start.
+      Bonus (B) always placed LAST if >0.
     Hidden rows:
-      - Pure appearance (<=2 pts AND no stats)
+      - Pure appearance (≤2 pts AND no stats)
       - MID-only CS row (3 pts with only CS, no DC, no Bonus)
     Alignment: fixed-width columns computed once per output block; monospaced code fence.
-- Live messages: grouped per fixture (goals paired with assists, others as lines)
+- Live messages: grouped per fixture (goals paired with assists, others listed)
 - Commands: /start /help /points /gw /rank /deadline /gwinfo /liveon /liveoff /con
 """
 
@@ -56,12 +55,12 @@ if not BOT_TOKEN:
 TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID")
 ENABLE_KILL = os.environ.get("ENABLE_KILL", "0") == "1"
 
-FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))              # minutes
+FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))
 FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))
-FPL_STANDINGS_TTL = int(os.environ.get("FPL_STANDINGS_TTL", "60"))     # seconds
-FPL_PICKS_TTL = int(os.environ.get("FPL_PICKS_TTL", "300"))            # seconds
+FPL_STANDINGS_TTL = int(os.environ.get("FPL_STANDINGS_TTL", "60"))
+FPL_PICKS_TTL = int(os.environ.get("FPL_PICKS_TTL", "300"))
 FPL_PICKS_ALLOW_STALE = os.environ.get("FPL_PICKS_ALLOW_STALE", "1") == "1"
-REDIS_GW_TTL = int(os.environ.get("REDIS_GW_TTL", str(7 * 24 * 3600))) # seconds (7 days)
+REDIS_GW_TTL = int(os.environ.get("REDIS_GW_TTL", str(7 * 24 * 3600)))
 
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
@@ -451,8 +450,8 @@ def find_next_deadline_event(events: List[Dict]) -> Optional[Dict]:
     if not future_candidates:
         return None
     prioritized = [e for e in future_candidates if e.get("is_current") or e.get("is_next")]
-    source = prioritized if prioritized else future_candidates
-    return min(source, key=lambda x: parse_deadline(x["deadline_time"]))
+    src = prioritized if prioritized else future_candidates
+    return min(src, key=lambda x: parse_deadline(x["deadline_time"]))
 
 # ---------- League Players ----------
 async def get_league_player_ids(gw: int) -> Set[int]:
@@ -511,7 +510,7 @@ def build_team_short_map() -> Dict[int, str]:
             mapping[tid] = str(short)
     return mapping
 
-# ---------- Live Stat Keys (tracked for event diff) ----------
+# ---------- Live Stat Keys ----------
 STAT_KEYS = [
     "goals_scored",
     "assists",
@@ -803,7 +802,7 @@ LABELS = {
     "assists": "A",
     "yellow_cards": "YC",
     "red_cards": "RC",
-    "clean_sheets": "CS",  # show as 'CS' not 'CS1'
+    "clean_sheets": "CS",  # always plain CS
     "own_goals": "OG",
     "penalties_saved": "PS",
     "bonus": "B",
@@ -859,7 +858,7 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if val > 0:
                 present_keys.add(key)
                 if key == "clean_sheets":
-                    stat_parts.append("CS")  # no number
+                    stat_parts.append("CS")
                 else:
                     stat_parts.append(f"{LABELS[key]}{val}")
 
@@ -879,24 +878,9 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stat_parts.insert(insert_idx, f"DC{dc_pts}")
 
         bonus_val = int(stats.get("bonus", 0) or 0)
+        # bonus ALWAYS last if >0
         if bonus_val > 0:
-            insert_idx = None
-            for i, part in enumerate(stat_parts):
-                if part.startswith("DC"):
-                    insert_idx = i + 1
-                    break
-            if insert_idx is None:
-                for anchor in ["RC", "YC", "A", "G"]:
-                    for i, part in enumerate(stat_parts):
-                        if part.startswith(anchor):
-                            insert_idx = i + 1
-                            break
-                    if insert_idx is not None:
-                        break
-            if insert_idx is None:
-                stat_parts.append(f"B{bonus_val}")
-            else:
-                stat_parts.insert(insert_idx, f"B{bonus_val}")
+            stat_parts.append(f"B{bonus_val}")
 
         only_mid_cs = (
             pos == 3 and
@@ -923,7 +907,6 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows.sort(key=lambda r: (-r["pts"], r["name"].lower()))
 
-    # Alignment: compute widths once
     name_w = max(len(r["name"]) for r in rows)
     stats_w = max(len(r["stats"]) for r in rows)
     pts_w = max(len(str(r["pts"])) for r in rows)
