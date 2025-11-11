@@ -1,28 +1,27 @@
 """
 FPL Telegram Bot (PTB v21) + Upstash Redis persistence for realtime events.
 
-Features:
-- Cloudflare Worker proxy (set FPL_PROXY_BASE) to avoid 403
-- HTTP/2 optional
-- Caching: bootstrap / standings / picks
-- Realtime monitoring: goals, assists, penalties missed, penalties saved, yellow cards, red cards, own goals,
-  clean sheets (early lock + final)
-- Redis persistence (Upstash) so events aren't duplicated after restart
-- Grouped fixture notifications
-- Player names (web_name)
-- /gwinfo: readable monospaced table:
-  - shows only non-zero stats in order: G, A, YC, RC, DC, CS, OG, PS
-  - includes DC (Defensive Contribution points) per official rule:
+Features (summary):
+- Cloudflare Worker proxy support (FPL_PROXY_BASE) to avoid 403
+- Async HTTP via httpx (optional HTTP/2 if h2 installed and ENABLE_HTTP2=1)
+- Caching: bootstrap, standings, picks
+- Realtime monitoring (league players only): goals, assists, yellow cards, red cards, own goals,
+  penalties missed, penalties saved, clean sheets (early + final)
+- Defensive Contribution (DC) points (official CBIT threshold):
     * DEF (element_type=2): >=10 CBIT → +2
     * MID/FWD (3/4): >=12 CBIT → +2
-    * GK (1): not eligible for DC
-    * DC is capped at +2 per match
-  - hides pure appearance (<=2 pts, no events)
-  - hides MID-only CS case (typical 3 pts without other contributions)
-  - shows total live points (Pts) and owners in league
+    * GK (1): 0
+- /gwinfo table (owners REMOVED per request):
+    Columns: Player | Stats | Pts
+    Stat order: G, A, YC, RC, DC, B, CS, OG, PS
+      DC inserted after RC when present (or after preceding highest‑priority stat)
+      B = bonus points (if >0)
+      CS suppressed for forwards (FWD element_type=4)
+    Hidden rows:
+      - Pure appearance (<=2 pts AND no stats)
+      - MID-only CS row (3 pts: minutes + CS only, no other stats)
+- Live messages group events per fixture.
 - Commands: /start /help /points /gw /rank /deadline /gwinfo /liveon /liveoff /con
-- /deadline shows UTC+5
-- Auto chat selection if TARGET_CHAT_ID not set (binds chat on /liveon)
 """
 
 import os
@@ -41,11 +40,10 @@ import httpx
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update, BotCommand
 
-# Upstash Redis (REST) - synchronous client; we'll wrap calls in asyncio.to_thread
 try:
     from upstash_redis import Redis
 except ImportError:
-    Redis = None  # fallback later
+    Redis = None  # fallback to memory
 
 # ---------- ENV ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -60,7 +58,7 @@ FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))
 FPL_STANDINGS_TTL = int(os.environ.get("FPL_STANDINGS_TTL", "60"))     # seconds
 FPL_PICKS_TTL = int(os.environ.get("FPL_PICKS_TTL", "300"))            # seconds
 FPL_PICKS_ALLOW_STALE = os.environ.get("FPL_PICKS_ALLOW_STALE", "1") == "1"
-REDIS_GW_TTL = int(os.environ.get("REDIS_GW_TTL", str(7 * 24 * 3600))) # default 7 days
+REDIS_GW_TTL = int(os.environ.get("REDIS_GW_TTL", str(7 * 24 * 3600))) # seconds (7 days)
 
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
@@ -71,7 +69,7 @@ FPL_PROXY_BASE = os.environ.get("FPL_PROXY_BASE", "").rstrip("/")
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "1") == "1"
 
 ENABLE_LIVE_MONITOR = os.environ.get("ENABLE_LIVE_MONITOR", "0") == "1"
-LIVE_POLL_INTERVAL = int(os.environ.get("LIVE_POLL_INTERVAL", "30"))   # recommended 30s with proxy
+LIVE_POLL_INTERVAL = int(os.environ.get("LIVE_POLL_INTERVAL", "30"))
 
 stop_event = asyncio.Event()
 
@@ -118,7 +116,7 @@ def start_flask():
 def kill_existing_instances():
     logger.info("ENABLE_KILL is set (placeholder)")
 
-# ---------- HTTP / Headers ----------
+# ---------- HTTP ----------
 def fpl_url(path: str) -> str:
     base = FPL_PROXY_BASE or "https://fantasy.premierleague.com"
     return f"{base}{path}"
@@ -139,6 +137,7 @@ FPL_BASE_HEADERS = {
 
 http_client: Optional[httpx.AsyncClient] = None
 
+# Caches
 bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
 bootstrap_lock = asyncio.Lock()
@@ -151,6 +150,7 @@ picks_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
 _picks_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
 _picks_locks_guard = asyncio.Lock()
 
+# FPL paths
 bootstrap_path = "/api/bootstrap-static/"
 league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
@@ -197,11 +197,10 @@ async def fetch_json(
                 await asyncio.sleep(min(backoff_base ** attempt, 8.0))
     return None
 
-# ---------- Redis Persistence ----------
+# ---------- Redis ----------
 redis_client: Optional["Redis"] = None
 SEASON_TAG: Optional[str] = None
 
-# In‑memory fallback stores
 _mem_events: Dict[str, int] = {}
 _mem_sets: Dict[str, Set[str]] = {}
 _mem_baseline: Set[str] = set()
@@ -279,10 +278,7 @@ def discover_season_tag(bootstrap: Dict[str, Any]) -> str:
 
 # ---------- Bootstrap ----------
 def bootstrap_cache_valid() -> bool:
-    if bootstrap_cache_ts is None:
-        return False
-    age = (time.time() - bootstrap_cache_ts) / 60.0
-    return age < FPL_CACHE_TTL
+    return bootstrap_cache_ts is not None and (time.time() - bootstrap_cache_ts)/60.0 < FPL_CACHE_TTL
 
 def get_events_from_env() -> Optional[List[Dict]]:
     raw = os.environ.get("FPL_EVENTS_JSON")
@@ -319,16 +315,14 @@ async def get_bootstrap() -> Optional[Dict]:
 
 # ---------- Standings ----------
 def standings_cache_valid() -> bool:
-    if standings_cache_ts is None:
-        return False
-    return (time.time() - standings_cache_ts) <= FPL_STANDINGS_TTL
+    return standings_cache_ts is not None and (time.time() - standings_cache_ts) <= FPL_STANDINGS_TTL
 
 async def get_league_results_cached(league_id: str) -> Optional[List[Dict]]:
     if standings_cache_valid() and "results" in standings_cache:
-        return standings_cache.get("results")  # type: ignore
+        return standings_cache["results"]  # type: ignore
     async with standings_lock:
         if standings_cache_valid() and "results" in standings_cache:
-            return standings_cache.get("results")  # type: ignore
+            return standings_cache["results"]  # type: ignore
         all_results: List[Dict] = []
         page = 1
         while True:
@@ -363,9 +357,7 @@ async def get_league_results_cached(league_id: str) -> Optional[List[Dict]]:
 
 # ---------- Picks ----------
 def picks_cache_valid(ts: Optional[float]) -> bool:
-    if ts is None:
-        return False
-    return (time.time() - ts) <= FPL_PICKS_TTL
+    return ts is not None and (time.time() - ts) <= FPL_PICKS_TTL
 
 async def _picks_get_lock_guarded(key: Tuple[int, int]) -> asyncio.Lock:
     async with _picks_locks_guard:
@@ -454,13 +446,12 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
 
 def find_next_deadline_event(events: List[Dict]) -> Optional[Dict]:
     now = datetime.now(timezone.utc)
-    future_candidates = [e for e in events if parse_deadline(e.get("deadline_time")) and parse_deadline(e.get("deadline_time")) > now]
+    future_candidates = [e for e in events if (dt := parse_deadline(e.get("deadline_time"))) and dt > now]
     if not future_candidates:
         return None
     prioritized = [e for e in future_candidates if e.get("is_current") or e.get("is_next")]
-    if prioritized:
-        return min(prioritized, key=lambda x: parse_deadline(x["deadline_time"]))
-    return min(future_candidates, key=lambda x: parse_deadline(x["deadline_time"]))
+    source = prioritized if prioritized else future_candidates
+    return min(source, key=lambda x: parse_deadline(x["deadline_time"]))
 
 # ---------- League Players ----------
 async def get_league_player_ids(gw: int) -> Set[int]:
@@ -476,46 +467,16 @@ async def get_league_player_ids(gw: int) -> Set[int]:
     picks_all = await asyncio.gather(*tasks, return_exceptions=True)
     for pr in picks_all:
         if isinstance(pr, dict):
-            picks = pr.get("picks", [])
-            for p in picks:
+            for p in pr.get("picks", []):
                 pid = p.get("element")
                 if isinstance(pid, int):
                     players.add(pid)
     return players
 
-async def get_league_player_owners(gw: int) -> Dict[int, List[str]]:
-    """
-    Возвращает словарь player_id -> список владельцев в формате 'ManagerName|EntryName'
-    """
-    owners: Dict[int, List[str]] = {}
-    results = await get_league_results_cached(LEAGUE_ID)
-    if results is None:
-        return owners
-    tasks = []
-    entries_meta = []
-    for r in results:
-        entry_id = r.get("entry")
-        player_name = r.get("player_name")  # менеджер
-        entry_name = r.get("entry_name")    # название команды
-        if isinstance(entry_id, int):
-            entries_meta.append((entry_id, player_name, entry_name))
-            tasks.append(asyncio.create_task(get_entry_picks_cached(entry_id, gw)))
-    picks_all = await asyncio.gather(*tasks, return_exceptions=True)
-    for idx, pr in enumerate(picks_all):
-        if isinstance(pr, dict):
-            entry_id, manager_name, team_name = entries_meta[idx]
-            picks = pr.get("picks", [])
-            for p in picks:
-                pid = p.get("element")
-                if isinstance(pid, int):
-                    owners.setdefault(pid, []).append(f"{manager_name}|{team_name}")
-    return owners
-
 # ---------- Player / Team Maps ----------
 def build_player_name_map() -> Dict[int, str]:
-    elements = bootstrap_cache.get("elements", [])
-    mapping = {}
-    for el in elements:
+    mapping: Dict[int, str] = {}
+    for el in bootstrap_cache.get("elements", []):
         pid = el.get("id")
         name = el.get("web_name") or el.get("second_name") or f"Player{pid}"
         if isinstance(pid, int):
@@ -523,9 +484,8 @@ def build_player_name_map() -> Dict[int, str]:
     return mapping
 
 def build_player_team_map() -> Dict[int, int]:
-    elements = bootstrap_cache.get("elements", [])
-    mp = {}
-    for el in elements:
+    mp: Dict[int,int] = {}
+    for el in bootstrap_cache.get("elements", []):
         pid = el.get("id")
         team = el.get("team")
         if isinstance(pid, int) and isinstance(team, int):
@@ -533,12 +493,8 @@ def build_player_team_map() -> Dict[int, int]:
     return mp
 
 def build_player_position_map() -> Dict[int, int]:
-    """
-    player_id -> element_type (1=GK, 2=DEF, 3=MID, 4=FWD)
-    """
-    elements = bootstrap_cache.get("elements", [])
-    mapping: Dict[int, int] = {}
-    for el in elements:
+    mapping: Dict[int,int] = {}
+    for el in bootstrap_cache.get("elements", []):
         pid = el.get("id")
         et = el.get("element_type")
         if isinstance(pid, int) and isinstance(et, int):
@@ -546,17 +502,15 @@ def build_player_position_map() -> Dict[int, int]:
     return mapping
 
 def build_team_short_map() -> Dict[int, str]:
-    teams = bootstrap_cache.get("teams", [])
-    mapping = {}
-    for t in teams:
+    mapping: Dict[int,str] = {}
+    for t in bootstrap_cache.get("teams", []):
         tid = t.get("id")
         short = t.get("short_name") or t.get("name") or f"T{tid}"
         if isinstance(tid, int):
             mapping[tid] = str(short)
     return mapping
 
-# ---------- Live Stat Keys ----------
-# We track these for live diff (events). Note: /gwinfo display order differs and excludes penalties_missed.
+# ---------- Live Stat Keys (tracked for event diff) ----------
 STAT_KEYS = [
     "goals_scored",
     "assists",
@@ -567,12 +521,8 @@ STAT_KEYS = [
     "own_goals",
 ]
 
-# ---------- Defensive Contributions (official) ----------
+# ---------- Defensive Contribution ----------
 def get_stat_int(stats: Dict[str, Any], *keys: str) -> int:
-    """
-    Returns integer value of the first found key in stats.
-    Useful for variant field names across seasons.
-    """
     for k in keys:
         v = stats.get(k)
         if isinstance(v, (int, float)):
@@ -583,13 +533,6 @@ def get_stat_int(stats: Dict[str, Any], *keys: str) -> int:
     return 0
 
 def calc_dc_points(stats: Dict[str, Any], pos: int) -> int:
-    """
-    Defensive Contribution points (official):
-    - DEF (2): >=10 CBIT → +2
-    - MID/FWD (3/4): >=12 CBIT → +2
-    - GK (1): 0
-    Field candidates checked: 'defensive_contributions', 'cbit', 'cbits', 'def_contributions'.
-    """
     if pos == 1:
         return 0
     dc_count = get_stat_int(stats, "defensive_contributions", "cbit", "cbits", "def_contributions")
@@ -600,12 +543,8 @@ def calc_dc_points(stats: Dict[str, Any], pos: int) -> int:
     return 0
 
 # ---------- Baseline Extraction ----------
-def extract_current_counts(live_elements: List[Dict]) -> Dict[Tuple[int, str, int, int], int]:
-    """
-    Returns (fixture_id, stat_key, player_id, minutes) -> count(value)
-    Only for STAT_KEYS above (not DC which is derived threshold).
-    """
-    counts: Dict[Tuple[int, str, int, int], int] = {}
+def extract_current_counts(live_elements: List[Dict]) -> Dict[Tuple[int,str,int,int], int]:
+    counts: Dict[Tuple[int,str,int,int], int] = {}
     for el in live_elements:
         pid = el.get("id")
         explain = el.get("explain", [])
@@ -613,19 +552,18 @@ def extract_current_counts(live_elements: List[Dict]) -> Dict[Tuple[int, str, in
         minutes_total = stats_overall.get("minutes", 0)
         for fixture_block in explain:
             fixture_id = fixture_block.get("fixture")
-            stats_list = fixture_block.get("stats", [])
             if not isinstance(fixture_id, int):
                 continue
-            for st in stats_list:
+            for st in fixture_block.get("stats", []):
                 identifier = st.get("identifier")
                 value = st.get("value")
                 if identifier in STAT_KEYS and isinstance(value, int):
-                    key = (fixture_id, identifier, pid, minutes_total)
-                    counts[key] = value
+                    counts[(fixture_id, identifier, pid, minutes_total)] = value
     return counts
 
-# ---------- Diff & Events Generation ----------
-async def diff_new_events(season: str, gw: int, counts: Dict[Tuple[int,str,int,int], int]) -> Dict[int, List[Dict]]:
+# ---------- Diff ----------
+async def diff_new_events(season: str, gw: int,
+                          counts: Dict[Tuple[int,str,int,int], int]) -> Dict[int, List[Dict]]:
     new_events_by_fixture: Dict[int, List[Dict]] = {}
     for (fixture_id, identifier, player_id, minutes), current_val in counts.items():
         key = key_event(season, gw, fixture_id, identifier, player_id)
@@ -640,10 +578,11 @@ async def diff_new_events(season: str, gw: int, counts: Dict[Tuple[int,str,int,i
                 )
             await r_set(key, current_val)
         elif current_val < stored:
+            # reset downward (rare corrections)
             await r_set(key, current_val)
     return new_events_by_fixture
 
-# ---------- Clean Sheet Processing ----------
+# ---------- Clean Sheets ----------
 def fixture_team_conceded(fix: Dict, team_id: int) -> int:
     th = fix.get("team_h")
     ta = fix.get("team_a")
@@ -651,8 +590,10 @@ def fixture_team_conceded(fix: Dict, team_id: int) -> int:
     sa = fix.get("team_a_score")
     if sh is None: sh = 0
     if sa is None: sa = 0
-    if team_id == th: return sa
-    if team_id == ta: return sh
+    if team_id == th:
+        return sa
+    if team_id == ta:
+        return sh
     return 0
 
 async def process_clean_sheets(season: str, gw: int, fixtures: List[Dict],
@@ -679,57 +620,47 @@ async def process_clean_sheets(season: str, gw: int, fixtures: List[Dict],
             conceded = fixture_team_conceded(fx, team_id)
             finished = fx.get("finished")
             member = f"{fixture_id}:{pid}"
-            # Early lock
             if not finished and conceded == 0 and 60 <= minutes < 90:
-                exists = await r_sismember(cs_locked_key, member)
-                if not exists:
+                if not await r_sismember(cs_locked_key, member):
                     await r_sadd(cs_locked_key, member)
-                    messages.setdefault(fixture_id, []).append(f"Ранний кленшит: {player_name_map.get(pid, f'Player{pid}')}")
-            # Final
+                    messages.setdefault(fixture_id, []).append(
+                        f"Ранний кленшит: {player_name_map.get(pid, f'Player{pid}')}")
             if finished and conceded == 0 and minutes >= 60:
-                final_exists = await r_sismember(cs_final_key, member)
-                if not final_exists:
+                if not await r_sismember(cs_final_key, member):
                     await r_sadd(cs_final_key, member)
-                    early_exists = await r_sismember(cs_locked_key, member)
-                    if early_exists:
-                        messages.setdefault(fixture_id, []).append(f"Кленшит подтверждён: {player_name_map.get(pid, f'Player{pid}')}")
+                    early = await r_sismember(cs_locked_key, member)
+                    if early:
+                        messages.setdefault(fixture_id, []).append(
+                            f"Кленшит подтверждён: {player_name_map.get(pid, f'Player{pid}')}")
                     else:
-                        messages.setdefault(fixture_id, []).append(f"Кленшит: {player_name_map.get(pid, f'Player{pid}')}")
+                        messages.setdefault(fixture_id, []).append(
+                            f"Кленшит: {player_name_map.get(pid, f'Player{pid}')}")
     return messages
 
-# ---------- Pair Goals & Assists; format others ----------
+# ---------- Event Formatting ----------
 def pair_goals_assists(events_by_fixture: Dict[int, List[Dict]]) -> Dict[int, List[str]]:
-    """
-    Produce human-readable lines per fixture:
-    - Pair each goal with one assist when possible
-    - Others: YC, RC, PM, PS, OG
-    """
-    output: Dict[int, List[str]] = {}
+    out: Dict[int, List[str]] = {}
     for fixture_id, evs in events_by_fixture.items():
         goals = [e for e in evs if e["type"] == "goals_scored"]
         assists = [e for e in evs if e["type"] == "assists"]
         others = [e for e in evs if e["type"] not in ("goals_scored", "assists")]
-        used_assist_indices: Set[int] = set()
+        used_a: Set[int] = set()
         lines: List[str] = []
-        # Goals + assists pairing
         for g in goals:
-            scorer_name = player_name_map.get(g["player"], f"Player{g['player']}")
-            assist_name = None
+            scorer = player_name_map.get(g["player"], f"Player{g['player']}")
+            a_name = None
             for idx, a in enumerate(assists):
-                if idx not in used_assist_indices:
-                    assist_name = player_name_map.get(a["player"], f"Player{a['player']}")
-                    used_assist_indices.add(idx)
+                if idx not in used_a:
+                    a_name = player_name_map.get(a["player"], f"Player{a['player']}")
+                    used_a.add(idx)
                     break
-            if assist_name:
-                lines.append(f"Гол: {scorer_name} (ассист: {assist_name})")
+            if a_name:
+                lines.append(f"Гол: {scorer} (ассист: {a_name})")
             else:
-                lines.append(f"Гол: {scorer_name}")
-        # Leftover assists
+                lines.append(f"Гол: {scorer}")
         for idx, a in enumerate(assists):
-            if idx not in used_assist_indices:
-                assist_name = player_name_map.get(a["player"], f"Player{a['player']}")
-                lines.append(f"Ассист: {assist_name}")
-        # Other events
+            if idx not in used_a:
+                lines.append(f"Ассист: {player_name_map.get(a['player'], f'Player{a['player']}')}")
         for o in others:
             pname = player_name_map.get(o["player"], f"Player{o['player']}")
             t = o["type"]
@@ -746,8 +677,8 @@ def pair_goals_assists(events_by_fixture: Dict[int, List[Dict]]) -> Dict[int, Li
             else:
                 lines.append(f"{t}: {pname}")
         if lines:
-            output[fixture_id] = lines
-    return output
+            out[fixture_id] = lines
+    return out
 
 # ---------- Commands ----------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -758,13 +689,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/start — приветствие\n"
         f"/points — очки за последний завершённый тур лиги {LEAGUE_ID}\n"
-        "/gw <номер> — очки за указанный тур\n"
+        "/gw <номер> — очки за тур\n"
         f"/rank — положение в лиге {LEAGUE_ID}\n"
         "/deadline — время до ближайшего дедлайна (UTC+5)\n"
-        "/gwinfo <номер> — таблица игроков лиги (live)\n"
+        "/gwinfo <номер> — таблица игроков (live)\n"
         "/liveon — включить мониторинг\n"
         "/liveoff — выключить мониторинг\n"
-        "/con — текущая конфигурация"
+        "/con — конфигурация"
     )
     await update.message.reply_text(text)
 
@@ -791,10 +722,7 @@ async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("bootstrap недоступен")
         return
     events = bs.get("events", [])
-    if not events:
-        await update.message.reply_text("Нет данных о турах.")
-        return
-    max_gw = max(e.get("id", 0) for e in events)
+    max_gw = max((e.get("id", 0) for e in events), default=0)
     if gw_num < 1 or gw_num > max_gw:
         await update.message.reply_text(f"Тур вне диапазона 1..{max_gw}")
         return
@@ -802,13 +730,11 @@ async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sel:
         await update.message.reply_text("Тур не найден.")
         return
-    finished = sel.get("finished")
-    is_current = sel.get("is_current")
-    if not finished and not is_current and not sel.get("data_checked", False):
+    if not (sel.get("finished") or sel.get("is_current") or sel.get("data_checked", False)):
         await update.message.reply_text("Тур не стартовал или нет данных.")
         return
     header = f"*Очки за тур {gw_num}*"
-    if not finished:
+    if not sel.get("finished"):
         header += " (ещё не завершён)"
     header += "\n\n"
     await send_league_points(update, LEAGUE_ID, gw_num, events, header_override=header)
@@ -819,7 +745,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Standings недоступен")
         return
     sorted_res = sorted(results, key=lambda r: r.get("rank", 10**9))
-    lines = ["*Текущее положение:*\n"]
+    lines = ["*Текущее положение:*", ""]
     for r in sorted_res:
         rank = r.get("rank")
         last_rank = r.get("last_rank")
@@ -829,12 +755,9 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         change = ""
         if isinstance(rank, int) and isinstance(last_rank, int) and rank > 0 and last_rank > 0:
             delta = last_rank - rank
-            if delta > 0:
-                change = f" ↑{delta}"
-            elif delta < 0:
-                change = f" ↓{abs(delta)}"
-            else:
-                change = " →0"
+            if delta > 0: change = f" ↑{delta}"
+            elif delta < 0: change = f" ↓{abs(delta)}"
+            else: change = " →0"
         lines.append(f"{rank}. {player_name} — {entry_name}: {total} pts{change}")
     text = "\n".join(lines)
     for chunk in split_message_chunks(text):
@@ -861,26 +784,27 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_local = datetime.now(timezone.utc) + timedelta(hours=5)
     delta_seconds = int((local - now_local).total_seconds())
     human = format_timedelta(delta_seconds)
-    gw_name = target.get("name", "Gameweek")
+    name = target.get("name", "Gameweek")
     local_str = local.strftime("%Y-%m-%d %H:%M:%S UTC+5")
-    text = f"*Ближайший дедлайн:* {gw_name}\nКогда: {local_str}\nОсталось: {human}"
+    text = f"*Ближайший дедлайн:* {name}\nКогда: {local_str}\nОсталось: {human}"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
         await update.message.reply_text(text)
 
 # ---------- /gwinfo ----------
-DISPLAY_ORDER = [
+# Base order (without DC and Bonus - they are inserted)
+BASE_DISPLAY_ORDER = [
     "goals_scored",   # G
     "assists",        # A
     "yellow_cards",   # YC
     "red_cards",      # RC
-    # DC (computed) will be inserted right after RC
-    "clean_sheets",   # CS
+    "clean_sheets",   # CS (suppressed for FWD)
     "own_goals",      # OG
     "penalties_saved" # PS
 ]
-DISPLAY_LABELS = {
+
+LABELS = {
     "goals_scored": "G",
     "assists": "A",
     "yellow_cards": "YC",
@@ -888,6 +812,8 @@ DISPLAY_LABELS = {
     "clean_sheets": "CS",
     "own_goals": "OG",
     "penalties_saved": "PS",
+    "bonus": "B",     # added
+    "dc": "DC"        # synthetic key
 }
 
 async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -902,10 +828,7 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("bootstrap недоступен")
         return
     events = bs.get("events", [])
-    if not events:
-        await update.message.reply_text("Нет events")
-        return
-    max_gw = max(e.get("id", 0) for e in events)
+    max_gw = max((e.get("id", 0) for e in events), default=0)
     if gw < 1 or gw > max_gw:
         await update.message.reply_text(f"Тур вне диапазона 1..{max_gw}")
         return
@@ -917,12 +840,10 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     league_player_ids = await get_league_player_ids(gw)
-    player_owners = await get_league_player_owners(gw)
 
     live_elements = live.get("elements", [])
     if not player_name_map:
         await get_bootstrap()
-
     pos_map = build_player_position_map()
 
     rows = []
@@ -934,93 +855,99 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_points = int(stats.get("total_points", 0) or 0)
         pos = pos_map.get(pid, 0)
 
-        # Build stats string in required order; include only >0 values
-        stat_parts = []
-        present_keys = set()
-        for key in DISPLAY_ORDER:
+        # Build stats list
+        stat_parts: List[str] = []
+        present_keys: Set[str] = set()
+
+        # Primary numeric stats following BASE_DISPLAY_ORDER
+        for key in BASE_DISPLAY_ORDER:
+            # Suppress CS for forwards
+            if key == "clean_sheets" and pos == 4:
+                continue
             val = int(stats.get(key, 0) or 0)
             if val > 0:
                 present_keys.add(key)
-                stat_parts.append(f"{DISPLAY_LABELS[key]}{val}")
+                stat_parts.append(f"{LABELS[key]}{val}")
 
-        # Insert DC right after RC if present, else after YC/A/G accordingly
+        # Defensive Contribution
         dc_pts = calc_dc_points(stats, pos)
         if dc_pts > 0:
-            # Find position after RC
+            # Insert after RC if present, else after YC, else after A, else after G, else at start
             insert_idx = None
-            # try after RC
-            for i, s in enumerate(stat_parts):
-                if s.startswith("RC"):
+            for anchor in ["RC", "YC", "A", "G"]:
+                for i, part in enumerate(stat_parts):
+                    if part.startswith(anchor):
+                        insert_idx = i + 1
+                        break
+                if insert_idx is not None:
+                    break
+            if insert_idx is None:
+                stat_parts.insert(0, f"{LABELS['dc']}{dc_pts}")
+            else:
+                stat_parts.insert(insert_idx, f"{LABELS['dc']}{dc_pts}")
+
+        # Bonus points (B) included if >0; place after DC if DC present, else after RC/YC/A/G similarly
+        bonus_val = int(stats.get("bonus", 0) or 0)
+        if bonus_val > 0:
+            # find DC first
+            insert_idx = None
+            for i, part in enumerate(stat_parts):
+                if part.startswith("DC"):
                     insert_idx = i + 1
                     break
-            # else after YC
             if insert_idx is None:
-                for i, s in enumerate(stat_parts):
-                    if s.startswith("YC"):
-                        insert_idx = i + 1
+                # fallback anchor chain
+                for anchor in ["RC", "YC", "A", "G"]:
+                    for i, part in enumerate(stat_parts):
+                        if part.startswith(anchor):
+                            insert_idx = i + 1
+                            break
+                    if insert_idx is not None:
                         break
-            # else after A
             if insert_idx is None:
-                for i, s in enumerate(stat_parts):
-                    if s.startswith("A"):
-                        insert_idx = i + 1
-                        break
-            # else after G
-            if insert_idx is None:
-                for i, s in enumerate(stat_parts):
-                    if s.startswith("G"):
-                        insert_idx = i + 1
-                        break
-            # default append
-            if insert_idx is None:
-                stat_parts.append(f"DC{dc_pts}")
+                stat_parts.append(f"{LABELS['bonus']}{bonus_val}")
             else:
-                stat_parts.insert(insert_idx, f"DC{dc_pts}")
+                stat_parts.insert(insert_idx, f"{LABELS['bonus']}{bonus_val}")
 
-        # Exclude: pure appearance (<=2 pts, no stat_parts), and MID-only CS case (stat set == {CS}, pts<=3)
-        only_mid_cs = (pos == 3) and ("clean_sheets" in present_keys) and (len(present_keys) == 1) and (total_points <= 3)
+        # Appearance filters
+        only_mid_cs = (
+            pos == 3 and
+            "clean_sheets" in present_keys and
+            len(present_keys) == 1 and
+            dc_pts == 0 and
+            bonus_val == 0 and
+            total_points <= 3
+        )
         if (not stat_parts and total_points <= 2) or only_mid_cs:
             continue
 
         name = player_name_map.get(pid, f"Player{pid}")
-        owners_list = player_owners.get(pid, [])
-        if owners_list:
-            max_len = 200
-            owner_names = [o.split("|")[0] for o in owners_list]
-            owners_joined = ", ".join(owner_names)
-            if len(owners_joined) > max_len:
-                owners_joined = owners_joined[:max_len] + "..."
-            owners_display = f"{len(owner_names)}: {owners_joined}"
-        else:
-            owners_display = "0"
 
         rows.append({
             "name": name,
             "stats": " ".join(stat_parts) if stat_parts else "-",
-            "pts": total_points,
-            "owners": owners_display
+            "pts": total_points
         })
 
     if not rows:
         await update.message.reply_text("Нет игроков с событиями или значимыми очками.")
         return
 
-    # Sort by Pts desc, then by name
     rows.sort(key=lambda r: (-r["pts"], r["name"].lower()))
 
-    # Format table
+    # Table formatting
     name_w = max(len(r["name"]) for r in rows)
     stats_w = max(len(r["stats"]) for r in rows)
     pts_w = max(len(str(r["pts"])) for r in rows)
-    header = f"{'Player'.ljust(name_w)}  {'Stats'.ljust(stats_w)}  {'Pts'.rjust(pts_w)}  Owners"
+
+    header = f"{'Player'.ljust(name_w)}  {'Stats'.ljust(stats_w)}  {'Pts'.rjust(pts_w)}"
     sep = "-" * len(header)
     lines = [f"*GW {gw} — Игроки лиги (live)*", "```", header, sep]
     for r in rows:
         line = (
             f"{r['name'].ljust(name_w)}  "
             f"{r['stats'].ljust(stats_w)}  "
-            f"{str(r['pts']).rjust(pts_w)}  "
-            f"{r['owners']}"
+            f"{str(r['pts']).rjust(pts_w)}"
         )
         lines.append(line)
     lines.append("```")
@@ -1044,10 +971,10 @@ async def liveon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global live_monitor_enabled, current_target_chat
     live_monitor_enabled = True
     if TARGET_CHAT_ID:
-        await update.message.reply_text("Мониторинг включён. Используется TARGET_CHAT_ID.")
+        await update.message.reply_text("Мониторинг включён (TARGET_CHAT_ID).")
     else:
         current_target_chat = update.effective_chat.id
-        await update.message.reply_text(f"Мониторинг включён. События будут приходить сюда (chat_id={current_target_chat}).")
+        await update.message.reply_text(f"Мониторинг включён (chat_id={current_target_chat}).")
 
 async def liveoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global live_monitor_enabled, current_target_chat
@@ -1073,20 +1000,18 @@ async def send_league_points(
 
     async def one(entry_id: int, entry_name: str, player_name: str) -> str:
         data = await get_entry_picks_cached(entry_id, gw_num)
-        pts = None
-        if data:
-            pts = data.get("entry_history", {}).get("points")
+        pts = data.get("entry_history", {}).get("points") if data else None
         return f"{player_name} — {entry_name}: {pts if pts is not None else 'нет данных'}"
 
     tasks = [asyncio.create_task(one(r["entry"], r["entry_name"], r["player_name"])) for r in results]
-    res = await asyncio.gather(*tasks, return_exceptions=True)
-    for item in res:
+    out = await asyncio.gather(*tasks, return_exceptions=True)
+    for item in out:
         if isinstance(item, Exception):
             lines.append("Ошибка участника: нет данных")
         else:
             lines.append(item)
-    full_text = header + "\n".join(lines)
-    for chunk in split_message_chunks(full_text):
+    text = header + "\n".join(lines)
+    for chunk in split_message_chunks(text):
         try:
             await update.message.reply_text(chunk, parse_mode="Markdown")
         except Exception:
@@ -1125,49 +1050,35 @@ async def live_monitor_loop():
             league_players = await get_league_player_ids(gw)
             live_elements = live.get("elements", [])
 
-            # Baseline check
             baseline_key = key_baseline(season, gw)
             baseline_done = await r_flag_exists(baseline_key)
-            counts = extract_current_counts(live_elements)
 
-            # Only consider league players
+            counts = extract_current_counts(live_elements)
             counts = {k: v for k, v in counts.items() if k[2] in league_players}
 
             if not baseline_done:
-                # Store baseline without notifications
-                for (fixture_id, stat, player_id, _minutes), val in counts.items():
+                for (fixture_id, stat, player_id, _m), val in counts.items():
                     await r_set(key_event(season, gw, fixture_id, stat, player_id), val)
                 await r_set_flag(baseline_key)
-                logger.info(f"Baseline set for GW {gw}.")
+                logger.info(f"Baseline set for GW {gw}")
                 await asyncio.sleep(LIVE_POLL_INTERVAL)
                 continue
 
-            new_events_by_fixture = await diff_new_events(
-                season,
-                gw,
-                counts
-            )
-
-            # Pair goals & assists to form lines
+            new_events_by_fixture = await diff_new_events(season, gw, counts)
             paired_lines = pair_goals_assists(new_events_by_fixture)
 
-            # Clean sheets
             player_team_map_local = build_player_team_map()
             cs_messages = await process_clean_sheets(season, gw, fixtures, live_elements,
                                                      league_players, player_team_map_local)
-
-            # Build fixture index for header
             team_short = build_team_short_map()
             fixture_index = {f.get("id"): f for f in fixtures if isinstance(f.get("id"), int)}
 
             messages: List[str] = []
-            # Fixtures with events
             for fixture_id in set(list(paired_lines.keys()) + list(cs_messages.keys())):
                 fx = fixture_index.get(fixture_id, {})
                 th = fx.get("team_h"); ta = fx.get("team_a")
-                sh = fx.get("team_h_score"); sa = fx.get("team_a_score")
-                if sh is None: sh = 0
-                if sa is None: sa = 0
+                sh = fx.get("team_h_score") or 0
+                sa = fx.get("team_a_score") or 0
                 head = f"*Матч:* {team_short.get(th,'T?')} {sh}–{sa} {team_short.get(ta,'T?')}"
                 lines = [head]
                 if fixture_id in paired_lines:
@@ -1179,7 +1090,6 @@ async def live_monitor_loop():
 
             if messages:
                 final_text = "\n\n".join(messages)
-                # Determine target chat
                 target_chat_id = None
                 if TARGET_CHAT_ID:
                     try:
@@ -1188,7 +1098,6 @@ async def live_monitor_loop():
                         target_chat_id = None
                 elif current_target_chat is not None:
                     target_chat_id = current_target_chat
-
                 if target_chat_id:
                     for chunk in split_message_chunks(final_text):
                         try:
@@ -1196,7 +1105,7 @@ async def live_monitor_loop():
                                 chat_id=target_chat_id, text=chunk, parse_mode="Markdown"
                             )
                         except Exception:
-                            logger.exception("Failed sending live notification.")
+                            logger.exception("Send live notification failed.")
                 else:
                     logger.info("Live events (no chat bound): " + final_text)
 
@@ -1233,9 +1142,6 @@ async def setup_bot_commands(bot):
 
 # ---------- Configuration Snapshot ----------
 def con() -> Dict[str, Any]:
-    """
-    Возвращает текущую конфигурацию и статус (для дебага / инспекции).
-    """
     return {
         "BOT_TOKEN_set": bool(BOT_TOKEN),
         "TARGET_CHAT_ID": TARGET_CHAT_ID,
@@ -1257,7 +1163,7 @@ def con() -> Dict[str, Any]:
 
 async def con_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     snapshot = con()
-    lines = ["*Конфигурация:*"]
+    lines = ["*Конфигурация:*", ""]
     for k, v in snapshot.items():
         lines.append(f"{k}: {v}")
     text = "\n".join(lines)
@@ -1285,6 +1191,7 @@ async def run_bot():
     http_client = httpx.AsyncClient(http2=use_http2, limits=limits, timeout=15.0)
     logger.info(f"httpx client created (http2={use_http2})")
 
+    # Telegram application
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -1306,15 +1213,13 @@ async def run_bot():
     except Exception:
         logger.exception("Failed set commands")
 
-    # Preload bootstrap for player names
+    # Preload bootstrap
     bs = await get_bootstrap()
     if bs:
-        player_name_map = build_player_name_map()
-    else:
-        player_name_map = {}
+        player_name_map.update(build_player_name_map())
 
     if USE_WEBHOOK:
-        logger.info("Webhook mode placeholder (not implemented).")
+        logger.info("Webhook mode not implemented; running polling fallback.")
     else:
         try:
             await application.updater.start_polling()
@@ -1337,7 +1242,7 @@ async def run_bot():
 
     try:
         me = await application.bot.get_me()
-        logger.info("Bot started as @%s (id=%s)", getattr(me, 'username', 'unknown'), getattr(me, 'id', 'unknown'))
+        logger.info("Bot started as @%s (id=%s)", getattr(me, "username", "unknown"), getattr(me, "id", "unknown"))
     except Exception:
         logger.exception("get_me failed")
 
@@ -1345,7 +1250,7 @@ async def run_bot():
     try:
         await stop_event.wait()
     finally:
-        logger.info("Shutdown initiated.")
+        logger.info("Shutdown initiated")
         if not USE_WEBHOOK:
             try:
                 await application.updater.stop()
@@ -1380,10 +1285,8 @@ if __name__ == "__main__":
     print("Main entrypoint start")
     if ENABLE_KILL:
         kill_existing_instances()
-    logger.info("Lock acquired (placeholder)")
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
-    logger.info("Flask thread started")
     try:
         asyncio.run(run_bot())
     except Exception:
