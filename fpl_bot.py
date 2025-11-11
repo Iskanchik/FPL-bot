@@ -1,17 +1,17 @@
 """
-FPL Telegram Bot (Variant 1, PTB v21 manual polling) + caching for standings and picks:
-- Manual polling (initialize + start + updater.start_polling)
-- Anti-403 headers + optional HTTP/2
-- Optional Cloudflare Worker proxy (FPL_PROXY_BASE)
-- Bootstrap cache with TTL (minutes, FPL_CACHE_TTL)
-- NEW: Standings cache with TTL (seconds, FPL_STANDINGS_TTL)
-- NEW: Entry picks cache with TTL (seconds, FPL_PICKS_TTL) + per-key locks, optional stale-on-error
-- Fallback: events from FPL_EVENTS_JSON
-- Concurrency limiting via semaphore
-- Commands: /points, /gw, /rank, /deadline, /help
-- Message splitting (Telegram 4096 limit)
-- Graceful shutdown
-- Flask health endpoint
+FPL Telegram Bot (PTB v21) + Upstash Redis persistence for realtime events.
+
+Features:
+- Anti-403 HTTP (optional Cloudflare Worker proxy)
+- HTTP/2 (optional)
+- Caching: bootstrap / standings / picks
+- Realtime monitoring of: goals, assists, penalties missed, red cards, clean sheets (early lock + final)
+- Upstash Redis persistence: no duplicate notifications after restarts
+- Grouping notifications per fixture
+- Player names (web_name)
+- Commands: /start /help /points /gw /rank /deadline /gwinfo /liveon /liveoff
+- /deadline shows UTC+5
+- Auto chat selection (if TARGET_CHAT_ID not set, /liveon binds current chat)
 """
 
 import os
@@ -22,53 +22,56 @@ import logging
 import time
 import signal
 import random
-from typing import Any, Dict, Optional, List, Tuple
-from datetime import datetime, timezone
+from typing import Any, Dict, Optional, List, Tuple, Set
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, jsonify
 import httpx
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update, BotCommand
 
-# ---------- 1. ENV ----------
+# Upstash Redis (REST) - synchronous client; we'll wrap calls in asyncio.to_thread
+try:
+    from upstash_redis import Redis
+except ImportError:
+    Redis = None  # fallback later
+
+# ---------- ENV ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Environment variable BOT_TOKEN is required")
 
+TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID")
 ENABLE_KILL = os.environ.get("ENABLE_KILL", "0") == "1"
 
-# bootstrap-static cache TTL in minutes
-FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))
-
-# concurrency for outgoing HTTP requests
+FPL_CACHE_TTL = int(os.environ.get("FPL_CACHE_TTL", "8"))              # minutes
 FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))
-
-# standings cache TTL in seconds (league standings aggregation)
-FPL_STANDINGS_TTL = int(os.environ.get("FPL_STANDINGS_TTL", "60"))
-
-# picks cache TTL in seconds ((entry_id, gw) picks endpoint)
-FPL_PICKS_TTL = int(os.environ.get("FPL_PICKS_TTL", "300"))
-
-# serve stale picks if upstream failed (within picks TTL)
+FPL_STANDINGS_TTL = int(os.environ.get("FPL_STANDINGS_TTL", "60"))     # seconds
+FPL_PICKS_TTL = int(os.environ.get("FPL_PICKS_TTL", "300"))            # seconds
 FPL_PICKS_ALLOW_STALE = os.environ.get("FPL_PICKS_ALLOW_STALE", "1") == "1"
+REDIS_GW_TTL = int(os.environ.get("REDIS_GW_TTL", str(7 * 24 * 3600))) # default 7 days
 
 PORT = int(os.environ.get("PORT", 10000))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
 USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "0") == "1"
 LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")
+
 FPL_PROXY_BASE = os.environ.get("FPL_PROXY_BASE", "").rstrip("/")
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "1") == "1"
 
+ENABLE_LIVE_MONITOR = os.environ.get("ENABLE_LIVE_MONITOR", "0") == "1"
+LIVE_POLL_INTERVAL = int(os.environ.get("LIVE_POLL_INTERVAL", "30"))   # recommended 30s with proxy
+
 stop_event = asyncio.Event()
 
-# ---------- 2. Logging ----------
+# ---------- Logging ----------
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger("fpl_bot")
 
-# ---------- 3. Flask ----------
+# ---------- Flask ----------
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -91,8 +94,10 @@ def health():
         "standings_cache_age_sec": standings_age,
         "standings_cache_size": len(standings_cache.get("results", [])) if standings_cache else 0,
         "picks_cache_size": len(picks_cache),
-        "concurrency_limit": FPL_CONCURRENCY,
-        "proxy_base": FPL_PROXY_BASE or None
+        "live_monitor_enabled": live_monitor_enabled,
+        "proxy_base": FPL_PROXY_BASE or None,
+        "redis_connected": redis_client is not None,
+        "season_tag": SEASON_TAG
     })
 
 def start_flask():
@@ -100,10 +105,9 @@ def start_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
 
 def kill_existing_instances():
-    logger.info("ENABLE_KILL is set (placeholder for external coordination)")
+    logger.info("ENABLE_KILL is set (placeholder)")
 
-# ---------- 4. HTTP / Cache / Headers ----------
-
+# ---------- HTTP / Headers ----------
 def fpl_url(path: str) -> str:
     base = FPL_PROXY_BASE or "https://fantasy.premierleague.com"
     return f"{base}{path}"
@@ -124,43 +128,23 @@ FPL_BASE_HEADERS = {
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# bootstrap cache (raw dict from bootstrap-static)
 bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
 bootstrap_lock = asyncio.Lock()
 
-# standings cache (aggregated list over all pages)
-standings_cache: Dict[str, Any] = {}  # {"results": List[Dict], "pages": int}
+standings_cache: Dict[str, Any] = {}
 standings_cache_ts: Optional[float] = None
 standings_lock = asyncio.Lock()
 
-# picks cache: key=(entry_id, gw) -> {"data": Dict, "ts": float}
 picks_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
-# per-key locks to avoid stampede
 _picks_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
 _picks_locks_guard = asyncio.Lock()
-
-def _picks_get_lock(key: Tuple[int, int]) -> asyncio.Lock:
-    # fast path without await: may race but okay; ensure creation guarded below
-    lock = _picks_locks.get(key)
-    if lock is not None:
-        return lock
-    # guarded creation
-    # Note: This is a sync helper called within async funcs; we can't await here.
-    # We'll create a new lock here and set under guard in async helper below.
-    return asyncio.Lock()
-
-async def _picks_get_lock_guarded(key: Tuple[int, int]) -> asyncio.Lock:
-    async with _picks_locks_guard:
-        lock = _picks_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _picks_locks[key] = lock
-        return lock
 
 bootstrap_path = "/api/bootstrap-static/"
 league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
+event_live_path_tpl = "/api/event/{gw}/live/"
+fixtures_event_path_tpl = "/api/fixtures/?event={gw}"
 
 fpl_semaphore = asyncio.Semaphore(FPL_CONCURRENCY)
 
@@ -182,31 +166,107 @@ async def fetch_json(
                 try:
                     return resp.json()
                 except Exception as jex:
-                    logger.warning(f"JSON decode error for {url}: {jex}")
+                    logger.warning(f"JSON decode error {url}: {jex}")
                     return None
-
-            body_preview = (resp.text or "")[:300].replace("\n", " ")
-            logger.warning(f"Attempt {attempt}: status={status} url={url} body='{body_preview}'")
-
+            body_preview = (resp.text or "")[:200].replace("\n", " ")
+            logger.warning(f"Attempt {attempt}: {status} {url} body='{body_preview}'")
             if status in (403, 429) or 500 <= status < 600:
                 if attempt < max_attempts:
                     sleep_time = min(backoff_base ** attempt + random.uniform(0, 0.5), 8.0)
                     await asyncio.sleep(sleep_time)
                     continue
             return None
-
         except httpx.TimeoutException:
-            logger.error(f"Timeout fetching {url} (attempt {attempt})")
+            logger.error(f"Timeout {url} attempt {attempt}")
             if attempt < max_attempts:
                 await asyncio.sleep(min(backoff_base ** attempt, 8.0))
         except Exception as ex:
-            logger.exception(f"Unexpected error fetching {url} (attempt {attempt}): {ex}")
+            logger.exception(f"Error fetching {url}: {ex}")
             if attempt < max_attempts:
                 await asyncio.sleep(min(backoff_base ** attempt, 8.0))
     return None
 
-# ---------- bootstrap cache ----------
+# ---------- Redis Persistence ----------
+redis_client: Optional["Redis"] = None
+SEASON_TAG: Optional[str] = None
 
+# In‑memory fallback stores
+_mem_events: Dict[str, int] = {}
+_mem_sets: Dict[str, Set[str]] = {}
+_mem_baseline: Set[str] = set()
+
+def init_redis():
+    global redis_client
+    if Redis is None:
+        logger.warning("upstash-redis not installed; using in-memory fallback.")
+        return
+    try:
+        redis_client = Redis.from_env()
+        logger.info("Upstash Redis connected.")
+    except Exception as e:
+        logger.warning(f"Redis init failed: {e}; fallback to memory.")
+        redis_client = None
+
+async def r_get(key: str) -> Optional[int]:
+    if redis_client:
+        raw = await asyncio.to_thread(redis_client.get, key)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except Exception:
+            return None
+    return _mem_events.get(key)
+
+async def r_set(key: str, value: int):
+    if redis_client:
+        await asyncio.to_thread(redis_client.set, key, value, ex=REDIS_GW_TTL)
+    else:
+        _mem_events[key] = value
+
+async def r_sadd(key: str, member: str):
+    if redis_client:
+        await asyncio.to_thread(redis_client.sadd, key, member)
+        await asyncio.to_thread(redis_client.expire, key, REDIS_GW_TTL)
+    else:
+        _mem_sets.setdefault(key, set()).add(member)
+
+async def r_sismember(key: str, member: str) -> bool:
+    if redis_client:
+        res = await asyncio.to_thread(redis_client.sismember, key, member)
+        return bool(res)
+    return member in _mem_sets.get(key, set())
+
+async def r_set_flag(key: str):
+    await r_set(key, 1)
+
+async def r_flag_exists(key: str) -> bool:
+    return (await r_get(key)) == 1 or key in _mem_baseline
+
+def key_event(season: str, gw: int, fixture_id: int, identifier: str, player_id: int) -> str:
+    return f"fpl:{season}:{gw}:stat:{fixture_id}:{identifier}:{player_id}"
+
+def key_cs_locked(season: str, gw: int) -> str:
+    return f"fpl:{season}:{gw}:cs_locked"
+
+def key_cs_final(season: str, gw: int) -> str:
+    return f"fpl:{season}:{gw}:cs_final"
+
+def key_baseline(season: str, gw: int) -> str:
+    return f"fpl:{season}:{gw}:baseline_done"
+
+def discover_season_tag(bootstrap: Dict[str, Any]) -> str:
+    global SEASON_TAG
+    if SEASON_TAG:
+        return SEASON_TAG
+    season = bootstrap.get("game_settings", {}).get("season")
+    if not season:
+        y = datetime.now().year
+        season = f"{y}/{str((y+1) % 100).zfill(2)}"
+    SEASON_TAG = season
+    return SEASON_TAG
+
+# ---------- Bootstrap ----------
 def bootstrap_cache_valid() -> bool:
     if bootstrap_cache_ts is None:
         return False
@@ -220,7 +280,7 @@ def get_events_from_env() -> Optional[List[Dict]]:
     try:
         return json.loads(raw)
     except Exception as ex:
-        logger.error(f"Failed to parse FPL_EVENTS_JSON: {ex}")
+        logger.error(f"Failed parse FPL_EVENTS_JSON: {ex}")
         return None
 
 async def get_bootstrap() -> Optional[Dict]:
@@ -237,7 +297,7 @@ async def get_bootstrap() -> Optional[Dict]:
         return data
     env_events = get_events_from_env()
     if env_events:
-        logger.warning("Using FPL_EVENTS_JSON fallback for bootstrap.events")
+        logger.warning("Using fallback events from env.")
         fake = {"events": env_events}
         async with bootstrap_lock:
             bootstrap_cache.clear()
@@ -246,32 +306,26 @@ async def get_bootstrap() -> Optional[Dict]:
         return fake
     return None
 
-# ---------- standings cache ----------
-
+# ---------- Standings ----------
 def standings_cache_valid() -> bool:
     if standings_cache_ts is None:
         return False
     return (time.time() - standings_cache_ts) <= FPL_STANDINGS_TTL
 
 async def get_league_results_cached(league_id: str) -> Optional[List[Dict]]:
-    # read-fast path without lock
     if standings_cache_valid() and "results" in standings_cache:
         return standings_cache.get("results")  # type: ignore
-
-    # guarded refresh
     async with standings_lock:
         if standings_cache_valid() and "results" in standings_cache:
             return standings_cache.get("results")  # type: ignore
-
         all_results: List[Dict] = []
         page = 1
         while True:
             url = fpl_url(league_path_tpl.format(league_id=league_id, page=page))
             data = await fetch_json(url)
             if not data:
-                # if we have some cached data and allow serving it while error, we could return it
                 if "results" in standings_cache:
-                    logger.warning("Standings fetch failed; serving cached standings.")
+                    logger.warning("Standings fetch failed; serve cached.")
                     return standings_cache.get("results")  # type: ignore
                 return None
             try:
@@ -282,59 +336,55 @@ async def get_league_results_cached(league_id: str) -> Optional[List[Dict]]:
                     break
                 page += 1
                 if page > 30:
-                    logger.warning("Stopped pagination after 30 pages (safety cutoff).")
+                    logger.warning("Pagination cutoff at 30 pages.")
                     break
             except Exception as ex:
-                logger.error(f"League standings decode error: {ex}")
+                logger.error(f"Decode standings error: {ex}")
                 if "results" in standings_cache:
-                    logger.warning("Decode error; serving cached standings.")
+                    logger.warning("Serve cached standings after decode error.")
                     return standings_cache.get("results")  # type: ignore
                 return None
-
-        # store
         standings_cache.clear()
         standings_cache.update({"results": all_results, "pages": page})
         global standings_cache_ts
         standings_cache_ts = time.time()
         return all_results
 
-# ---------- picks cache ----------
-
+# ---------- Picks ----------
 def picks_cache_valid(ts: Optional[float]) -> bool:
     if ts is None:
         return False
     return (time.time() - ts) <= FPL_PICKS_TTL
 
+async def _picks_get_lock_guarded(key: Tuple[int, int]) -> asyncio.Lock:
+    async with _picks_locks_guard:
+        lock = _picks_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _picks_locks[key] = lock
+        return lock
+
 async def get_entry_picks_cached(entry_id: int, gw: int) -> Optional[Dict]:
     key = (entry_id, gw)
-    # fast path
     cached = picks_cache.get(key)
     if cached and picks_cache_valid(cached.get("ts")):
         return cached.get("data")  # type: ignore
-
-    # guarded, per-key lock
     lock = await _picks_get_lock_guarded(key)
     async with lock:
-        # re-check
         cached2 = picks_cache.get(key)
         if cached2 and picks_cache_valid(cached2.get("ts")):
             return cached2.get("data")  # type: ignore
-
         url = fpl_url(entry_picks_path_tpl.format(entry_id=entry_id, gw=gw))
         data = await fetch_json(url)
         if data:
             picks_cache[key] = {"data": data, "ts": time.time()}
             return data
-
-        # upstream failed; serve stale if allowed and present
         if FPL_PICKS_ALLOW_STALE and cached2 and cached2.get("data"):
-            logger.warning(f"Serving STALE picks for entry={entry_id} gw={gw}")
+            logger.warning(f"Serve STALE picks entry={entry_id} gw={gw}")
             return cached2.get("data")  # type: ignore
-
         return None
 
-# ---------- helpers ----------
-
+# ---------- Helpers ----------
 def choose_last_finished_gw(events: List[Dict]) -> Optional[int]:
     finished = [e for e in events if e.get("finished")]
     if finished:
@@ -393,109 +443,294 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
 
 def find_next_deadline_event(events: List[Dict]) -> Optional[Dict]:
     now = datetime.now(timezone.utc)
-    candidates: List[Dict] = []
-    for e in events:
-        deadline = parse_deadline(e.get("deadline_time"))
-        if not deadline:
-            continue
-        if deadline > now and (e.get("is_current") or e.get("is_next")):
-            candidates.append(e)
-    if candidates:
-        return min(candidates, key=lambda x: parse_deadline(x["deadline_time"]))
-    future = [e for e in events if not e.get("finished") and parse_deadline(e.get("deadline_time")) and parse_deadline(e.get("deadline_time")) > now]
-    if future:
-        return min(future, key=lambda x: parse_deadline(x["deadline_time"]))
-    return None
+    future_candidates = [e for e in events if parse_deadline(e.get("deadline_time")) and parse_deadline(e.get("deadline_time")) > now]
+    if not future_candidates:
+        return None
+    # prefer is_current / is_next if in future
+    prioritized = [e for e in future_candidates if e.get("is_current") or e.get("is_next")]
+    if prioritized:
+        return min(prioritized, key=lambda x: parse_deadline(x["deadline_time"]))
+    return min(future_candidates, key=lambda x: parse_deadline(x["deadline_time"]))
 
-# ---------- 5. Handlers ----------
+# ---------- League Players ----------
+async def get_league_player_ids(gw: int) -> Set[int]:
+    results = await get_league_results_cached(LEAGUE_ID)
+    if results is None:
+        return set()
+    players: Set[int] = set()
+    tasks = []
+    for r in results:
+        entry_id = r.get("entry")
+        if isinstance(entry_id, int):
+            tasks.append(asyncio.create_task(get_entry_picks_cached(entry_id, gw)))
+    picks_all = await asyncio.gather(*tasks, return_exceptions=True)
+    for pr in picks_all:
+        if isinstance(pr, dict):
+            picks = pr.get("picks", [])
+            for p in picks:
+                pid = p.get("element")
+                if isinstance(pid, int):
+                    players.add(pid)
+    return players
+
+# ---------- Player / Team Maps ----------
+def build_player_name_map() -> Dict[int, str]:
+    elements = bootstrap_cache.get("elements", [])
+    mapping = {}
+    for el in elements:
+        pid = el.get("id")
+        name = el.get("web_name") or el.get("second_name") or f"Player{pid}"
+        if isinstance(pid, int):
+            mapping[pid] = str(name)
+    return mapping
+
+def build_player_team_map() -> Dict[int, int]:
+    elements = bootstrap_cache.get("elements", [])
+    mp = {}
+    for el in elements:
+        pid = el.get("id")
+        team = el.get("team")
+        if isinstance(pid, int) and isinstance(team, int):
+            mp[pid] = team
+    return mp
+
+def build_team_short_map() -> Dict[int, str]:
+    teams = bootstrap_cache.get("teams", [])
+    mapping = {}
+    for t in teams:
+        tid = t.get("id")
+        short = t.get("short_name") or t.get("name") or f"T{tid}"
+        if isinstance(tid, int):
+            mapping[tid] = str(short)
+    return mapping
+
+# ---------- Stats Keys ----------
+STAT_KEYS = ["goals_scored", "assists", "penalties_missed", "red_cards"]
+
+# ---------- Baseline Extraction ----------
+def extract_current_counts(live_elements: List[Dict]) -> Dict[Tuple[int, str, int, int], int]:
+    """
+    Returns (fixture_id, stat_key, player_id, minutes) -> count(value)
+    We treat 'value' as cumulative count for that stat in the fixture.
+    For minutes we store latest for potential CS logic, but minutes not persisted by count key.
+    """
+    counts: Dict[Tuple[int, str, int, int], int] = {}
+    for el in live_elements:
+        pid = el.get("id")
+        explain = el.get("explain", [])
+        stats_overall = el.get("stats", {})
+        minutes_total = stats_overall.get("minutes", 0)
+        for fixture_block in explain:
+            fixture_id = fixture_block.get("fixture")
+            stats_list = fixture_block.get("stats", [])
+            if not isinstance(fixture_id, int):
+                continue
+            for st in stats_list:
+                identifier = st.get("identifier")
+                value = st.get("value")
+                if identifier in STAT_KEYS and isinstance(value, int):
+                    key = (fixture_id, identifier, pid, minutes_total)
+                    counts[key] = value
+    return counts
+
+# ---------- Diff & Events Generation ----------
+async def diff_new_events(season: str, gw: int, counts: Dict[Tuple[int,str,int,int], int]) -> Dict[int, List[Dict]]:
+    """
+    Returns fixture_id -> list of event dicts:
+      {'type':'goal','player':pid} etc.
+    We only generate delta events (new occurrences).
+    """
+    new_events_by_fixture: Dict[int, List[Dict]] = {}
+    for (fixture_id, identifier, player_id, minutes), current_val in counts.items():
+        key = key_event(season, gw, fixture_id, identifier, player_id)
+        stored = await r_get(key)
+        if stored is None:
+            stored = 0
+        if current_val > stored:
+            delta = current_val - stored
+            # Each increment -> one event (for pairing we keep them separate)
+            for _ in range(delta):
+                ev_type = identifier
+                entry = {"type": ev_type, "player": player_id, "minutes": minutes}
+                new_events_by_fixture.setdefault(fixture_id, []).append(entry)
+            await r_set(key, current_val)
+        elif current_val == stored:
+            # no change
+            pass
+        else:
+            # current less than stored (unlikely) -> reset baseline
+            await r_set(key, current_val)
+    return new_events_by_fixture
+
+# ---------- Clean Sheet Processing ----------
+async def process_clean_sheets(season: str, gw: int, fixtures: List[Dict],
+                               live_elements: List[Dict],
+                               league_player_ids: Set[int],
+                               player_team_map: Dict[int, int]) -> Dict[int, List[str]]:
+    messages: Dict[int, List[str]] = {}
+    cs_locked_key = key_cs_locked(season, gw)
+    cs_final_key = key_cs_final(season, gw)
+    for el in live_elements:
+        pid = el.get("id")
+        if pid not in league_player_ids:
+            continue
+        stats = el.get("stats", {})
+        minutes = stats.get("minutes", 0)
+        team_id = player_team_map.get(pid)
+        if not team_id:
+            continue
+        # fixtures for this team
+        player_fixes = [f for f in fixtures if f.get("team_h") == team_id or f.get("team_a") == team_id]
+        for fx in player_fixes:
+            fixture_id = fx.get("id")
+            if not isinstance(fixture_id, int):
+                continue
+            conceded = fixture_team_conceded(fx, team_id)
+            finished = fx.get("finished")
+            member = f"{fixture_id}:{pid}"
+            # Early lock
+            if not finished and conceded == 0 and 60 <= minutes < 90:
+                exists = await r_sismember(cs_locked_key, member)
+                if not exists:
+                    await r_sadd(cs_locked_key, member)
+                    messages.setdefault(fixture_id, []).append(f"Ранний кленшит: {player_name_map.get(pid, f'Player{pid}')}")
+            # Final
+            if finished and conceded == 0 and minutes >= 60:
+                final_exists = await r_sismember(cs_final_key, member)
+                if not final_exists:
+                    await r_sadd(cs_final_key, member)
+                    # Was early?
+                    early_exists = await r_sismember(cs_locked_key, member)
+                    if early_exists:
+                        messages.setdefault(fixture_id, []).append(f"Кленшит подтверждён: {player_name_map.get(pid, f'Player{pid}')}")
+                    else:
+                        messages.setdefault(fixture_id, []).append(f"Кленшит: {player_name_map.get(pid, f'Player{pid}')}")
+    return messages
+
+# ---------- Pair Goals & Assists ----------
+def pair_goals_assists(events_by_fixture: Dict[int, List[Dict]]) -> Dict[int, List[str]]:
+    """
+    Produce human-readable lines per fixture:
+    For each goal event, attempt to pair with one assist event from same fixture (unpaired).
+    If assists > goals, leftover assists become 'Ассист: <player>'.
+    """
+    output: Dict[int, List[str]] = {}
+    for fixture_id, evs in events_by_fixture.items():
+        goals = [e for e in evs if e["type"] == "goals_scored"]
+        assists = [e for e in evs if e["type"] == "assists"]
+        others = [e for e in evs if e["type"] not in ("goals_scored", "assists")]
+        used_assist_indices: Set[int] = set()
+        lines: List[str] = []
+        for g in goals:
+            scorer_name = player_name_map.get(g["player"], f"Player{g['player']}")
+            assist_name = None
+            for idx, a in enumerate(assists):
+                if idx not in used_assist_indices:
+                    assist_name = player_name_map.get(a["player"], f"Player{a['player']}")
+                    used_assist_indices.add(idx)
+                    break
+            if assist_name:
+                lines.append(f"Гол: {scorer_name} (ассист: {assist_name})")
+            else:
+                lines.append(f"Гол: {scorer_name}")
+        # leftover assists
+        for idx, a in enumerate(assists):
+            if idx not in used_assist_indices:
+                assist_name = player_name_map.get(a["player"], f"Player{a['player']}")
+                lines.append(f"Ассист: {assist_name}")
+        # others
+        for o in others:
+            pname = player_name_map.get(o["player"], f"Player{o['player']}")
+            if o["type"] == "penalties_missed":
+                lines.append(f"Пенальти не забит: {pname}")
+            elif o["type"] == "red_cards":
+                lines.append(f"Красная карточка: {pname}")
+            else:
+                lines.append(f"{o['type']}: {pname}")
+        if lines:
+            output[fixture_id] = lines
+    return output
+
+# ---------- Commands ----------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я FPL-бот 🚀")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Доступные команды:\n"
+        "Команды:\n"
         "/start — приветствие\n"
         f"/points — очки за последний завершённый тур лиги {LEAGUE_ID}\n"
-        "/gw <номер> — очки за указанный тур (например: /gw 14)\n"
-        f"/rank — текущее положение в лиге {LEAGUE_ID}\n"
-        "/deadline — сколько осталось до ближайшего дедлайна\n"
+        "/gw <номер> — очки за указанный тур\n"
+        f"/rank — положение в лиге {LEAGUE_ID}\n"
+        "/deadline — время до ближайшего дедлайна (UTC+5)\n"
+        "/gwinfo <номер> — тест: события тура\n"
+        "/liveon — включить мониторинг\n"
+        "/liveoff — выключить мониторинг\n"
         "/help — эта справка"
     )
     await update.message.reply_text(text)
 
 async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    league_id = LEAGUE_ID
-    bootstrap = await get_bootstrap()
-    if not bootstrap:
-        err = "FPL API bootstrap-static недоступен (ошибка/таймаут)"
-        logger.error(err)
-        await update.message.reply_text(err)
+    bs = await get_bootstrap()
+    if not bs:
+        await update.message.reply_text("bootstrap недоступен")
         return
-    events = bootstrap.get("events", [])
-    if not events:
-        await update.message.reply_text("Не удалось получить список туров.")
+    events = bs.get("events", [])
+    last_finished = choose_last_finished_gw(events)
+    if not last_finished:
+        await update.message.reply_text("Нет завершённого тура.")
         return
-    last_finished_gw = choose_last_finished_gw(events)
-    if not last_finished_gw:
-        await update.message.reply_text("Не удалось определить завершённый тур.")
-        return
-    await send_league_points(update, league_id, last_finished_gw, events, header_override=None)
+    await send_league_points(update, LEAGUE_ID, last_finished, events, header_override=None)
 
 async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    league_id = LEAGUE_ID
     args = context.args
-    if not args:
-        await update.message.reply_text("Использование: /gw <номер_тура>. Например: /gw 14")
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /gw <номер>")
         return
-    gw_str = args[0].strip()
-    if not gw_str.isdigit():
-        await update.message.reply_text("Номер тура должен быть целым числом. Пример: /gw 12")
+    gw_num = int(args[0])
+    bs = await get_bootstrap()
+    if not bs:
+        await update.message.reply_text("bootstrap недоступен")
         return
-    gw_num = int(gw_str)
-    bootstrap = await get_bootstrap()
-    if not bootstrap:
-        await update.message.reply_text("Не удалось обновить bootstrap-static.")
-        return
-    events = bootstrap.get("events", [])
+    events = bs.get("events", [])
     if not events:
         await update.message.reply_text("Нет данных о турах.")
         return
     max_gw = max(e.get("id", 0) for e in events)
     if gw_num < 1 or gw_num > max_gw:
-        await update.message.reply_text(f"Тур {gw_num} вне диапазона (1..{max_gw}).")
+        await update.message.reply_text(f"Тур вне диапазона 1..{max_gw}")
         return
-    event_map = {e["id"]: e for e in events}
-    selected_event = event_map.get(gw_num)
-    finished = selected_event.get("finished") if selected_event else False
-    is_current = selected_event.get("is_current") if selected_event else False
-    if not finished and not is_current and not selected_event.get("data_checked", False):
-        await update.message.reply_text("Этот тур ещё не стартовал или нет данных.")
+    e_map = {e["id"]: e for e in events}
+    sel = e_map.get(gw_num)
+    if not sel:
+        await update.message.reply_text("Тур не найден.")
+        return
+    finished = sel.get("finished")
+    is_current = sel.get("is_current")
+    if not finished and not is_current and not sel.get("data_checked", False):
+        await update.message.reply_text("Тур не стартовал или нет данных.")
         return
     header = f"*Очки за тур {gw_num}*"
     if not finished:
-        header += " (тур ещё не завершён)"
+        header += " (ещё не завершён)"
     header += "\n\n"
-    await send_league_points(update, league_id, gw_num, events, header_override=header)
+    await send_league_points(update, LEAGUE_ID, gw_num, events, header_override=header)
 
 async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    league_id = LEAGUE_ID
-    results = await get_league_results_cached(league_id)
+    results = await get_league_results_cached(LEAGUE_ID)
     if results is None:
-        err = "Не удалось получить участников лиги (standings)."
-        logger.error(err)
-        await update.message.reply_text(err)
+        await update.message.reply_text("Standings недоступен")
         return
-    results_sorted = sorted(results, key=lambda r: r.get("rank", 10**9))
-    header = "*Текущее положение в лиге:*\n\n"
-    lines: List[str] = []
-    for r in results_sorted:
+    sorted_res = sorted(results, key=lambda r: r.get("rank", 10**9))
+    lines = ["*Текущее положение:*\n"]
+    for r in sorted_res:
         rank = r.get("rank")
         last_rank = r.get("last_rank")
         total = r.get("total")
         entry_name = r.get("entry_name")
         player_name = r.get("player_name")
         change = ""
-        if isinstance(last_rank, int) and isinstance(rank, int) and last_rank > 0 and rank > 0:
+        if isinstance(rank, int) and isinstance(last_rank, int) and rank > 0 and last_rank > 0:
             delta = last_rank - rank
             if delta > 0:
                 change = f" ↑{delta}"
@@ -504,47 +739,107 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 change = " →0"
         lines.append(f"{rank}. {player_name} — {entry_name}: {total} pts{change}")
-    full_text = header + "\n".join(lines)
-    for chunk in split_message_chunks(full_text):
+    text = "\n".join(lines)
+    for chunk in split_message_chunks(text):
         try:
             await update.message.reply_text(chunk, parse_mode="Markdown")
         except Exception:
             await update.message.reply_text(chunk)
 
 async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bootstrap = await get_bootstrap()
-    if not bootstrap:
-        await update.message.reply_text("Не удалось получить данные (bootstrap).")
+    bs = await get_bootstrap()
+    if not bs:
+        await update.message.reply_text("bootstrap недоступен")
         return
-    events = bootstrap.get("events", [])
-    if not events:
-        await update.message.reply_text("Нет данных о турах.")
-        return
+    events = bs.get("events", [])
     target = find_next_deadline_event(events)
     if not target:
-        await update.message.reply_text("Нет будущих дедлайнов (сезон завершён или данные недоступны).")
+        await update.message.reply_text("Нет будущих дедлайнов.")
         return
-    deadline_dt = parse_deadline(target.get("deadline_time"))
-    if not deadline_dt:
-        await update.message.reply_text("Не удалось распарсить время дедлайна.")
+    dt_utc = parse_deadline(target.get("deadline_time"))
+    if not dt_utc:
+        await update.message.reply_text("Ошибка парсинга дедлайна.")
         return
-    now = datetime.now(timezone.utc)
-    delta_seconds = int((deadline_dt - now).total_seconds())
+    local = dt_utc + timedelta(hours=5)
+    now_local = datetime.now(timezone.utc) + timedelta(hours=5)
+    delta_seconds = int((local - now_local).total_seconds())
     human = format_timedelta(delta_seconds)
-    gw_id = target.get("id")
-    gw_name = target.get("name", f"GW {gw_id}")
-    deadline_str = deadline_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-    text = (
-        f"*Ближайший дедлайн:* {gw_name} (ID {gw_id})\n"
-        f"Когда: {deadline_str}\n"
-        f"Осталось: {human}"
-    )
+    gw_name = target.get("name", "Gameweek")
+    local_str = local.strftime("%Y-%m-%d %H:%M:%S UTC+5")
+    text = f"*Ближайший дедлайн:* {gw_name}\nКогда: {local_str}\nОсталось: {human}"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
         await update.message.reply_text(text)
 
-# ---------- shared send ----------
+async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /gwinfo <номер>")
+        return
+    gw = int(args[0])
+    bs = await get_bootstrap()
+    if not bs:
+        await update.message.reply_text("bootstrap недоступен")
+        return
+    events = bs.get("events", [])
+    if not events:
+        await update.message.reply_text("Нет events")
+        return
+    max_gw = max(e.get("id", 0) for e in events)
+    if gw < 1 or gw > max_gw:
+        await update.message.reply_text(f"Тур вне диапазона 1..{max_gw}")
+        return
+    live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
+    fixtures = await fetch_json(fpl_url(fixtures_event_path_tpl.format(gw=gw)))
+    if not live or not fixtures:
+        await update.message.reply_text("Live/fixtures недоступны.")
+        return
+    player_ids = await get_league_player_ids(gw)
+    elements = live.get("elements", [])
+    lines = [f"*События GW {gw}:*\n"]
+    for el in elements:
+        pid = el.get("id")
+        if pid not in player_ids:
+            continue
+        stats = el.get("stats", {})
+        mins = stats.get("minutes", 0)
+        g = stats.get("goals_scored", 0)
+        a = stats.get("assists", 0)
+        pm = stats.get("penalties_missed", 0)
+        rc = stats.get("red_cards", 0)
+        cs = stats.get("clean_sheets", 0)
+        if any([g, a, pm, rc, cs]):
+            name = player_name_map.get(pid, f"Player{pid}")
+            lines.append(f"{name}: G={g} A={a} PM={pm} RC={rc} CS={cs} MIN={mins}")
+    text = "\n".join(lines)
+    for chunk in split_message_chunks(text):
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(chunk)
+
+current_target_chat: Optional[int] = None
+live_monitor_enabled = ENABLE_LIVE_MONITOR
+player_name_map: Dict[int, str] = {}
+
+async def liveon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global live_monitor_enabled, current_target_chat
+    live_monitor_enabled = True
+    if TARGET_CHAT_ID:
+        await update.message.reply_text("Мониторинг включён. Используется фиксированный TARGET_CHAT_ID.")
+    else:
+        current_target_chat = update.effective_chat.id
+        await update.message.reply_text(f"Мониторинг включён. События будут приходить сюда (chat_id={current_target_chat}).")
+
+async def liveoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global live_monitor_enabled, current_target_chat
+    live_monitor_enabled = False
+    if not TARGET_CHAT_ID:
+        current_target_chat = None
+    await update.message.reply_text("Мониторинг выключен.")
+
+# ---------- League Points ----------
 async def send_league_points(
     update: Update,
     league_id: str,
@@ -554,75 +849,176 @@ async def send_league_points(
 ):
     results = await get_league_results_cached(league_id)
     if results is None:
-        err = "Не удалось получить участников лиги (standings)."
-        logger.error(err)
-        await update.message.reply_text(err)
+        await update.message.reply_text("Standings недоступен")
         return
     header = header_override or f"*Очки за тур {gw_num}:*\n\n"
     lines: List[str] = []
 
-    async def fetch_points(entry_id: int, entry_name: str, player_name: str) -> str:
+    async def one(entry_id: int, entry_name: str, player_name: str) -> str:
         data = await get_entry_picks_cached(entry_id, gw_num)
-        points = None
+        pts = None
         if data:
-            points = data.get("entry_history", {}).get("points")
-        return f"{player_name} — {entry_name}: {points if points is not None else 'нет данных'}"
+            pts = data.get("entry_history", {}).get("points")
+        return f"{player_name} — {entry_name}: {pts if pts is not None else 'нет данных'}"
 
-    tasks = [
-        asyncio.create_task(fetch_points(r["entry"], r["entry_name"], r["player_name"]))
-        for r in results
-    ]
-    fetched = await asyncio.gather(*tasks, return_exceptions=True)
-    for item in fetched:
+    tasks = [asyncio.create_task(one(r["entry"], r["entry_name"], r["player_name"])) for r in results]
+    res = await asyncio.gather(*tasks, return_exceptions=True)
+    for item in res:
         if isinstance(item, Exception):
             lines.append("Ошибка участника: нет данных")
         else:
             lines.append(item)
-
     full_text = header + "\n".join(lines)
-    chunks = split_message_chunks(full_text)
-    for chunk in chunks:
+    for chunk in split_message_chunks(full_text):
         try:
             await update.message.reply_text(chunk, parse_mode="Markdown")
         except Exception:
             await update.message.reply_text(chunk)
 
-# ---------- misc ----------
-async def _register_webhook_if_needed():
-    logger.info("Webhook registration placeholder (not implemented)")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception in handler", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_chat:
+# ---------- Live Monitor Loop ----------
+async def live_monitor_loop():
+    logger.info("Live monitor loop started")
+    while not stop_event.is_set():
         try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Произошла внутренняя ошибка. Сообщите администратору."
-            )
-        except Exception:
-            pass
+            if not live_monitor_enabled:
+                await asyncio.sleep(5)
+                continue
 
-# ---------- 7. Setup Telegram command menu ----------
+            bs = await get_bootstrap()
+            if not bs:
+                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                continue
+            season = discover_season_tag(bs)
+            events = bs.get("events", [])
+            current_ev = next((e for e in events if e.get("is_current")), None)
+            if not current_ev or current_ev.get("finished"):
+                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                continue
+            gw = current_ev.get("id")
+            if not isinstance(gw, int):
+                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                continue
+
+            live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
+            fixtures = await fetch_json(fpl_url(fixtures_event_path_tpl.format(gw=gw)))
+            if not live or not fixtures:
+                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                continue
+
+            league_players = await get_league_player_ids(gw)
+            live_elements = live.get("elements", [])
+
+            # Baseline check
+            baseline_key = key_baseline(season, gw)
+            baseline_done = await r_flag_exists(baseline_key)
+            counts = extract_current_counts(live_elements)
+
+            # Only consider league players
+            counts = {k: v for k, v in counts.items() if k[2] in league_players}
+
+            if not baseline_done:
+                # Store baseline without notifications
+                for (fixture_id, stat, player_id, _minutes), val in counts.items():
+                    await r_set(key_event(season, gw, fixture_id, stat, player_id), val)
+                await r_set_flag(baseline_key)
+                logger.info(f"Baseline set for GW {gw}.")
+                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                continue
+
+            new_events_by_fixture = await diff_new_events(
+                season,
+                gw,
+                counts
+            )
+
+            # Pair goals & assists to form lines
+            paired_lines = pair_goals_assists(new_events_by_fixture)
+
+            # Clean sheets
+            player_team_map_local = build_player_team_map()
+            cs_messages = await process_clean_sheets(season, gw, fixtures, live_elements,
+                                                     league_players, player_team_map_local)
+
+            # Build fixture index for header
+            team_short = build_team_short_map()
+            fixture_index = {f.get("id"): f for f in fixtures if isinstance(f.get("id"), int)}
+
+            messages: List[str] = []
+            # Fixtures with events
+            for fixture_id in set(list(paired_lines.keys()) + list(cs_messages.keys())):
+                fx = fixture_index.get(fixture_id, {})
+                th = fx.get("team_h"); ta = fx.get("team_a")
+                sh = fx.get("team_h_score"); sa = fx.get("team_a_score")
+                if sh is None: sh = 0
+                if sa is None: sa = 0
+                head = f"*Матч:* {team_short.get(th,'T?')} {sh}–{sa} {team_short.get(ta,'T?')}"
+                lines = [head]
+                if fixture_id in paired_lines:
+                    lines.extend(paired_lines[fixture_id])
+                if fixture_id in cs_messages:
+                    lines.extend(cs_messages[fixture_id])
+                if len(lines) > 1:
+                    messages.append("\n".join(lines))
+
+            if messages:
+                final_text = "\n\n".join(messages)
+                # Determine target chat
+                target_chat_id = None
+                if TARGET_CHAT_ID:
+                    try:
+                        target_chat_id = int(TARGET_CHAT_ID)
+                    except ValueError:
+                        target_chat_id = None
+                elif current_target_chat is not None:
+                    target_chat_id = current_target_chat
+
+                if target_chat_id:
+                    for chunk in split_message_chunks(final_text):
+                        try:
+                            await application.bot.send_message(
+                                chat_id=target_chat_id, text=chunk, parse_mode="Markdown"
+                            )
+                        except Exception:
+                            logger.exception("Failed sending live notification.")
+                else:
+                    logger.info("Live events (no chat bound): " + final_text)
+
+            await asyncio.sleep(LIVE_POLL_INTERVAL)
+        except Exception as ex:
+            logger.exception(f"Error in live_monitor_loop: {ex}")
+            await asyncio.sleep(LIVE_POLL_INTERVAL)
+    logger.info("Live monitor loop stopped")
+
+# ---------- Error Handler ----------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception", exc_info=context.error)
+
+# ---------- Commands Menu ----------
 async def setup_bot_commands(bot):
     commands = [
         BotCommand("start", "Приветствие"),
-        BotCommand("help", "Справка по командам"),
-        BotCommand("points", "Очки за последний завершённый тур"),
-        BotCommand("gw", "Очки за указанный тур: /gw <номер>"),
-        BotCommand("rank", "Текущее положение в лиге"),
-        BotCommand("deadline", "Сколько осталось до дедлайна"),
+        BotCommand("help", "Справка"),
+        BotCommand("points", "Очки (последний завершённый)"),
+        BotCommand("gw", "Очки за тур"),
+        BotCommand("rank", "Положение в лиге"),
+        BotCommand("deadline", "До дедлайна (UTC+5)"),
+        BotCommand("gwinfo", "События тура"),
+        BotCommand("liveon", "Включить мониторинг"),
+        BotCommand("liveoff", "Выключить мониторинг"),
     ]
     await bot.set_my_commands(commands)
     try:
         await bot.set_my_commands(commands, language_code="ru")
     except Exception:
         pass
-    logger.info("Telegram command menu set.")
+    logger.info("Bot commands set.")
 
-# ---------- 8. run_bot (manual polling) ----------
+# ---------- run_bot ----------
 async def run_bot():
-    global http_client
+    global http_client, application, player_name_map
     logger.info("Starting bot...")
+
+    init_redis()
 
     limits = httpx.Limits(max_keepalive_connections=10, max_connections=50)
     use_http2 = ENABLE_HTTP2
@@ -630,7 +1026,7 @@ async def run_bot():
         try:
             import h2  # noqa: F401
         except ImportError:
-            logger.warning("h2 package not found, disabling HTTP/2. Install httpx[http2] to enable.")
+            logger.warning("h2 not found, disabling HTTP/2.")
             use_http2 = False
 
     http_client = httpx.AsyncClient(http2=use_http2, limits=limits, timeout=15.0)
@@ -643,6 +1039,9 @@ async def run_bot():
     application.add_handler(CommandHandler("gw", gw_command))
     application.add_handler(CommandHandler("rank", rank_command))
     application.add_handler(CommandHandler("deadline", deadline_command))
+    application.add_handler(CommandHandler("gwinfo", gwinfo_command))
+    application.add_handler(CommandHandler("liveon", liveon_command))
+    application.add_handler(CommandHandler("liveoff", liveoff_command))
     application.add_error_handler(error_handler)
 
     await application.initialize()
@@ -651,59 +1050,68 @@ async def run_bot():
     try:
         await setup_bot_commands(application.bot)
     except Exception:
-        logger.exception("Failed to set bot commands")
+        logger.exception("Failed set commands")
+
+    # Preload bootstrap for player names
+    bs = await get_bootstrap()
+    if bs:
+        player_name_map = build_player_name_map()
+    else:
+        player_name_map = {}
 
     if USE_WEBHOOK:
-        await _register_webhook_if_needed()
+        logger.info("Webhook mode placeholder (not implemented).")
     else:
         try:
             await application.updater.start_polling()
-            logger.info("Polling started")
+            logger.info("Polling started.")
         except Exception:
-            logger.exception("Failed to start polling")
+            logger.exception("Failed start polling")
             try:
                 await application.stop()
                 await application.shutdown()
             except Exception:
-                logger.exception("Error shutting down application after polling failure")
+                logger.exception("Shutdown after polling failure")
             try:
-                await http_client.aclose()
+                if http_client:
+                    await http_client.aclose()
             except Exception:
-                logger.exception("Error closing HTTP client early")
+                logger.exception("Close http client failed")
             return
+
+    asyncio.create_task(live_monitor_loop())
 
     try:
         me = await application.bot.get_me()
         logger.info("Bot started as @%s (id=%s)", getattr(me, 'username', 'unknown'), getattr(me, 'id', 'unknown'))
     except Exception:
-        logger.exception("Failed to get_me")
+        logger.exception("get_me failed")
 
-    logger.info("Bot started, waiting for stop_event...")
+    logger.info("Waiting for stop_event...")
     try:
         await stop_event.wait()
     finally:
-        logger.info("Shutdown initiated")
+        logger.info("Shutdown initiated.")
         if not USE_WEBHOOK:
             try:
                 await application.updater.stop()
-                logger.info("Updater stopped")
             except Exception:
-                logger.exception("Error stopping updater")
+                logger.exception("Updater stop error")
         try:
             await application.stop()
             await application.shutdown()
         except Exception:
-            logger.exception("Error shutting down application")
+            logger.exception("Application shutdown error")
         try:
             if http_client:
                 await http_client.aclose()
         except Exception:
-            logger.exception("Error closing HTTP client")
-        logger.info("SHUTDOWN COMPLETE")
+            logger.exception("HTTP client close error")
+        logger.info("Shutdown complete.")
 
-# ---------- 9. Signals ----------
+# ---------- Signals ----------
 def handle_sigterm(signum, frame):
-    logger.info("SIGTERM/SIGINT received, initiating shutdown...")
+    logger.info("SIGTERM/SIGINT received -> stopping.")
     try:
         loop = asyncio.get_event_loop()
         loop.call_soon_threadsafe(stop_event.set)
@@ -713,18 +1121,15 @@ def handle_sigterm(signum, frame):
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
-# ---------- 10. Entrypoint ----------
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
     print("Main entrypoint start")
-
     if ENABLE_KILL:
         kill_existing_instances()
-
     logger.info("Lock acquired (placeholder)")
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask thread started")
-
     try:
         asyncio.run(run_bot())
     except Exception:
