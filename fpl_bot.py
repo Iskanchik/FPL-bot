@@ -44,6 +44,7 @@ import logging
 import time
 import signal
 import random
+import hashlib
 from typing import Any, Dict, Optional, List, Tuple, Set
 from datetime import datetime, timezone, timedelta
 
@@ -215,6 +216,21 @@ _mem_events: Dict[str, int] = {}
 _mem_sets: Dict[str, Set[str]] = {}
 _mem_baseline: Set[str] = set()
 
+# ---------- In-memory KV with TTL (Item 10) ----------
+_mem_kv: Dict[str, Tuple[Any, float]] = {}  # key -> (value, timestamp)
+_mem_kv_lock = asyncio.Lock()
+
+# Fixtures cache per GW (Item 1)
+_fixtures_cache: Dict[int, Tuple[List[Dict], float]] = {}  # gw -> (fixtures, timestamp)
+_fixtures_cache_lock = asyncio.Lock()
+FIXTURES_TTL = 900  # 15 minutes
+
+# Rebuild tracking (Item 13)
+_rebuild_tracker: Dict[str, List[float]] = {}  # key -> [timestamp list]
+_rebuild_tracker_lock = asyncio.Lock()
+REBUILD_RATE_LIMIT_COUNT = 5  # max rebuilds per hour
+REBUILD_RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
+
 def init_redis():
     global redis_client
     if Redis is None:
@@ -286,6 +302,55 @@ def discover_season_tag(bootstrap: Dict[str, Any]) -> str:
     SEASON_TAG = season
     return SEASON_TAG
 
+# ---------- In-memory KV with TTL helpers (Item 10) ----------
+async def mem_kv_set(key: str, value: Any, ttl: int = 3600):
+    """Set a value in memory KV with TTL (seconds)"""
+    async with _mem_kv_lock:
+        _mem_kv[key] = (value, time.time() + ttl)
+
+async def mem_kv_get(key: str) -> Optional[Any]:
+    """Get a value from memory KV if not expired"""
+    async with _mem_kv_lock:
+        entry = _mem_kv.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if time.time() > expires_at:
+            del _mem_kv[key]
+            return None
+        return value
+
+async def mem_kv_cleanup():
+    """Remove expired entries from memory KV (Item 10)"""
+    async with _mem_kv_lock:
+        now = time.time()
+        expired_keys = [k for k, (_, exp) in _mem_kv.items() if now > exp]
+        for k in expired_keys:
+            del _mem_kv[k]
+        if expired_keys:
+            logger.debug(f"Cleaned up {len(expired_keys)} expired KV entries")
+
+# ---------- Rebuild rate limiter (Item 13) ----------
+async def can_rebuild(resource_key: str) -> bool:
+    """Check if rebuild is allowed based on rate limit"""
+    async with _rebuild_tracker_lock:
+        now = time.time()
+        window_start = now - REBUILD_RATE_LIMIT_WINDOW
+        
+        # Get recent rebuilds for this resource
+        recent = _rebuild_tracker.get(resource_key, [])
+        # Filter to only those within the window
+        recent = [t for t in recent if t > window_start]
+        
+        if len(recent) >= REBUILD_RATE_LIMIT_COUNT:
+            logger.warning(f"Rebuild rate limit exceeded for {resource_key}: {len(recent)} rebuilds in last hour")
+            return False
+        
+        # Record this rebuild
+        recent.append(now)
+        _rebuild_tracker[resource_key] = recent
+        return True
+
 # ---------- Bootstrap ----------
 def bootstrap_cache_valid() -> bool:
     if bootstrap_cache_ts is None:
@@ -325,6 +390,36 @@ async def get_bootstrap() -> Optional[Dict]:
             bootstrap_cache_ts = time.time()
         return fake
     return None
+
+# ---------- Unified cached accessors (Item 7) ----------
+async def get_bootstrap_cached() -> Optional[Dict]:
+    """Unified accessor for bootstrap with TTL control"""
+    return await get_bootstrap()
+
+async def get_fixtures_cached(gw: int) -> Optional[List[Dict]]:
+    """Unified accessor for fixtures with TTL ~900s (Item 1, 7)"""
+    async with _fixtures_cache_lock:
+        cached = _fixtures_cache.get(gw)
+        if cached:
+            fixtures, ts = cached
+            if time.time() - ts < FIXTURES_TTL:
+                logger.debug(f"Using cached fixtures for GW {gw}")
+                return fixtures
+    
+    # Fetch fresh
+    url = fpl_url(fixtures_event_path_tpl.format(gw=gw))
+    data = await fetch_json(url)
+    if data and isinstance(data, list):
+        async with _fixtures_cache_lock:
+            _fixtures_cache[gw] = (data, time.time())
+        logger.debug(f"Fetched and cached fixtures for GW {gw}")
+        return data
+    
+    return None
+
+async def get_standings_cached() -> Optional[List[Dict]]:
+    """Unified accessor for standings with TTL ~300-600s (Item 7)"""
+    return await get_league_results_cached(LEAGUE_ID)
 
 # ---------- Standings ----------
 def standings_cache_valid() -> bool:
@@ -437,6 +532,21 @@ def split_message_chunks(text: str, limit: int = 4000) -> List[str]:
         chunks.append(buf)
     return chunks
 
+# ---------- Unified send function (Item 8) ----------
+async def safe_reply_markdown(update: Update, text: str):
+    """
+    Unified send function handling Markdown fallback and chunk splitting.
+    Removes duplication across commands.
+    """
+    for chunk in split_message_chunks(text):
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception as e:
+            logger.debug(f"Markdown send failed, falling back to plain text: {e}")
+            # Fallback: remove markdown formatting artifacts
+            plain_chunk = chunk.replace("*", "").replace("_", "").replace("`", "")
+            await update.message.reply_text(plain_chunk)
+
 def format_timedelta(delta_seconds: int) -> str:
     if delta_seconds < 0:
         return "дедлайн уже прошёл"
@@ -470,6 +580,62 @@ def find_next_deadline_event(events: List[Dict]) -> Optional[Dict]:
     if prioritized:
         return min(prioritized, key=lambda x: parse_deadline(x["deadline_time"]))
     return min(future_candidates, key=lambda x: parse_deadline(x["deadline_time"]))
+
+# ---------- Adaptive polling interval (Item 2) ----------
+async def next_poll_interval(fixtures: Optional[List[Dict]] = None, events: Optional[List[Dict]] = None) -> int:
+    """
+    Calculate adaptive poll interval based on match state and time to kickoff:
+    - >6h until next kickoff: 180s
+    - 30m-6h until kickoff: 60s
+    - During active matches: 30s
+    - Optional future: 20s during high activity
+    """
+    now = datetime.now(timezone.utc)
+    
+    # Check if there are active matches
+    if fixtures:
+        active_matches = [f for f in fixtures if f.get("started") and not f.get("finished")]
+        if active_matches:
+            logger.debug("Active matches in progress, using 30s interval")
+            return 30
+    
+    # Find time until next kickoff
+    if fixtures:
+        upcoming = []
+        for f in fixtures:
+            ko_str = f.get("kickoff_time")
+            if ko_str and not f.get("started"):
+                ko_dt = parse_deadline(ko_str)
+                if ko_dt and ko_dt > now:
+                    upcoming.append(ko_dt)
+        
+        if upcoming:
+            next_ko = min(upcoming)
+            seconds_until = (next_ko - now).total_seconds()
+            
+            if seconds_until < 1800:  # < 30 minutes
+                logger.debug(f"Match starting in {int(seconds_until)}s, using 60s interval")
+                return 60
+            elif seconds_until < 21600:  # < 6 hours
+                logger.debug(f"Match starting in {int(seconds_until/60)}m, using 60s interval")
+                return 60
+            else:
+                logger.debug(f"No matches soon ({int(seconds_until/3600)}h), using 180s interval")
+                return 180
+    
+    # Check deadline proximity as fallback
+    if events:
+        next_event = find_next_deadline_event(events)
+        if next_event:
+            dt = parse_deadline(next_event.get("deadline_time"))
+            if dt:
+                seconds_until = (dt - now).total_seconds()
+                if seconds_until < 3600:  # < 1 hour
+                    return 60
+    
+    # Default: no active matches, no upcoming kickoffs
+    logger.debug("No active or upcoming matches, using 180s interval")
+    return 180
 
 # ---------- League Players / Owners ----------
 async def get_league_player_ids(gw: int) -> Set[int]:
@@ -598,6 +764,78 @@ def calc_dc_points(stats: Dict[str, Any], pos: int) -> int:
     if pos in (3, 4):
         return 2 if dc_count >= 12 else 0
     return 0
+
+# ---------- Stat extraction helpers (Item 16) ----------
+def extract_player_event_stats(stats: Dict[str, Any], pos: int, fixture_finished: bool = True) -> Dict[str, Any]:
+    """
+    Helper to extract and compute player stats for display in a clean, testable way.
+    Returns dict with stat tokens and computed values.
+    """
+    stat_parts: List[str] = []
+    total_points = int(stats.get("total_points", 0) or 0)
+    
+    # Goals
+    g = int(stats.get("goals_scored", 0) or 0)
+    if g > 0:
+        stat_parts.append(f"G{g}")
+    
+    # Assists
+    a = int(stats.get("assists", 0) or 0)
+    if a > 0:
+        stat_parts.append(f"A{a}")
+    
+    # Clean sheet (show for GK/DEF/MID; suppress for FWD)
+    cs = int(stats.get("clean_sheets", 0) or 0)
+    if cs > 0 and pos != 4:
+        stat_parts.append("CS")
+    
+    # DC (presence only)
+    dc_pts = calc_dc_points(stats, pos)
+    if dc_pts > 0:
+        stat_parts.append("DC")
+    
+    # Yellow cards (with number)
+    yc = int(stats.get("yellow_cards", 0) or 0)
+    if yc > 0:
+        stat_parts.append(f"YC{yc}")
+    
+    # Red cards (presence only)
+    rc = int(stats.get("red_cards", 0) or 0)
+    if rc > 0:
+        stat_parts.append("RC")
+    
+    # Goalkeeper saves points (saves // 3) as GKS
+    if pos == 1:
+        saves = int(stats.get("saves", 0) or 0)
+        gks = saves // 3
+        if gks > 0:
+            stat_parts.append(f"GKS{gks}")
+    
+    # Own goals (with number)
+    og = int(stats.get("own_goals", 0) or 0)
+    if og > 0:
+        stat_parts.append(f"OG{og}")
+    
+    # Penalties missed (PenM)
+    pen_m = int(stats.get("penalties_missed", 0) or 0)
+    if pen_m > 0:
+        stat_parts.append(f"PenM{pen_m}")
+    
+    # Penalties saved (PenS)
+    pen_s = int(stats.get("penalties_saved", 0) or 0)
+    if pen_s > 0:
+        stat_parts.append(f"PenS{pen_s}")
+    
+    # Bonus (always last) - only show after match ends (Bonus handling adjustment)
+    bonus_val = int(stats.get("bonus", 0) or 0)
+    if bonus_val > 0 and fixture_finished:
+        stat_parts.append(f"B{bonus_val}")
+    
+    return {
+        "stat_parts": stat_parts,
+        "total_points": total_points,
+        "has_meaningful_stats": bool(stat_parts) or total_points > 2
+    }
 
 # ---------- Baseline Extraction ----------
 def extract_current_counts(live_elements: List[Dict]) -> Dict[Tuple[int, str, int, int], int]:
@@ -753,7 +991,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/gwinfo <номер> — таблица игроков (live)\n"
         "/liveon — включить мониторинг\n"
         "/liveoff — выключить мониторинг\n"
-        "/con — конфигурация"
+        "/con — конфигурация\n"
+        "/rebuild_gw <номер> — пересчитать данные тура (admin)"
     )
     await update.message.reply_text(text)
 
@@ -826,11 +1065,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 change = " →0"
         lines.append(f"{rank}. {player_name} — {entry_name}: {total} pts{change}")
     text = "\n".join(lines)
-    for chunk in split_message_chunks(text):
-        try:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
-        except Exception:
-            await update.message.reply_text(chunk)
+    await safe_reply_markdown(update, text)
 
 async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bs = await get_bootstrap()
@@ -853,10 +1088,7 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gw_name = target.get("name", "Gameweek")
     local_str = local.strftime("%Y-%m-%d %H:%M:%S UTC+5")
     text = f"*Ближайший дедлайн:* {gw_name}\nКогда: {local_str}\nОсталось: {human}"
-    try:
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(text)
+    await safe_reply_markdown(update, text)
 
 # ---------- /gwinfo ----------
 async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -880,7 +1112,7 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
-    fixtures = await fetch_json(fpl_url(fixtures_event_path_tpl.format(gw=gw)))
+    fixtures = await get_fixtures_cached(gw)  # Use cached accessor
     if not live or not fixtures:
         await update.message.reply_text("live/fixtures недоступны.")
         return
@@ -893,6 +1125,16 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_bootstrap()
 
     pos_map = build_player_position_map()
+    player_team_map = build_player_team_map()
+    
+    # Build fixture status map (player -> all fixtures finished)
+    fixture_finished_map: Dict[int, bool] = {}
+    for pid in league_player_ids:
+        team_id = player_team_map.get(pid)
+        if team_id:
+            player_fixtures = [f for f in fixtures if f.get("team_h") == team_id or f.get("team_a") == team_id]
+            # All player's fixtures must be finished for bonus to show
+            fixture_finished_map[pid] = all(f.get("finished", False) for f in player_fixtures) if player_fixtures else False
 
     rows = []
     for el in live_elements:
@@ -900,72 +1142,14 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pid not in league_player_ids:
             continue
         stats = el.get("stats", {}) or {}
-        total_points = int(stats.get("total_points", 0) or 0)
         pos = pos_map.get(pid, 0)
+        fixture_finished = fixture_finished_map.get(pid, False)
 
-        # Build Stats tokens in strict order:
-        # G, A, CS, DC, YC, RC, GKS, OG, PenM, PenS, B
-        stat_parts: List[str] = []
-
-        # Goals
-        g = int(stats.get("goals_scored", 0) or 0)
-        if g > 0:
-            stat_parts.append(f"G{g}")
-
-        # Assists
-        a = int(stats.get("assists", 0) or 0)
-        if a > 0:
-            stat_parts.append(f"A{a}")
-
-        # Clean sheet (show for GK/DEF/MID; suppress for FWD)
-        cs = int(stats.get("clean_sheets", 0) or 0)
-        if cs > 0 and pos != 4:
-            stat_parts.append("CS")
-
-        # DC (presence only)
-        dc_pts = calc_dc_points(stats, pos)
-        if dc_pts > 0:
-            stat_parts.append("DC")
-
-        # Yellow cards (with number)
-        yc = int(stats.get("yellow_cards", 0) or 0)
-        if yc > 0:
-            stat_parts.append(f"YC{yc}")
-
-        # Red cards (presence only)
-        rc = int(stats.get("red_cards", 0) or 0)
-        if rc > 0:
-            stat_parts.append("RC")
-
-        # Goalkeeper saves points (saves // 3) as GKS
-        if pos == 1:
-            saves = int(stats.get("saves", 0) or 0)
-            gks = saves // 3
-            if gks > 0:
-                stat_parts.append(f"GKS{gks}")
-
-        # Own goals (with number)
-        og = int(stats.get("own_goals", 0) or 0)
-        if og > 0:
-            stat_parts.append(f"OG{og}")
-
-        # Penalties missed (PenM)
-        pen_m = int(stats.get("penalties_missed", 0) or 0)
-        if pen_m > 0:
-            stat_parts.append(f"PenM{pen_m}")
-
-        # Penalties saved (PenS)
-        pen_s = int(stats.get("penalties_saved", 0) or 0)
-        if pen_s > 0:
-            stat_parts.append(f"PenS{pen_s}")
-
-        # Bonus (always last)
-        bonus_val = int(stats.get("bonus", 0) or 0)
-        if bonus_val > 0:
-            stat_parts.append(f"B{bonus_val}")
-
+        # Use the new helper function (Item 16 + Bonus handling)
+        extracted = extract_player_event_stats(stats, pos, fixture_finished)
+        
         # Filter out pure appearance-only (<=2 pts and no stats)
-        if (not stat_parts) and (total_points <= 2):
+        if not extracted["has_meaningful_stats"]:
             continue
 
         name = player_name_map.get(pid, f"Player{pid}")
@@ -973,8 +1157,8 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rows.append({
             "name": name,
-            "stats": " ".join(stat_parts) if stat_parts else "-",
-            "pts": total_points,
+            "stats": " ".join(extracted["stat_parts"]) if extracted["stat_parts"] else "-",
+            "pts": extracted["total_points"],
             "own": owners_count
         })
 
@@ -1004,14 +1188,7 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("```")
 
     full_text = "\n".join(lines)
-    for chunk in split_message_chunks(full_text):
-        try:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
-        except Exception:
-            safe_text = full_text.replace("```", "")
-            for c2 in split_message_chunks(safe_text):
-                await update.message.reply_text(c2)
-            break
+    await safe_reply_markdown(update, full_text)
 
 # ---------- Live On/Off ----------
 current_target_chat: Optional[int] = None
@@ -1033,6 +1210,68 @@ async def liveoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not TARGET_CHAT_ID:
         current_target_chat = None
     await update.message.reply_text("Мониторинг выключен.")
+
+# ---------- Admin commands (Item 17) ----------
+async def rebuild_gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command to rebuild GW snapshot data.
+    Usage: /rebuild_gw <gw_number>
+    """
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /rebuild_gw <номер>")
+        return
+    
+    gw = int(args[0])
+    
+    # Check rate limit
+    resource_key = f"gw:{gw}"
+    if not await can_rebuild(resource_key):
+        await update.message.reply_text(
+            f"Превышен лимит перестроения для GW {gw}. "
+            f"Максимум {REBUILD_RATE_LIMIT_COUNT} раз в час."
+        )
+        return
+    
+    await update.message.reply_text(f"Начинаем перестроение данных GW {gw}...")
+    
+    try:
+        bs = await get_bootstrap()
+        if not bs:
+            await update.message.reply_text("bootstrap недоступен")
+            return
+        
+        season = discover_season_tag(bs)
+        
+        # Clear baseline to force recalculation
+        baseline_key = key_baseline(season, gw)
+        if redis_client:
+            await asyncio.to_thread(redis_client.delete, baseline_key)
+        elif baseline_key in _mem_baseline:
+            _mem_baseline.remove(baseline_key)
+        
+        # Clear CS flags
+        cs_locked_key = key_cs_locked(season, gw)
+        cs_final_key = key_cs_final(season, gw)
+        if redis_client:
+            await asyncio.to_thread(redis_client.delete, cs_locked_key)
+            await asyncio.to_thread(redis_client.delete, cs_final_key)
+        else:
+            _mem_sets.pop(cs_locked_key, None)
+            _mem_sets.pop(cs_final_key, None)
+        
+        # Clear fixtures cache for this GW
+        async with _fixtures_cache_lock:
+            _fixtures_cache.pop(gw, None)
+        
+        logger.info(f"Rebuild triggered for GW {gw} by user {update.effective_user.id}")
+        await update.message.reply_text(
+            f"✅ Данные GW {gw} очищены. "
+            f"При следующем цикле мониторинга будет установлен новый baseline."
+        )
+    except Exception as ex:
+        logger.exception(f"Error rebuilding GW {gw}: {ex}")
+        await update.message.reply_text(f"❌ Ошибка при перестроении GW {gw}: {str(ex)}")
 
 # ---------- League Points ----------
 async def send_league_points(
@@ -1064,15 +1303,12 @@ async def send_league_points(
         else:
             lines.append(item)
     full_text = header + "\n".join(lines)
-    for chunk in split_message_chunks(full_text):
-        try:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
-        except Exception:
-            await update.message.reply_text(chunk)
+    await safe_reply_markdown(update, full_text)
 
 # ---------- Live Monitor Loop ----------
 async def live_monitor_loop():
     logger.info("Live monitor loop started")
+    cleanup_counter = 0
     while not stop_event.is_set():
         try:
             if not live_monitor_enabled:
@@ -1081,23 +1317,42 @@ async def live_monitor_loop():
 
             bs = await get_bootstrap()
             if not bs:
-                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                poll_interval = await next_poll_interval()
+                await asyncio.sleep(poll_interval)
                 continue
             season = discover_season_tag(bs)
             events = bs.get("events", [])
+            
+            # Item 1: Focus only on relevant GWs (current, previous if settling, next)
             current_ev = next((e for e in events if e.get("is_current")), None)
             if not current_ev or current_ev.get("finished"):
-                await asyncio.sleep(LIVE_POLL_INTERVAL)
-                continue
-            gw = current_ev.get("id")
+                # Check if previous GW is settling (not fully finished)
+                previous_ev = None
+                if current_ev:
+                    prev_id = current_ev.get("id", 0) - 1
+                    previous_ev = next((e for e in events if e.get("id") == prev_id), None)
+                
+                if previous_ev and not previous_ev.get("data_checked"):
+                    logger.debug(f"Previous GW {previous_ev.get('id')} still settling")
+                    gw = previous_ev.get("id")
+                else:
+                    poll_interval = await next_poll_interval(events=events)
+                    await asyncio.sleep(poll_interval)
+                    continue
+            else:
+                gw = current_ev.get("id")
+            
             if not isinstance(gw, int):
-                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                poll_interval = await next_poll_interval(events=events)
+                await asyncio.sleep(poll_interval)
                 continue
 
+            # Use cached fixtures accessor (Item 7)
+            fixtures = await get_fixtures_cached(gw)
             live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
-            fixtures = await fetch_json(fpl_url(fixtures_event_path_tpl.format(gw=gw)))
             if not live or not fixtures:
-                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                poll_interval = await next_poll_interval(events=events)
+                await asyncio.sleep(poll_interval)
                 continue
 
             league_players = await get_league_player_ids(gw)
@@ -1113,10 +1368,14 @@ async def live_monitor_loop():
                     await r_set(key_event(season, gw, fixture_id, stat, player_id), val)
                 await r_set_flag(baseline_key)
                 logger.info(f"Baseline set for GW {gw}.")
-                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                poll_interval = await next_poll_interval(fixtures, events)
+                await asyncio.sleep(poll_interval)
                 continue
 
             new_events_by_fixture = await diff_new_events(season, gw, counts)
+            if new_events_by_fixture:
+                logger.debug(f"New events detected in GW {gw}")
+            
             paired_lines = pair_goals_assists(new_events_by_fixture)
 
             player_team_map_local = build_player_team_map()
@@ -1162,9 +1421,25 @@ async def live_monitor_loop():
                         except Exception:
                             logger.exception("Failed sending live notification.")
                 else:
-                    logger.info("Live events (no chat bound): " + final_text)
+                    logger.debug("Live events (no chat bound): " + final_text)
 
-            await asyncio.sleep(LIVE_POLL_INTERVAL)
+            # Item 10: Periodic memory cleanup
+            cleanup_counter += 1
+            if cleanup_counter >= 10:  # Every 10 cycles
+                await mem_kv_cleanup()
+                # Cleanup old fixtures cache
+                async with _fixtures_cache_lock:
+                    now = time.time()
+                    expired = [gw_id for gw_id, (_, ts) in _fixtures_cache.items() if now - ts > FIXTURES_TTL * 2]
+                    for gw_id in expired:
+                        del _fixtures_cache[gw_id]
+                    if expired:
+                        logger.debug(f"Cleaned up {len(expired)} expired fixture cache entries")
+                cleanup_counter = 0
+
+            # Item 2: Use adaptive poll interval
+            poll_interval = await next_poll_interval(fixtures, events)
+            await asyncio.sleep(poll_interval)
         except Exception as ex:
             logger.exception(f"Error in live_monitor_loop: {ex}")
             await asyncio.sleep(LIVE_POLL_INTERVAL)
@@ -1187,6 +1462,7 @@ async def setup_bot_commands(bot):
         BotCommand("liveon", "Включить мониторинг"),
         BotCommand("liveoff", "Выключить мониторинг"),
         BotCommand("con", "Конфигурация"),
+        BotCommand("rebuild_gw", "Перестроить данные тура (admin)"),
     ]
     await bot.set_my_commands(commands)
     try:
@@ -1225,10 +1501,7 @@ async def con_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k, v in snapshot.items():
         lines.append(f"{k}: {v}")
     text = "\n".join(lines)
-    try:
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(text)
+    await safe_reply_markdown(update, text)
 
 # ---------- run_bot ----------
 async def run_bot():
@@ -1260,6 +1533,7 @@ async def run_bot():
     application.add_handler(CommandHandler("liveon", liveon_command))
     application.add_handler(CommandHandler("liveoff", liveoff_command))
     application.add_handler(CommandHandler("con", con_command))
+    application.add_handler(CommandHandler("rebuild_gw", rebuild_gw_command))
     application.add_error_handler(error_handler)
 
     await application.initialize()
