@@ -194,7 +194,7 @@ async def fetch_json(
                     logger.warning(f"JSON decode error {url}: {jex}")
                     return None
             body_preview = (resp.text or "")[:200].replace("\n", " ")
-            logger.warning(f"Attempt {attempt}: {status} {url} body='{body_preview}'")
+            logger.warning(f"HTTP {status} attempt {attempt}/{max_attempts} {url[:80]}... body='{body_preview}'")
             if status in (403, 429) or 500 <= status < 600:
                 if attempt < max_attempts:
                     sleep_time = min(backoff_base ** attempt + random.uniform(0, 0.5), 8.0)
@@ -202,11 +202,11 @@ async def fetch_json(
                     continue
             return None
         except httpx.TimeoutException:
-            logger.error(f"Timeout {url} attempt {attempt}")
+            logger.error(f"Timeout {url[:80]}... attempt {attempt}/{max_attempts}")
             if attempt < max_attempts:
                 await asyncio.sleep(min(backoff_base ** attempt, 8.0))
         except Exception as ex:
-            logger.exception(f"Error fetching {url}: {ex}")
+            logger.error(f"Error fetching {url[:80]}...: {ex}")
             if attempt < max_attempts:
                 await asyncio.sleep(min(backoff_base ** attempt, 8.0))
     return None
@@ -273,11 +273,48 @@ async def r_get(key: str) -> Optional[int]:
             return None
     return _mem_events.get(key)
 
+async def r_get_many(keys: List[str]) -> Dict[str, Optional[int]]:
+    """Batch GET operation to reduce round-trips."""
+    prune_expired_mem_kv()
+    result = {}
+    if redis_client:
+        try:
+            # Use pipeline for Redis if available
+            for key in keys:
+                raw = await asyncio.to_thread(redis_client.get, key)
+                if raw is not None:
+                    try:
+                        result[key] = int(raw)
+                    except Exception:
+                        result[key] = None
+                else:
+                    result[key] = None
+        except Exception as e:
+            logger.warning(f"Redis batch get failed: {e}")
+            for key in keys:
+                result[key] = _mem_events.get(key)
+    else:
+        for key in keys:
+            result[key] = _mem_events.get(key)
+    return result
+
 async def r_set(key: str, value: int):
     if redis_client:
         await asyncio.to_thread(redis_client.set, key, value, ex=REDIS_GW_TTL)
     else:
         _mem_events[key] = value
+
+async def r_set_many(items: Dict[str, int]):
+    """Batch SET operation to reduce round-trips."""
+    if redis_client:
+        try:
+            for key, value in items.items():
+                await asyncio.to_thread(redis_client.set, key, value, ex=REDIS_GW_TTL)
+        except Exception as e:
+            logger.warning(f"Redis batch set failed: {e}")
+            _mem_events.update(items)
+    else:
+        _mem_events.update(items)
 
 async def r_sadd(key: str, member: str):
     if redis_client:
@@ -812,9 +849,18 @@ def extract_current_counts(live_elements: List[Dict]) -> Dict[Tuple[int, str, in
 # ---------- Diff & New Events ----------
 async def diff_new_events(season: str, gw: int, counts: Dict[Tuple[int,str,int,int], int]) -> Dict[int, List[Dict]]:
     new_events_by_fixture: Dict[int, List[Dict]] = {}
+    
+    # Batch GET all keys
+    keys_to_fetch = [key_event(season, gw, fixture_id, identifier, player_id) 
+                     for (fixture_id, identifier, player_id, minutes) in counts.keys()]
+    stored_values = await r_get_many(keys_to_fetch)
+    
+    # Batch SET updates
+    updates = {}
+    
     for (fixture_id, identifier, player_id, minutes), current_val in counts.items():
         key = key_event(season, gw, fixture_id, identifier, player_id)
-        stored = await r_get(key)
+        stored = stored_values.get(key)
         if stored is None:
             stored = 0
         if current_val > stored:
@@ -823,9 +869,14 @@ async def diff_new_events(season: str, gw: int, counts: Dict[Tuple[int,str,int,i
                 new_events_by_fixture.setdefault(fixture_id, []).append(
                     {"type": identifier, "player": player_id, "minutes": minutes}
                 )
-            await r_set(key, current_val)
+            updates[key] = current_val
         elif current_val < stored:
-            await r_set(key, current_val)
+            updates[key] = current_val
+    
+    # Batch write all updates
+    if updates:
+        await r_set_many(updates)
+    
     return new_events_by_fixture
 
 # ---------- Clean Sheets ----------
@@ -1238,15 +1289,25 @@ async def send_league_points(
         return
     header = header_override or f"*Очки за тур {gw_num}:*\n\n"
     lines: List[str] = []
+    
+    # Check if this is the current GW to use optimization
+    current_ev = next((e for e in events if e.get("is_current") and e.get("id") == gw_num), None)
+    use_event_total = current_ev is not None
 
-    async def one(entry_id: int, entry_name: str, player_name: str) -> str:
-        data = await get_entry_picks_cached(entry_id, gw_num)
+    async def one(entry_id: int, entry_name: str, player_name: str, result: Dict) -> str:
         pts = None
-        if data:
-            pts = data.get("entry_history", {}).get("points")
+        # Optimization: For current GW, prefer standings event_total if available
+        if use_event_total and result.get("event_total") is not None:
+            pts = result.get("event_total")
+            logger.debug(f"Using event_total for entry {entry_id} GW {gw_num}: {pts}")
+        else:
+            # Fall back to picks API
+            data = await get_entry_picks_cached(entry_id, gw_num)
+            if data:
+                pts = data.get("entry_history", {}).get("points")
         return f"{player_name} — {entry_name}: {pts if pts is not None else 'нет данных'}"
 
-    tasks = [asyncio.create_task(one(r["entry"], r["entry_name"], r["player_name"])) for r in results]
+    tasks = [asyncio.create_task(one(r["entry"], r["entry_name"], r["player_name"], r)) for r in results]
     res = await asyncio.gather(*tasks, return_exceptions=True)
     for item in res:
         if isinstance(item, Exception):
