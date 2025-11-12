@@ -1,5 +1,15 @@
-# FPL Telegram Bot — live events, per-user timezone (/tz + inline), Squid Game mini-tournament, price predictions
-# — Centered tables, league name headers, DC and CS logic, idempotency, optimizations —
+# FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
+# Key updates (per latest requests):
+# - Always use real league name from API (e.g., "Zakynule Fantasy Vibe") in headers: "<League> — GW N" or "<League> — <Месяц>"
+# - /rank: phone-friendly (no Δ), stable alignment
+# - /players_pts: GW optional (default current). Stats include DC again (shown as "DC", no (+2) in legend)
+# - /gwpoints and /month: local numbering (#1, #2, ...) relative to their own ordering (not overall)
+# - Squid Game:
+#   - Report includes "Среднее очков" and "Очки тура" with points
+#   - "Прошли дальше" and "Выбыли" sections numbered locally and include points; if exactly one passes → only "Победитель цикла …"
+#   - Winners list: manager names without "#", interval "GW A - GW B"
+# - Price parser: multi-strategy (JSON endpoints → __NEXT_DATA__ deep-scan → robust HTML/regex), filter by ownership >= 1%
+# - Column widths computed on final strings (including "#NN ") to keep alignment when numbers become two-digit
 
 import os
 import json
@@ -45,7 +55,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required")
 
 TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID")
-LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")
+LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")  # Zakynule Fantasy Vibe
 
 PORT = int(os.environ.get("PORT", "10000"))
 TELEGRAM_CONCURRENCY = int(os.environ.get("TELEGRAM_CONCURRENCY", "4"))
@@ -72,7 +82,6 @@ INITIAL_TZ_OFFSET = int(TIMEZONE_ENV) if TIMEZONE_ENV and TIMEZONE_ENV.lstrip("+
 TZ_REDIS_KEY_PREFIX = "fpl:tz:user:"
 DEFAULT_TZ_NAME = "Астана"
 
-# ===== Timezone maps =====
 TZ_MAP = {
     "Астана": ("Asia/Almaty", 5),
     "Баку": ("Asia/Baku", 4),
@@ -85,11 +94,9 @@ TZ_MAP = {
     "Владивосток": ("Asia/Vladivostok", 10),
 }
 
-# ===== Logging =====
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("fpl_bot")
 
-# ===== Flask =====
 flask_app = Flask(__name__)
 
 # Health metrics
@@ -221,6 +228,11 @@ _sent_msg_hashes: Set[str] = set()
 
 _tz_offset_memory: Dict[int, Tuple[str,int]] = {}
 
+# Mappings entry -> manager meta
+ENTRY_TO_MANAGER_NAME: Dict[int, str] = {}
+ENTRY_TO_RANK: Dict[int, int] = {}
+ENTRY_TO_OVERALL: Dict[int, int] = {}
+
 # Squid game
 squid_active_state: Optional[Dict[str, Any]] = None
 squid_winner_history: List[Dict[str, Any]] = []
@@ -231,11 +243,6 @@ prices_cache_data: Optional[Dict[str, Any]] = None
 prices_cache_ts: Optional[float] = None
 PRICES_CACHE_TTL = 600
 PRICES_URL = "https://www.livefpl.net/prices"
-
-# Mapping entry_id -> manager name / rank / overall total
-ENTRY_TO_MANAGER_NAME: Dict[int, str] = {}
-ENTRY_TO_RANK: Dict[int, int] = {}
-ENTRY_TO_OVERALL: Dict[int, int] = {}
 
 # ===== Helpers =====
 async def gather_limited(coros: Iterable[Awaitable], limit: int) -> List[Any]:
@@ -248,12 +255,16 @@ async def gather_limited(coros: Iterable[Awaitable], limit: int) -> List[Any]:
 def manager_name(entry_id: int) -> str:
     return ENTRY_TO_MANAGER_NAME.get(entry_id, f"Entry {entry_id}")
 
-def manager_tag(entry_id: int) -> str:
+def manager_tag_overall(entry_id: int) -> str:
     r = ENTRY_TO_RANK.get(entry_id)
     nm = manager_name(entry_id)
     if r is None:
         return nm
     return f"#{r} {nm}"
+
+def manager_tag_local(index1: int, entry_id: int) -> str:
+    # index1 is 1-based local position
+    return f"#{index1} {manager_name(entry_id)}"
 
 # ===== Redis init & utils =====
 def init_redis():
@@ -619,22 +630,6 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
     except Exception:
         return None
 
-def extract_minutes_for_fixture(el: Dict, fid: int) -> int:
-    stats_overall = el.get("stats", {}) or {}
-    m = stats_overall.get("minutes")
-    return int(m) if isinstance(m, int) else 0
-
-def format_minute_str(minute: int, fid: int, fixture_max_minute: Dict[int, int]) -> str:
-    if minute <= 0:
-        return "0'"
-    if minute > 90:
-        return f"90+{minute - 90}'"
-    if minute > 45:
-        maxm = fixture_max_minute.get(fid, minute)
-        if maxm <= 60:
-            return f"45+{minute - 45}'"
-    return f"{minute}'"
-
 # ===== Squid Game Tournament =====
 SQUID_ACTIVE_KEY = "fpl:squid:active"
 SQUID_WINNERS_KEY = "fpl:squid:winners"
@@ -693,13 +688,13 @@ async def squid_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def squid_rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Правила Squid Game:\n"
-        "- Запускаем игру с указанного GW.\n"
-        "- После завершения GW считаем очки тура среди оставшихся участников.\n"
-        "- Проходят дальше те, у кого очки >= среднему по оставшимся.\n"
-        "- Игра продолжается до одного победителя или до GW38.\n"
-        "- Если победитель определился раньше — со следующего GW стартует новый цикл.\n"
-        "- В GW38 побеждает участник с наибольшими очками тура среди оставшихся."
+        "Squid Game — краткие правила:\n"
+        "• Игра начинается с указанного GW.\n"
+        "• После завершения GW считаем очки тура только у оставшихся участников.\n"
+        "• Дальше проходят те, у кого очки не ниже среднего по оставшимся.\n"
+        "• Игра продолжается до единственного победителя или до GW38.\n"
+        "• Если победитель найден раньше, со следующего GW стартует новый цикл.\n"
+        "• В GW38 побеждает тот, у кого больше очков тура среди оставшихся."
     )
     await update.message.reply_text(text)
 
@@ -717,7 +712,7 @@ async def squid_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Живых игроков: {len(alive)}"
     ]
     for entry_id in alive[:30]:
-        lines.append(f"- {manager_tag(entry_id)}")
+        lines.append(f"- {manager_tag_overall(entry_id)}")
     if len(alive) > 30:
         lines.append(f"... и ещё {len(alive)-30}")
     await update.message.reply_text("\n".join(lines))
@@ -729,7 +724,7 @@ async def squid_winners_command(update: Update, context: ContextTypes.DEFAULT_TY
     lines = ["Прошлые победители:"]
     for w in squid_winner_history:
         lines.append(
-            f"Цикл {w.get('cycle')} — {manager_tag(w.get('winner_entry'))} (GW {w.get('start_gw')} - GW {w.get('end_gw')})"
+            f"Цикл {w.get('cycle')} — {manager_name(w.get('winner_entry'))} (GW {w.get('start_gw')} - GW {w.get('end_gw')})"
         )
     await update.message.reply_text("\n".join(lines))
 
@@ -771,7 +766,6 @@ async def process_squid_after_gw_finish(finished_gw: int):
 
     gw38 = finished_gw == 38
     winner_entry = None
-    # Победитель, если GW38 или остался 1
     if gw38:
         alive_points_sorted = sorted(alive, key=lambda x: points_map.get(x,0), reverse=True)
         if alive_points_sorted:
@@ -783,22 +777,21 @@ async def process_squid_after_gw_finish(finished_gw: int):
             top_alive = sorted(alive, key=lambda x: points_map.get(x,0), reverse=True)
             winner_entry = top_alive[0]
 
-    # Формируем отчёт
     lines: List[str] = [f"Squid Game — GW {finished_gw} завершён.", f"Среднее очков: {avg:.2f}"]
-    # Всегда показываем очки тура по убыванию
+
+    # Всегда показываем очки тура (по всем «живым») — сортировка по убыванию
     lines.append("Очки тура:")
     for eid in sorted(alive, key=lambda x: points_map.get(x,0), reverse=True):
-        lines.append(f"- {manager_tag(eid)}: {points_map.get(eid,0)} pts")
+        lines.append(f"- {manager_tag_overall(eid)}: {points_map.get(eid,0)} pts")
 
     if winner_entry is not None:
-        lines.append(f"Победитель цикла: {manager_tag(winner_entry)}")
+        lines.append(f"Победитель цикла: {manager_name(winner_entry)}")
         squid_winner_history.append({
             "cycle": squid_active_state.get("cycle",1),
             "winner_entry": winner_entry,
             "start_gw": squid_active_state["start_gw"],
             "end_gw": finished_gw
         })
-        # новый цикл, если не GW38
         if not gw38 and finished_gw < 38:
             next_gw = finished_gw + 1
             results = await get_league_results_cached(LEAGUE_ID)
@@ -820,21 +813,22 @@ async def process_squid_after_gw_finish(finished_gw: int):
             lines.append("Турнир завершён.")
             squid_active_state = None
     else:
-        # Если не определился победитель, показать прошедших / выбывших по убыванию
+        # Прошли дальше — локальная нумерация и очки
         lines.append(f"Прошли дальше ({len(passed)}):")
-        for eid in sorted(passed, key=lambda x: points_map.get(x,0), reverse=True):
-            lines.append(f"- {manager_tag(eid)}: {points_map.get(eid,0)} pts")
-        if len(passed) != 1:  # спец-условие: если ровно 1 прошёл — не писать «выбыли»
+        for i, eid in enumerate(sorted(passed, key=lambda x: points_map.get(x,0), reverse=True), start=1):
+            lines.append(f"- #{i} {manager_name(eid)}: {points_map.get(eid,0)} pts")
+        # Если не ровно один прошёл — выводим «Выбыли»
+        if len(passed) != 1:
             lines.append(f"Выбыли ({len(eliminated)}):")
-            for eid in sorted(eliminated, key=lambda x: points_map.get(x,0), reverse=True):
-                lines.append(f"- {manager_tag(eid)}: {points_map.get(eid,0)} pts")
+            for i, eid in enumerate(sorted(eliminated, key=lambda x: points_map.get(x,0), reverse=True), start=1):
+                lines.append(f"- #{i} {manager_name(eid)}: {points_map.get(eid,0)} pts")
+        # advance state
         squid_active_state["players_alive"] = passed
         squid_active_state["players_eliminated"].extend(eliminated)
         squid_active_state["current_gw"] = finished_gw + 1
 
     persist_squid()
 
-    # Отправка
     chat_id = int(TARGET_CHAT_ID) if TARGET_CHAT_ID and TARGET_CHAT_ID.isdigit() else None
     text = "\n".join(lines)
     if chat_id and application:
@@ -842,7 +836,7 @@ async def process_squid_after_gw_finish(finished_gw: int):
     else:
         logger.info("SquidGame report:\n"+text)
 
-# ===== Prices parsing/caching (Next.js + fallback) =====
+# ===== Prices parsing/caching (JSON endpoints + NEXT_DATA + fallback) =====
 def prices_cache_valid() -> bool:
     if prices_cache_ts is None:
         return False
@@ -850,11 +844,32 @@ def prices_cache_valid() -> bool:
 
 async def fetch_prices_page() -> Optional[str]:
     try:
-        resp = await http_client.get(PRICES_URL, timeout=15.0)
+        resp = await http_client.get(PRICES_URL, timeout=20.0)
         if resp.status_code == 200:
             return resp.text
     except Exception as ex:
         logger.warning(f"Prices fetch error: {ex}")
+    return None
+
+async def fetch_prices_json_candidates() -> Optional[Any]:
+    # Try a few possible JSON endpoints (best effort)
+    candidates = [
+        "https://www.livefpl.net/api/prices",
+        "https://www.livefpl.net/api/prices?summary=1",
+        "https://www.livefpl.net/api/prices.json",
+        "https://prices.livefpl.net/latest_prices.json",
+        "https://prices.livefpl.net/summary.json"
+    ]
+    for url in candidates:
+        try:
+            resp = await http_client.get(url, timeout=15.0)
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except Exception:
+                    continue
+        except Exception:
+            continue
     return None
 
 def build_ownership_map() -> Dict[str,float]:
@@ -867,7 +882,8 @@ def build_ownership_map() -> Dict[str,float]:
             own = float(sel) if sel is not None else 0.0
         except Exception:
             own = 0.0
-        mp[name.lower()] = own
+        if name:
+            mp[name.lower()] = own
     return mp
 
 def _deep_iter(obj):
@@ -911,65 +927,66 @@ def _map_category(key: str) -> Optional[str]:
         return "Close by end of day"
     return None
 
-def parse_prices(html: str, ownership_map: Dict[str,float]) -> Dict[str, Dict[str,List[Tuple[str,str]]]]:
+def dedup_keep_order(items: List[Tuple[str,str]]) -> List[Tuple[str,str]]:
+    seen=set(); out=[]
+    for nm, pr in items:
+        key=nm.lower()
+        if key in seen: continue
+        seen.add(key)
+        out.append((nm, pr))
+    return out
+
+def parse_prices_from_json(data: Any, ownership_map: Dict[str,float]) -> Dict[str, Dict[str,List[Tuple[str,str]]]]:
     blocks = {"Rises": {}, "Falls": {}}
-    # 1) Next.js JSON
+    rises: List[Tuple[str,str]] = []
+    falls: List[Tuple[str,str]] = []
+    for k, v in _deep_iter(data):
+        if isinstance(v, list) and v and all(isinstance(x, (dict,str)) for x in v):
+            parent = str(k).lower()
+            buf: List[Tuple[str,str]] = []
+            for it in v:
+                pair = _extract_name_and_progress(it)
+                if pair:
+                    nm, pr = pair
+                    if ownership_map.get(nm.lower(), 0.0) >= 1.0:
+                        buf.append((nm, pr))
+            if buf:
+                if any(w in parent for w in ["rise","riser","rises","up"]):
+                    rises.extend(buf)
+                elif any(w in parent for w in ["fall","faller","falls","down"]):
+                    falls.extend(buf)
+    if rises:
+        blocks["Rises"]["Projected to reach today"] = dedup_keep_order(rises)
+    if falls:
+        blocks["Falls"]["Projected to reach today"] = dedup_keep_order(falls)
+    return blocks
+
+def parse_prices_from_html(html: str, ownership_map: Dict[str,float]) -> Dict[str, Dict[str,List[Tuple[str,str]]]]:
+    blocks = {"Rises": {}, "Falls": {}}
     if BeautifulSoup:
         try:
             soup = BeautifulSoup(html, "html.parser")
-            script = soup.find("script", id="__NEXT_DATA__", type="application/json")
-            if script and script.string:
-                data = json.loads(script.string)
-                candidate = None
-                for k, v in _deep_iter(data):
-                    if isinstance(v, dict) and "rises" in v and "falls" in v:
-                        candidate = v
-                        break
-                if isinstance(candidate, dict):
-                    for side_key in ["rises", "falls"]:
-                        side_val = candidate.get(side_key)
-                        side_out: Dict[str,List[Tuple[str,str]]] = {}
-                        if isinstance(side_val, dict):
-                            for sub_key, lst in side_val.items():
-                                cat = _map_category(str(sub_key)) or str(sub_key)
-                                items: List[Tuple[str,str]] = []
-                                if isinstance(lst, list):
-                                    for it in lst:
-                                        pair = _extract_name_and_progress(it)
-                                        if pair:
-                                            nm, pr = pair
-                                            if ownership_map.get(nm.lower(), 0.0) >= 1.0:
-                                                items.append((nm, pr))
-                                if items:
-                                    side_out[cat] = items
-                        elif isinstance(side_val, list):
-                            items: List[Tuple[str,str]] = []
-                            for it in side_val:
-                                pair = _extract_name_and_progress(it)
-                                if pair:
-                                    nm, pr = pair
-                                    if ownership_map.get(nm.lower(), 0.0) >= 1.0:
-                                        items.append((nm, pr))
-                            if items:
-                                side_out["Projected to reach today"] = items
-                        if side_out:
-                            title = "Rises" if side_key == "rises" else "Falls"
-                            blocks[title] = side_out
-                if any(blocks[s] for s in ("Rises","Falls")):
-                    return blocks
+            # Next.js embedded JSON scripts (scan broadly)
+            for script in soup.find_all("script"):
+                try:
+                    if script.get("type") == "application/json":
+                        data = json.loads(script.string or "")
+                        blk = parse_prices_from_json(data, ownership_map)
+                        if any(blk[s] for s in ("Rises","Falls")):
+                            return blk
+                except Exception:
+                    continue
         except Exception as ex:
-            logger.warning(f"NEXT_DATA parse error: {ex}")
-
-    # 2) Fallback: текст/regex + попытка прочитать списки после заголовков
-    text = ""
-    if BeautifulSoup:
-        try:
+            logger.warning(f"NEXT_DATA scan error: {ex}")
+    # Fallback regex on flattened text
+    try:
+        if BeautifulSoup:
             soup = BeautifulSoup(html, "html.parser")
             section = soup.find(string=re.compile("Summary of Predictions", re.I))
             text = soup.get_text(" ", strip=True) if not section else section.parent.get_text(" ", strip=True)
-        except Exception:
+        else:
             text = re.sub(r"\s+", " ", html)
-    else:
+    except Exception:
         text = re.sub(r"\s+", " ", html)
 
     categories = ["Already reached target", "Projected to reach today", "Close by end of day"]
@@ -977,7 +994,7 @@ def parse_prices(html: str, ownership_map: Dict[str,float]) -> Dict[str, Dict[st
     falls_section = re.search(r"Falls(.*?)(Rises|$)", text, re.I|re.S)
 
     def extract(section_text: str) -> Dict[str,List[Tuple[str,str]]]:
-        result: Dict[str,List[Tuple[str,str]]] = {}
+        result: Dict[str,List[Tuple[str,str]]]] = {}
         for cat in categories:
             part = re.search(cat + r"(.*?)(?:Already reached target|Projected to reach today|Close by end of day|Rises|Falls|$)", section_text, re.I|re.S)
             if part:
@@ -1004,11 +1021,16 @@ async def get_prices_data() -> Dict[str, Any]:
     global prices_cache_data, prices_cache_ts
     if prices_cache_valid() and prices_cache_data:
         return prices_cache_data
-    html = await fetch_prices_page()
-    if not html:
-        return {"ok": False, "error": "fetch_failed"}
     ownership_map = build_ownership_map()
-    parsed = parse_prices(html, ownership_map)
+    data_json = await fetch_prices_json_candidates()
+    parsed = {"Rises": {}, "Falls": {}}
+    if data_json is not None:
+        parsed = parse_prices_from_json(data_json, ownership_map)
+    if not any(parsed[s] for s in ("Rises","Falls")):
+        html = await fetch_prices_page()
+        if not html:
+            return {"ok": False, "error": "fetch_failed"}
+        parsed = parse_prices_from_html(html, ownership_map)
     data = {"ok": True, "parsed": parsed, "ts": time.time()}
     prices_cache_data = data
     prices_cache_ts = time.time()
@@ -1079,19 +1101,14 @@ async def tz_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     data = query.data
     if data == "tz_more":
-        await query.edit_message_reply_markup(reply_markup=build_tz_more_keyboard())
-        await query.answer()
-        return
+        await query.edit_message_reply_markup(reply_markup=build_tz_more_keyboard()); await query.answer(); return
     if data == "tz_back":
-        await query.edit_message_reply_markup(reply_markup=build_tz_main_keyboard())
-        await query.answer()
-        return
+        await query.edit_message_reply_markup(reply_markup=build_tz_main_keyboard()); await query.answer(); return
     if data.startswith("tz|"):
         rus = data.split("|",1)[1]
         info = resolve_tz_arg(rus)
         if not info:
-            await query.answer("Не удалось распознать")
-            return
+            await query.answer("Не удалось распознать"); return
         rus_name, offset, zone = info
         set_user_tz(query.from_user.id, rus_name, offset, zone)
         await query.answer("Таймзона установлена")
@@ -1140,16 +1157,6 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     minutes = (left_seconds % 3600) // 60
     gw_num = e.get("id")
 
-    tz_set_explicit = False
-    if redis_client:
-        try:
-            if redis_client.get(TZ_REDIS_KEY_PREFIX + str(user_id)):
-                tz_set_explicit = True
-        except Exception:
-            pass
-    if user_id in _tz_offset_memory:
-        tz_set_explicit = True
-
     text = (
         f"Ближайший дедлайн: Gameweek {gw_num}\n"
         f"Когда: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({rus_name}, UTC{offset:+d})\n"
@@ -1162,28 +1169,19 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not results:
         await update.message.reply_text("Standings недоступны")
         return
-    league_name = LEAGUE_NAME or "League name"
+    league_name = LEAGUE_NAME or "League"
+    # Phone-friendly: no delta column; just Rank | Player | Pts
     rows=[]
     for r in sorted(results, key=lambda x: x.get("rank", 10**9)):
-        rank = r.get("rank")
-        last = r.get("last_rank")
-        if isinstance(rank,int) and isinstance(last,int) and rank>0 and last>0:
-            d = last - rank
-            if d > 0: delta = f"↑{d}"
-            elif d < 0: delta = f"↓{abs(d)}"
-            else: delta = ""
-        else:
-            delta = ""
-        rows.append((rank, r.get("player_name"), r.get("total"), delta))
+        rows.append((r.get("rank"), r.get("player_name"), r.get("total")))
     rank_w = max(len("Rank"), max((len(str(r[0])) for r in rows), default=4))
     player_w = max(len("Player"), max((len(r[1]) for r in rows), default=6))
     total_w = max(len("Pts"), max((len(str(r[2])) for r in rows), default=3))
-    delta_w = max(len("Δ"), max((len(r[3]) for r in rows), default=0))
-    header = f"{'Rank'.center(rank_w)}  {'Player'.center(player_w)}  {'Pts'.center(total_w)}  {'Δ'.center(max(1,delta_w))}"
+    header = f"{'Rank'.center(rank_w)}  {'Player'.center(player_w)}  {'Pts'.center(total_w)}"
     sep = "-"*len(header)
     lines=[f"{league_name}".center(len(header)), "```", header, sep]
     for r in rows:
-        lines.append(f"{str(r[0]).center(rank_w)}  {r[1].center(player_w)}  {str(r[2]).center(total_w)}  {r[3].center(max(1,delta_w))}")
+        lines.append(f"{str(r[0]).center(rank_w)}  {r[1].ljust(player_w)}  {str(r[2]).center(total_w)}")
     lines.append("```")
     text = "\n".join(lines)
     for chunk in split_message_chunks(text):
@@ -1195,13 +1193,27 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(c2)
             break
 
-# players_pts (бывш. gwinfo): очки игроков из live
+# players_pts: optional GW (default current), DC shown in stats
 async def players_pts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args or not args[0].isdigit():
-        await update.message.reply_text("Использование: /players_pts <номер_GW>")
+    bs = await get_bootstrap_cached()
+    if not bs:
+        await update.message.reply_text("Нет bootstrap")
         return
-    gw = int(args[0])
+    args = context.args
+    gw: Optional[int] = None
+    if args and args[0].isdigit():
+        gw = int(args[0])
+    else:
+        current_ev = next((e for e in bs.get("events", []) if e.get("is_current")), None)
+        if current_ev and isinstance(current_ev.get("id"), int):
+            gw = current_ev.get("id")
+        else:
+            next_ev = next((e for e in bs.get("events", []) if e.get("is_next")), None)
+            gw = (next_ev or {}).get("id")
+    if not isinstance(gw, int):
+        await update.message.reply_text("Не удалось определить текущий GW")
+        return
+
     await get_league_results_cached(LEAGUE_ID)
     live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
     if not live:
@@ -1253,13 +1265,13 @@ async def players_pts_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     pts_w = max(len("Pts"), max(len(str(r["pts"])) for r in rows))
     header = f"{'Player'.center(name_w)}  {'Stats'.center(stats_w)}  {'Pts'.center(pts_w)}"
     sep = "-"*len(header)
-    league_name = LEAGUE_NAME or "League name"
+    league_name = LEAGUE_NAME or "League"
     desc = ("G=Goals, A=Assists, CS=Clean sheet, DC=Defensive contribution, "
             "YC=Yellow cards, RC=Red card, GKS=GK save points, OG=Own goals, PM=Penalties missed, "
             "PS=Penalties saved, B=Bonus")
     lines=[f"{league_name} — GW {gw}".center(len(header)), desc.center(len(header)), "```", header, sep]
     for r in rows:
-        lines.append(f"{r['name'].center(name_w)}  {r['stats'].center(stats_w)}  {str(r['pts']).center(pts_w)}")
+        lines.append(f"{r['name'].ljust(name_w)}  {r['stats'].center(stats_w)}  {str(r['pts']).center(pts_w)}")
     lines.append("```")
     full_text="\n".join(lines)
     for chunk in split_message_chunks(full_text):
@@ -1280,8 +1292,7 @@ async def gwpoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = await get_league_results_cached(LEAGUE_ID)
     if not results:
         await update.message.reply_text("Standings недоступны"); return
-    league_name = LEAGUE_NAME or "League name"
-    # собрать по каждому участнику: entry_id, name, rank, overall, gw_pts
+    league_name = LEAGUE_NAME or "League"
     async def one(r):
         entry_id = r.get("entry")
         data=await get_entry_picks_cached(entry_id, gw)
@@ -1289,26 +1300,25 @@ async def gwpoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gw_pts = pts if isinstance(pts,int) else -1
         overall = ENTRY_TO_OVERALL.get(entry_id, 0)
         name = r.get("player_name")
-        rank = ENTRY_TO_RANK.get(entry_id)
-        return (entry_id, name, rank, overall, gw_pts)
+        return (entry_id, name, overall, gw_pts)
     coros = [one(r) for r in results if isinstance(r.get("entry"), int)]
     got = await gather_limited(coros, PICKS_CONCURRENCY)
     entries=[]
     for item in got:
         if isinstance(item, tuple):
             entries.append(item)
-    # сортировка: GW pts desc, при равенстве overall desc, дальше по rank asc
-    entries.sort(key=lambda x: (-x[4], -x[3], (x[2] if isinstance(x[2],int) else 10**9), x[1].lower()))
-    player_col = [manager_tag(e[0]) for e in entries]
-    player_w = max(len("Player"), max((len(s) for s in player_col), default=6))
-    pts_w = max(len("Pts"), max((len(str(e[4])) for e in entries), default=3))
+    # sort by GW pts desc; tie-break overall desc; finally name
+    entries.sort(key=lambda x: (-x[3], -x[2], x[1].lower()))
+    # Local numbering (#1 ...)
+    display_names = [manager_tag_local(i+1, e[0]) for i, e in enumerate(entries)]
+    player_w = max(len("Player"), max((len(s) for s in display_names), default=6))
+    pts_w = max(len("Pts"), max((len(str(e[3])) for e in entries), default=3))
     header = f"{'Player'.center(player_w)}  {'Pts'.center(pts_w)}"
     sep = "-"*len(header)
     lines=[f"{league_name} — GW {gw}".center(len(header)), "```", header, sep]
-    for i,e in enumerate(entries):
-        name_disp = player_col[i]
-        val = e[4] if e[4] >= 0 else "n/a"
-        lines.append(f"{name_disp.ljust(player_w)}  {str(val).center(pts_w)}")
+    for i, e in enumerate(entries):
+        val = e[3] if e[3] >= 0 else "n/a"
+        lines.append(f"{display_names[i].ljust(player_w)}  {str(val).center(pts_w)}")
     lines.append("```")
     text = "\n".join(lines)
     for chunk in split_message_chunks(text):
@@ -1357,7 +1367,7 @@ async def month_points_for(entries: List[Dict], events: List[Dict], target_month
         return [], 0, 0
     finished_ids = [ev.get("id") for ev in events if ev.get("finished") and ev.get("id") in month_event_ids]
     played = len(finished_ids)
-    total = len(month_event_ids)
+    remaining = len(month_event_ids) - played
     async def fetch_entry(eid: int, mgr: str):
         total_pts = 0
         for gw_id in finished_ids:
@@ -1377,8 +1387,9 @@ async def month_points_for(entries: List[Dict], events: List[Dict], target_month
     for f in fetched:
         if isinstance(f, tuple):
             rows.append(f)
+    # sort by month points desc; tie-break overall rank asc to stabilize
     rows.sort(key=lambda x: (-x[2], ENTRY_TO_RANK.get(x[0], 10**9), x[1].lower()))
-    return rows, played, total-played
+    return rows, played, remaining
 
 async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bs = await get_bootstrap_cached()
@@ -1403,11 +1414,10 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cal_month, cal_year = season_month_index_to_calendar(selected_index, season)
     rows, played, remaining = await month_points_for(results, events, cal_month, cal_year)
     month_name = RUS_MONTH.get(cal_month, f"Месяц {cal_month}")
-    league_name = LEAGUE_NAME or "League name"
+    league_name = LEAGUE_NAME or "League"
     top = rows[:10]
-    # формат имени: #rank Manager
-    name_cells = [manager_tag(eid) for (eid, mgr, pts) in top]
-    player_w = max(len("Player"), max((len(s) for s in name_cells), default=6))
+    display_names = [manager_tag_local(i+1, eid) for i, (eid, _mgr, _pts) in enumerate(top)]
+    player_w = max(len("Player"), max((len(s) for s in display_names), default=6))
     pts_w = max(len("MonthPts"), max((len(str(pts)) for (_eid,_mgr,pts) in top), default=8))
     header = f"{'Player'.center(player_w)}  {'MonthPts'.center(pts_w)}"
     sep = "-"*len(header)
@@ -1415,7 +1425,7 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info_line = f"Сыграно туров: {played}, осталось: {remaining}"
     lines=[title.center(len(header)), info_line.center(len(header)), "```", header, sep]
     for i,(eid,mgr,pts) in enumerate(top):
-        lines.append(f"{name_cells[i].ljust(player_w)}  {str(pts).center(pts_w)}")
+        lines.append(f"{display_names[i].ljust(player_w)}  {str(pts).center(pts_w)}")
     lines.append("```")
     text="\n".join(lines)
     for chunk in split_message_chunks(text):
@@ -1612,10 +1622,10 @@ async def live_monitor_loop():
                 for um in update_msgs:
                     await send_once(um, season, gw)
 
-                # Positives
+                # Positives (goals, assists, pens, cards, CS subbed, DC add)
                 pos_events = pos_pool.get(fid, {})
 
-                # Goals with optional assist
+                # Goals
                 goals = list(pos_events.get("goals_scored", []))
                 assists = list(pos_events.get("assists", []))
                 while goals:
@@ -1643,7 +1653,7 @@ async def live_monitor_loop():
                         msg = f"{header}\n{line1}"
                     await send_once(msg, season, gw)
 
-                # Own goals with optional assist
+                # Own goals
                 own_goals = list(pos_events.get("own_goals", []))
                 while own_goals:
                     ogid = own_goals.pop(0)
@@ -1670,7 +1680,7 @@ async def live_monitor_loop():
                         msg = f"{header}\n{line1}"
                     await send_once(msg, season, gw)
 
-                # Pens missed + saved
+                # Pens missed/saved
                 pens_missed = list(pos_events.get("penalties_missed", []))
                 pens_saved = list(pos_events.get("penalties_saved", []))
                 while pens_missed and pens_saved:
@@ -1685,19 +1695,15 @@ async def live_monitor_loop():
                     line1 = f"{mstr} Penalty missed - {PLAYER_NAME_MAP.get(pm,f'P{pm}')} {format_points(pts_m)}, total ({total_m})."
                     line2 = f"{mstr} Penalty saved - {PLAYER_NAME_MAP.get(ps,f'P{ps}')} {format_points(pts_s)}, total ({total_s})."
                     await send_once(f"{header}\n{line1}\n{line2}", season, gw)
-
                 for pm in pens_missed:
                     pos_m, minutes_m, total_m = get_state(pm)
                     pts_m = event_points_for(pos_m,"Penalty missed")
-                    header = header_line()
-                    mstr = format_minute_str(minutes_m, fid, fixture_max_minute)
+                    header = header_line(); mstr = format_minute_str(minutes_m, fid, fixture_max_minute)
                     await send_once(f"{header}\n{mstr} Penalty missed - {PLAYER_NAME_MAP.get(pm,f'P{pm}')} {format_points(pts_m)}, total ({total_m}).", season, gw)
-
                 for ps in pens_saved:
                     pos_s, minutes_s, total_s = get_state(ps)
                     pts_s = event_points_for(pos_s,"Penalty saved")
-                    header = header_line()
-                    mstr = format_minute_str(minutes_s, fid, fixture_max_minute)
+                    header = header_line(); mstr = format_minute_str(minutes_s, fid, fixture_max_minute)
                     await send_once(f"{header}\n{mstr} Penalty saved - {PLAYER_NAME_MAP.get(ps,f'P{ps}')} {format_points(pts_s)}, total ({total_s}).", season, gw)
 
                 # Cards
@@ -1835,7 +1841,7 @@ async def run_bot():
         import h2  # noqa
     except Exception:
         use_http2=False
-    http_client = httpx.AsyncClient(http2=use_http2, limits=limits, timeout=15.0)
+    http_client = httpx.AsyncClient(http2=use_http2, limits=limits, timeout=20.0)
 
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
     application.add_handler(CommandHandler("tz", settz_command))
