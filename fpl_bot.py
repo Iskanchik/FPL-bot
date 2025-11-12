@@ -44,6 +44,8 @@ import logging
 import time
 import signal
 import random
+import hashlib
+import gzip
 from typing import Any, Dict, Optional, List, Tuple, Set
 from datetime import datetime, timezone, timedelta
 
@@ -82,6 +84,10 @@ ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "1") == "1"
 
 ENABLE_LIVE_MONITOR = os.environ.get("ENABLE_LIVE_MONITOR", "0") == "1"
 LIVE_POLL_INTERVAL = int(os.environ.get("LIVE_POLL_INTERVAL", "30"))
+
+# Snapshot system flags
+ENABLE_SNAPSHOT_COMPRESSION = os.environ.get("ENABLE_SNAPSHOT_COMPRESSION", "0") == "1"
+SNAPSHOT_REBUILD_RATE_LIMIT = int(os.environ.get("SNAPSHOT_REBUILD_RATE_LIMIT", "2"))  # rebuilds per minute
 
 stop_event = asyncio.Event()
 
@@ -358,6 +364,105 @@ def discover_season_tag(bootstrap: Dict[str, Any]) -> str:
     SEASON_TAG = season
     return SEASON_TAG
 
+# ---------- Snapshot System ----------
+# Rate limiting for rebuilds
+_rebuild_timestamps: List[float] = []
+_rebuild_lock = asyncio.Lock()
+
+def compute_roster_hash(entry_ids: List[int]) -> str:
+    """Compute SHA256 hash of sorted league entry IDs."""
+    sorted_ids = sorted(entry_ids)
+    roster_str = ",".join(map(str, sorted_ids))
+    return hashlib.sha256(roster_str.encode()).hexdigest()[:16]
+
+async def r_get_json(key: str) -> Optional[Dict]:
+    """Get JSON data from Redis."""
+    if redis_client:
+        raw = await asyncio.to_thread(redis_client.get, key)
+        if raw is None:
+            return None
+        try:
+            # Handle both compressed and uncompressed
+            if isinstance(raw, bytes) and raw[:2] == b'\x1f\x8b':  # gzip magic number
+                raw = gzip.decompress(raw)
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8')
+            return json.loads(raw)
+        except Exception as e:
+            logger.warning(f"Failed to decode JSON from Redis key {key}: {e}")
+            return None
+    # In-memory fallback
+    val = _mem_kv.get(key)
+    if val and isinstance(val, dict):
+        return val.get('value')
+    return None
+
+async def r_set_json(key: str, data: Dict, ttl: Optional[int] = None):
+    """Set JSON data to Redis with optional compression."""
+    if ttl is None:
+        ttl = REDIS_GW_TTL
+    
+    try:
+        json_str = json.dumps(data)
+        
+        # Optional compression
+        if ENABLE_SNAPSHOT_COMPRESSION:
+            compressed = gzip.compress(json_str.encode('utf-8'))
+            if redis_client:
+                await asyncio.to_thread(redis_client.set, key, compressed, ex=ttl)
+            else:
+                _mem_kv[key] = {'value': data, 'ts': time.time()}
+            logger.debug(f"Stored compressed snapshot {key} ({len(compressed)} bytes)")
+        else:
+            if redis_client:
+                await asyncio.to_thread(redis_client.set, key, json_str, ex=ttl)
+            else:
+                _mem_kv[key] = {'value': data, 'ts': time.time()}
+    except Exception as e:
+        logger.error(f"Failed to set JSON to Redis key {key}: {e}")
+
+async def r_setnx(key: str, value: str, ex: int) -> bool:
+    """Set if not exists (Redis lock primitive). Returns True if set, False if already exists."""
+    if redis_client:
+        result = await asyncio.to_thread(redis_client.set, key, value, ex=ex, nx=True)
+        return result is not None
+    else:
+        # In-memory fallback
+        if key not in _mem_kv:
+            _mem_kv[key] = {'value': value, 'ts': time.time()}
+            return True
+        return False
+
+async def r_delete(key: str):
+    """Delete a key from Redis."""
+    if redis_client:
+        await asyncio.to_thread(redis_client.delete, key)
+    else:
+        _mem_kv.pop(key, None)
+
+def key_gw_snapshot(season: str, league_id: str, gw: int) -> str:
+    """Key for GW snapshot in Redis."""
+    return f"fpl:{season}:league:{league_id}:gw:{gw}:snapshot"
+
+def key_snapshot_lock(season: str, league_id: str, gw: int) -> str:
+    """Key for snapshot rebuild lock."""
+    return f"fpl:{season}:league:{league_id}:gw:{gw}:rebuild_lock"
+
+async def can_rebuild_now() -> bool:
+    """Check if we can rebuild a snapshot now based on rate limiting."""
+    async with _rebuild_lock:
+        now = time.time()
+        # Remove timestamps older than 1 minute
+        global _rebuild_timestamps
+        _rebuild_timestamps = [ts for ts in _rebuild_timestamps if now - ts < 60]
+        
+        if len(_rebuild_timestamps) >= SNAPSHOT_REBUILD_RATE_LIMIT:
+            logger.warning(f"Rebuild rate limit reached: {len(_rebuild_timestamps)} rebuilds in last minute")
+            return False
+        
+        _rebuild_timestamps.append(now)
+        return True
+
 def next_poll_interval(now_utc: datetime, next_kickoff_utc: Optional[datetime]) -> int:
     """
     Adaptive poll interval based on time until next kickoff:
@@ -406,6 +511,116 @@ def find_next_kickoff(events: List[Dict], fixtures: Optional[List[Dict]] = None)
                     return ko
     
     return None
+
+async def build_gw_snapshot(season: str, league_id: str, gw: int, 
+                            events: List[Dict], current_roster: List[int]) -> Dict[str, Any]:
+    """
+    Build a GW snapshot storing only numerical data + IDs.
+    Names are resolved at render time from standings cache.
+    
+    Snapshot structure:
+    {
+        "version": 1,
+        "gw": gw,
+        "roster_hash": hash,
+        "built_at": timestamp,
+        "entries": [
+            {"id": entry_id, "gw_points": pts, "transfers": tc, "transfer_cost": cost, ...},
+            ...
+        ]
+    }
+    """
+    roster_hash = compute_roster_hash(current_roster)
+    entries_data = []
+    
+    # Fetch all entry data for this GW
+    tasks = []
+    for entry_id in current_roster:
+        tasks.append(get_entry_picks_cached(entry_id, gw))
+    
+    picks_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for entry_id, picks_data in zip(current_roster, picks_results):
+        if isinstance(picks_data, Exception) or not picks_data:
+            continue
+        
+        entry_history = picks_data.get("entry_history", {})
+        entries_data.append({
+            "id": entry_id,
+            "gw_points": entry_history.get("points"),
+            "total_points": entry_history.get("total_points"),
+            "transfers": entry_history.get("event_transfers"),
+            "transfer_cost": entry_history.get("event_transfers_cost"),
+            "bank": entry_history.get("bank"),
+            "value": entry_history.get("value"),
+            "rank": entry_history.get("rank"),
+            "overall_rank": entry_history.get("overall_rank"),
+        })
+    
+    snapshot = {
+        "version": 1,
+        "gw": gw,
+        "roster_hash": roster_hash,
+        "built_at": time.time(),
+        "entries": entries_data
+    }
+    
+    return snapshot
+
+async def get_or_build_gw_snapshot(season: str, league_id: str, gw: int, 
+                                   events: List[Dict], current_roster: List[int],
+                                   force_rebuild: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Get GW snapshot with lazy rebuild on roster change.
+    Uses Redis lock to prevent concurrent rebuilds.
+    """
+    snapshot_key = key_gw_snapshot(season, league_id, gw)
+    lock_key = key_snapshot_lock(season, league_id, gw)
+    
+    # Check if GW is frozen (past freeze time: last kickoff + 24h)
+    gw_event = next((e for e in events if e.get("id") == gw), None)
+    if not gw_event:
+        return None
+    
+    is_frozen = gw_event.get("finished", False)
+    
+    # Load existing snapshot if not forcing rebuild
+    if not force_rebuild:
+        existing = await r_get_json(snapshot_key)
+        if existing:
+            current_hash = compute_roster_hash(current_roster)
+            existing_hash = existing.get("roster_hash", "")
+            
+            # If roster hasn't changed or GW is not frozen, return existing
+            if existing_hash == current_hash or not is_frozen:
+                logger.debug(f"Using existing snapshot for GW {gw}")
+                return existing
+            
+            # Roster changed and GW is frozen - need rebuild
+            logger.info(f"Roster hash mismatch for GW {gw}: existing={existing_hash}, current={current_hash}")
+    
+    # Check rate limiting
+    if not await can_rebuild_now():
+        logger.warning(f"Rate limit hit, serving existing snapshot for GW {gw}")
+        existing = await r_get_json(snapshot_key)
+        return existing if existing else None
+    
+    # Try to acquire lock for rebuild
+    lock_acquired = await r_setnx(lock_key, "1", ex=300)
+    if not lock_acquired:
+        logger.info(f"Another process is rebuilding GW {gw} snapshot, waiting...")
+        # Wait a bit and try to fetch
+        await asyncio.sleep(2)
+        return await r_get_json(snapshot_key)
+    
+    try:
+        logger.info(f"Building snapshot for GW {gw} with {len(current_roster)} entries")
+        snapshot = await build_gw_snapshot(season, league_id, gw, events, current_roster)
+        await r_set_json(snapshot_key, snapshot, ttl=REDIS_GW_TTL)
+        logger.info(f"Snapshot built for GW {gw} with roster_hash={snapshot['roster_hash']}")
+        return snapshot
+    finally:
+        await r_delete(lock_key)
 
 # ---------- Bootstrap ----------
 def bootstrap_cache_valid() -> bool:
@@ -988,6 +1203,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — приветствие\n"
         f"/points — очки за последний завершённый тур лиги {LEAGUE_ID}\n"
         "/gw <номер> — очки за тур\n"
+        "/transfers <номер> — трансферы за тур\n"
+        "/month <номер> — очки за месяц (1-12)\n"
         f"/rank — положение в лиге {LEAGUE_ID}\n"
         "/deadline — время до ближайшего дедлайна (UTC+5)\n"
         "/gwinfo <номер> — таблица игроков (live)\n"
@@ -1275,6 +1492,140 @@ async def liveoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_target_chat = None
     await update.message.reply_text("Мониторинг выключен.")
 
+# ---------- /month Command ----------
+async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Aggregate month results from GW snapshots.
+    Usage: /month <month_number> (1=August, 2=September, etc.)
+    """
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /month <номер месяца> (1-12)")
+        return
+    
+    month_num = int(args[0])
+    if month_num < 1 or month_num > 12:
+        await update.message.reply_text("Месяц должен быть от 1 до 12")
+        return
+    
+    bs = await get_bootstrap_cached()
+    if not bs:
+        await update.message.reply_text("bootstrap недоступен")
+        return
+    
+    season = discover_season_tag(bs)
+    events = bs.get("events", [])
+    
+    # Find GWs that belong to this month (simplified - use month from deadline)
+    month_gws = []
+    for e in events:
+        deadline = parse_deadline(e.get("deadline_time"))
+        if deadline and deadline.month == month_num:
+            month_gws.append(e.get("id"))
+    
+    if not month_gws:
+        await update.message.reply_text(f"Нет туров для месяца {month_num}")
+        return
+    
+    # Get current roster
+    results = await get_league_results_cached(LEAGUE_ID)
+    if not results:
+        await update.message.reply_text("Standings недоступен")
+        return
+    
+    current_roster = [r.get("entry") for r in results if r.get("entry")]
+    
+    # Aggregate from snapshots
+    entry_totals: Dict[int, int] = {}
+    
+    for gw in sorted(month_gws):
+        snapshot = await get_or_build_gw_snapshot(season, LEAGUE_ID, gw, events, current_roster)
+        if snapshot:
+            for entry_data in snapshot.get("entries", []):
+                entry_id = entry_data.get("id")
+                pts = entry_data.get("gw_points")
+                if entry_id and pts is not None:
+                    entry_totals[entry_id] = entry_totals.get(entry_id, 0) + pts
+    
+    if not entry_totals:
+        await update.message.reply_text(f"Нет данных для месяца {month_num}")
+        return
+    
+    # Resolve names from standings and format output
+    entry_names = {r.get("entry"): (r.get("player_name"), r.get("entry_name")) 
+                   for r in results if r.get("entry")}
+    
+    sorted_entries = sorted(entry_totals.items(), key=lambda x: -x[1])
+    
+    lines = [f"*Очки за месяц {month_num} (GWs {min(month_gws)}-{max(month_gws)}):*\n"]
+    for rank, (entry_id, total) in enumerate(sorted_entries, 1):
+        player_name, entry_name = entry_names.get(entry_id, ("Unknown", "Unknown"))
+        lines.append(f"{rank}. {player_name} — {entry_name}: {total}")
+    
+    full_text = "\n".join(lines)
+    await send_text(update, full_text, parse_mode="Markdown")
+
+# ---------- /transfers Command ----------
+async def transfers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Show transfer activity for a gameweek.
+    Usage: /transfers <gw_number>
+    """
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /transfers <номер тура>")
+        return
+    
+    gw_num = int(args[0])
+    
+    bs = await get_bootstrap_cached()
+    if not bs:
+        await update.message.reply_text("bootstrap недоступен")
+        return
+    
+    season = discover_season_tag(bs)
+    events = bs.get("events", [])
+    
+    # Get current roster
+    results = await get_league_results_cached(LEAGUE_ID)
+    if not results:
+        await update.message.reply_text("Standings недоступен")
+        return
+    
+    current_roster = [r.get("entry") for r in results if r.get("entry")]
+    
+    # Get or build snapshot
+    snapshot = await get_or_build_gw_snapshot(season, LEAGUE_ID, gw_num, events, current_roster)
+    if not snapshot:
+        await update.message.reply_text(f"Нет данных для тура {gw_num}")
+        return
+    
+    # Resolve names and format output
+    entry_names = {r.get("entry"): (r.get("player_name"), r.get("entry_name")) 
+                   for r in results if r.get("entry")}
+    
+    lines = [f"*Трансферы GW {gw_num}:*\n"]
+    
+    # Sort by transfers descending
+    entries_with_transfers = [e for e in snapshot.get("entries", []) 
+                             if e.get("transfers") and e.get("transfers") > 0]
+    sorted_entries = sorted(entries_with_transfers, 
+                           key=lambda x: -x.get("transfers", 0))
+    
+    if not sorted_entries:
+        lines.append("Нет трансферов в этом туре")
+    else:
+        for entry_data in sorted_entries:
+            entry_id = entry_data.get("id")
+            transfers = entry_data.get("transfers", 0)
+            cost = entry_data.get("transfer_cost", 0)
+            player_name, entry_name = entry_names.get(entry_id, ("Unknown", "Unknown"))
+            cost_str = f" (-{cost})" if cost > 0 else ""
+            lines.append(f"{player_name} — {entry_name}: {transfers}{cost_str}")
+    
+    full_text = "\n".join(lines)
+    await send_text(update, full_text, parse_mode="Markdown")
+
 # ---------- League Points ----------
 async def send_league_points(
     update: Update,
@@ -1462,6 +1813,8 @@ async def setup_bot_commands(bot):
         BotCommand("help", "Справка"),
         BotCommand("points", "Очки (последний завершённый)"),
         BotCommand("gw", "Очки за тур"),
+        BotCommand("transfers", "Трансферы за тур"),
+        BotCommand("month", "Очки за месяц"),
         BotCommand("rank", "Положение в лиге"),
         BotCommand("deadline", "До дедлайна (UTC+5)"),
         BotCommand("gwinfo", "События тура"),
@@ -1535,6 +1888,8 @@ async def run_bot():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("points", points_command))
     application.add_handler(CommandHandler("gw", gw_command))
+    application.add_handler(CommandHandler("transfers", transfers_command))
+    application.add_handler(CommandHandler("month", month_command))
     application.add_handler(CommandHandler("rank", rank_command))
     application.add_handler(CommandHandler("deadline", deadline_command))
     application.add_handler(CommandHandler("gwinfo", gwinfo_command))
