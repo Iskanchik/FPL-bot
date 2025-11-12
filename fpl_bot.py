@@ -45,6 +45,8 @@ import time
 import signal
 import random
 import hashlib
+import gzip
+import base64
 from typing import Any, Dict, Optional, List, Tuple, Set
 from datetime import datetime, timezone, timedelta
 
@@ -83,6 +85,9 @@ ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "1") == "1"
 
 ENABLE_LIVE_MONITOR = os.environ.get("ENABLE_LIVE_MONITOR", "0") == "1"
 LIVE_POLL_INTERVAL = int(os.environ.get("LIVE_POLL_INTERVAL", "30"))
+
+# Item 14: Optional compression for snapshots
+COMPRESS_SNAPSHOTS = os.environ.get("COMPRESS_SNAPSHOTS", "0") == "1"
 
 stop_event = asyncio.Event()
 
@@ -350,6 +355,207 @@ async def can_rebuild(resource_key: str) -> bool:
         recent.append(now)
         _rebuild_tracker[resource_key] = recent
         return True
+
+# ---------- Snapshot compression helpers (Item 14) ----------
+def compress_snapshot(data: Dict[str, Any]) -> str:
+    """
+    Compress snapshot data using gzip if COMPRESS_SNAPSHOTS is enabled.
+    Returns base64-encoded compressed JSON or plain JSON.
+    """
+    json_str = json.dumps(data)
+    if not COMPRESS_SNAPSHOTS:
+        return json_str
+    
+    try:
+        compressed = gzip.compress(json_str.encode('utf-8'))
+        encoded = base64.b64encode(compressed).decode('ascii')
+        # Prefix with marker to indicate compressed data
+        return f"GZIP:{encoded}"
+    except Exception as e:
+        logger.warning(f"Compression failed, storing uncompressed: {e}")
+        return json_str
+
+def decompress_snapshot(data_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Decompress snapshot data. Handles both compressed and plain JSON.
+    """
+    if not data_str:
+        return None
+    
+    try:
+        # Check if data is compressed
+        if data_str.startswith("GZIP:"):
+            encoded = data_str[5:]  # Remove prefix
+            compressed = base64.b64decode(encoded)
+            json_str = gzip.decompress(compressed).decode('utf-8')
+            return json.loads(json_str)
+        else:
+            # Plain JSON
+            return json.loads(data_str)
+    except Exception as e:
+        logger.error(f"Failed to decompress/parse snapshot: {e}")
+        return None
+
+# ---------- Snapshot system with roster_hash (Items 3, 4, 5) ----------
+def compute_roster_hash(entry_ids: List[int]) -> str:
+    """
+    Compute sha256 hash of sorted entry IDs for roster change detection.
+    """
+    sorted_ids = sorted(entry_ids)
+    id_str = ",".join(str(eid) for eid in sorted_ids)
+    return hashlib.sha256(id_str.encode('utf-8')).hexdigest()
+
+def key_snapshot(season: str, gw: int) -> str:
+    """Redis key for GW snapshot"""
+    return f"fpl:{season}:snapshot:gw:{gw}"
+
+def key_snapshot_lock(season: str, gw: int) -> str:
+    """Redis key for snapshot rebuild lock"""
+    return f"fpl:{season}:snapshot:gw:{gw}:lock"
+
+async def acquire_snapshot_lock(season: str, gw: int, ttl: int = 300) -> bool:
+    """
+    Acquire lock for snapshot rebuild using Redis SETNX.
+    Returns True if lock acquired, False otherwise.
+    """
+    lock_key = key_snapshot_lock(season, gw)
+    if redis_client:
+        try:
+            # SETNX returns 1 if key was set, 0 if it already exists
+            result = await asyncio.to_thread(redis_client.set, lock_key, "1", ex=ttl, nx=True)
+            return result is not None
+        except Exception as e:
+            logger.warning(f"Failed to acquire Redis lock: {e}")
+            return False
+    else:
+        # In-memory fallback - use mem_kv
+        existing = await mem_kv_get(lock_key)
+        if existing is not None:
+            return False
+        await mem_kv_set(lock_key, "1", ttl)
+        return True
+
+async def release_snapshot_lock(season: str, gw: int):
+    """Release snapshot rebuild lock"""
+    lock_key = key_snapshot_lock(season, gw)
+    if redis_client:
+        try:
+            await asyncio.to_thread(redis_client.delete, lock_key)
+        except Exception as e:
+            logger.warning(f"Failed to release Redis lock: {e}")
+    else:
+        async with _mem_kv_lock:
+            _mem_kv.pop(lock_key, None)
+
+async def get_snapshot(season: str, gw: int) -> Optional[Dict[str, Any]]:
+    """
+    Get snapshot for a gameweek. Returns None if not found.
+    Snapshot contains: entry_ids, roster_hash, data (numeric stats), timestamp
+    """
+    snap_key = key_snapshot(season, gw)
+    
+    if redis_client:
+        try:
+            raw = await asyncio.to_thread(redis_client.get, snap_key)
+            if raw:
+                if isinstance(raw, bytes):
+                    raw = raw.decode('utf-8')
+                return decompress_snapshot(raw)
+        except Exception as e:
+            logger.error(f"Failed to get snapshot from Redis: {e}")
+    
+    # In-memory fallback
+    return await mem_kv_get(snap_key)
+
+async def save_snapshot(season: str, gw: int, snapshot: Dict[str, Any]):
+    """
+    Save snapshot to storage (Redis or memory).
+    """
+    snap_key = key_snapshot(season, gw)
+    compressed = compress_snapshot(snapshot)
+    
+    if redis_client:
+        try:
+            await asyncio.to_thread(redis_client.set, snap_key, compressed, ex=REDIS_GW_TTL)
+            logger.info(f"Snapshot saved for GW {gw} (compressed={COMPRESS_SNAPSHOTS})")
+        except Exception as e:
+            logger.error(f"Failed to save snapshot to Redis: {e}")
+    else:
+        await mem_kv_set(snap_key, snapshot, REDIS_GW_TTL)
+        logger.info(f"Snapshot saved to memory for GW {gw}")
+
+async def build_gw_snapshot(season: str, gw: int, standings: List[Dict]) -> Dict[str, Any]:
+    """
+    Build snapshot for a gameweek.
+    Stores only numeric/statistical data + entry IDs (not frozen names).
+    Names reflect current standings ("like FPL").
+    """
+    entry_ids = [r["entry"] for r in standings if "entry" in r]
+    roster_hash = compute_roster_hash(entry_ids)
+    
+    # Fetch points for each entry
+    entry_data = []
+    for r in standings:
+        entry_id = r.get("entry")
+        if not entry_id:
+            continue
+        
+        picks = await get_entry_picks_cached(entry_id, gw)
+        points = None
+        if picks:
+            points = picks.get("entry_history", {}).get("points")
+        
+        entry_data.append({
+            "entry_id": entry_id,
+            "points": points,
+            "rank": r.get("rank"),
+            "total": r.get("total")
+        })
+    
+    snapshot = {
+        "gw": gw,
+        "season": season,
+        "entry_ids": entry_ids,
+        "roster_hash": roster_hash,
+        "data": entry_data,
+        "timestamp": time.time()
+    }
+    
+    return snapshot
+
+async def lazy_rebuild_snapshot(season: str, gw: int, standings: List[Dict]) -> bool:
+    """
+    Lazy rebuild: check if roster_hash differs, rebuild if needed.
+    Returns True if rebuilt, False otherwise.
+    Uses concurrency-safe lock.
+    """
+    # Get current roster hash
+    entry_ids = [r["entry"] for r in standings if "entry" in r]
+    current_hash = compute_roster_hash(entry_ids)
+    
+    # Get existing snapshot
+    existing = await get_snapshot(season, gw)
+    if existing and existing.get("roster_hash") == current_hash:
+        logger.debug(f"Snapshot for GW {gw} is up to date (roster_hash matches)")
+        return False
+    
+    # Check rate limit
+    if not await can_rebuild(f"snapshot:gw:{gw}"):
+        logger.warning(f"Skipping rebuild for GW {gw} due to rate limit")
+        return False
+    
+    # Try to acquire lock
+    if not await acquire_snapshot_lock(season, gw):
+        logger.info(f"Another process is rebuilding snapshot for GW {gw}")
+        return False
+    
+    try:
+        logger.info(f"Rebuilding snapshot for GW {gw} (roster_hash mismatch)")
+        snapshot = await build_gw_snapshot(season, gw, standings)
+        await save_snapshot(season, gw, snapshot)
+        return True
+    finally:
+        await release_snapshot_lock(season, gw)
 
 # ---------- Bootstrap ----------
 def bootstrap_cache_valid() -> bool:
@@ -1287,7 +1493,26 @@ async def send_league_points(
         return
     header = header_override or f"*Очки за тур {gw_num}:*\n\n"
     lines: List[str] = []
+    
+    # Item 12: Check if this is current GW and if event_total is available
+    current_gw_event = next((e for e in events if e.get("is_current") and e.get("id") == gw_num), None)
+    use_event_total = current_gw_event is not None and not current_gw_event.get("finished")
+    
+    if use_event_total:
+        # Try to use standings event_total to avoid picks calls before freeze
+        has_event_total = all("event_total" in r for r in results)
+        if has_event_total:
+            logger.debug(f"Using event_total from standings for current GW {gw_num}")
+            for r in results:
+                player_name = r.get("player_name", "Unknown")
+                entry_name = r.get("entry_name", "Unknown")
+                pts = r.get("event_total")
+                lines.append(f"{player_name} — {entry_name}: {pts if pts is not None else 'нет данных'}")
+            full_text = header + "\n".join(lines)
+            await safe_reply_markdown(update, full_text)
+            return
 
+    # Fallback: fetch picks for each entry
     async def one(entry_id: int, entry_name: str, player_name: str) -> str:
         data = await get_entry_picks_cached(entry_id, gw_num)
         pts = None
@@ -1491,8 +1716,10 @@ def con() -> Dict[str, Any]:
         "REDIS_GW_TTL": REDIS_GW_TTL,
         "ENABLE_HTTP2": ENABLE_HTTP2,
         "USE_WEBHOOK": USE_WEBHOOK,
+        "COMPRESS_SNAPSHOTS": COMPRESS_SNAPSHOTS,
         "Redis_connected": redis_client is not None,
         "Season_tag": SEASON_TAG,
+        "Fixtures_cache_size": len(_fixtures_cache),
     }
 
 async def con_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
