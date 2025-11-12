@@ -1,20 +1,15 @@
-# FPL Telegram Bot — live events (message per event pair), optimizations, idempotency, updates
-# Версия с правками по запросу:
-# - Стиль /deadline: 
-#   Ближайший дедлайн: Gameweek N
-#   Когда: YYYY-MM-DD HH:MM:SS UTC+X
-#   Осталось: D д. H ч. M мин.
-# - Настраиваемая таймзона для дедлайна: TIMEZONE_OFFSET_HOURS (env, default +5)
-# - Удалены команды /start и /help
-# - /gw переименована в /gwpoints, сортировка по очкам (убывание) конкретного тура
-# - /points удалена
-# - В заголовках /rank, /gwinfo, /gwpoints добавлено имя лиги (League Name) по LEAGUE_ID
-# - В /gwinfo заменены PenM -> PM, PenS -> PS; есть расшифровка сокращений
-# - DC токен отображается корректно (DEF >=10; MID/FWD >=12)
-# - Clean sheet (subbed off): игрок >=60 минут, не пропустил, заменён (minutes < max minutes матча до финала)
-# - Минуты добавленного времени: 45+N (1-й тайм), 90+N (2-й тайм)
-# - Idempotency: уникальные сообщения не дублируются (Redis или память)
-# - Update события: Goal cancelled (VAR), Assist cancelled, Own goal removed, Penalty missed/ saved removed, Red card cancelled, Clean sheet removed, DC removed, Assist reassigned, Penalty retake
+# FPL Telegram Bot — live events, optimizations, idempotency, updates
+# Изменения:
+# - Заголовки: только название лиги (без "Положение лиги", без ID).
+# - Центрирование всех таблиц (/rank, /gwinfo, /gwpoints, /month).
+# - Таймзона: интерактивная настройка. Если не установлена — первый /deadline подскажет команду /settz <offset>.
+# - /gwinfo и /gwpoints: в заголовке название лиги + номер GW.
+# - /month: заголовок как в /gwinfo, русское имя месяца, номер месяца сезона (Авг=1..Май=10),
+#           количество оставшихся туров до конца месяца, топ-10 игроков по очкам месяца.
+# - /rank: отображение изменения ранга (↑, ↓, →0) относительно last_rank.
+# - Аббревиатуры: PM (penalties missed), PS (penalties saved).
+# - DC в /gwinfo: токен "DC" при DEF>=10 или MID/FWD>=12 (по ключам defensive_contributions/cbit/cbits/def_contributions).
+# - Live: 45+N/90+N минуты, Clean sheet (subbed off) и идемпотентность сохранены.
 
 import os
 import asyncio
@@ -23,7 +18,7 @@ import logging
 import time
 import signal
 import random
-import hashlib 
+import hashlib
 from typing import Any, Dict, Optional, List, Tuple, Set
 from datetime import datetime, timezone, timedelta
 
@@ -61,9 +56,12 @@ FPL_PICKS_ALLOW_STALE = os.environ.get("FPL_PICKS_ALLOW_STALE", "1") == "1"
 FPL_CONCURRENCY = int(os.environ.get("FPL_CONCURRENCY", "3"))
 
 FIXTURES_TTL = int(os.environ.get("FIXTURES_TTL", "900"))
-LEAGUE_PLAYERS_TTL = 300  # seconds
+LEAGUE_PLAYERS_TTL = 300
 IDEMPOTENCY_TTL_SEC = 10 * 24 * 3600
-TIMEZONE_OFFSET_HOURS = int(os.environ.get("TIMEZONE_OFFSET_HOURS", "5"))
+
+TIMEZONE_ENV = os.environ.get("TIMEZONE_OFFSET_HOURS")  # начальное значение, если нет интерактива
+INITIAL_TZ_OFFSET = int(TIMEZONE_ENV) if TIMEZONE_ENV and TIMEZONE_ENV.lstrip("+-").isdigit() else None
+TZ_REDIS_KEY = "fpl:tz_offset"
 
 # ===== Logging =====
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
@@ -85,7 +83,8 @@ def health():
         "fixtures_cache_entries": len(_fixtures_cache),
         "redis_connected": redis_client is not None,
         "season_tag": SEASON_TAG,
-        "league_name": LEAGUE_NAME
+        "league_name": LEAGUE_NAME,
+        "tz_offset": get_timezone_offset()
     })
 
 def start_flask():
@@ -182,6 +181,8 @@ _last_counts: Dict[Tuple[int,int,int,str], int] = {}
 _current_gw: Optional[int] = None
 _sent_msg_hashes: Set[str] = set()
 
+_tz_offset_memory: Optional[int] = None  # in-memory fallback for tz
+
 # ===== Redis =====
 def init_redis():
     global redis_client
@@ -194,6 +195,30 @@ def init_redis():
     except Exception as e:
         logger.warning(f"Redis init failed: {e}")
         redis_client = None
+
+def get_timezone_offset() -> int:
+    # Priority: Redis -> memory -> INITIAL_TZ_OFFSET -> 0
+    if redis_client:
+        try:
+            val = redis_client.get(TZ_REDIS_KEY)
+            if val is not None and str(val).lstrip("+-").isdigit():
+                return int(val)
+        except Exception:
+            pass
+    if _tz_offset_memory is not None:
+        return _tz_offset_memory
+    if INITIAL_TZ_OFFSET is not None:
+        return INITIAL_TZ_OFFSET
+    return 0
+
+def set_timezone_offset(offset: int):
+    global _tz_offset_memory
+    _tz_offset_memory = offset
+    if redis_client:
+        try:
+            redis_client.set(TZ_REDIS_KEY, str(offset))
+        except Exception:
+            logger.warning("Redis set tz_offset failed")
 
 # ===== Utilities =====
 def parse_deadline(dt_str: str) -> Optional[datetime]:
@@ -240,9 +265,16 @@ def standings_valid() -> bool:
 
 async def get_league_results_cached(league_id: str) -> Optional[List[Dict]]:
     if standings_valid() and "results" in standings_cache:
+        # обновим имя лиги, если есть
+        global LEAGUE_NAME
+        if "league_name" in standings_cache and standings_cache["league_name"]:
+            LEAGUE_NAME = standings_cache["league_name"]
         return standings_cache.get("results")
     async with standings_lock:
         if standings_valid() and "results" in standings_cache:
+            if "league_name" in standings_cache and standings_cache["league_name"]:
+                global LEAGUE_NAME
+                LEAGUE_NAME = standings_cache["league_name"]
             return standings_cache.get("results")
         all_results: List[Dict] = []
         page = 1
@@ -562,6 +594,7 @@ async def live_monitor_loop():
                 def get_state(pid: int) -> Tuple[int,int,int]:
                     return player_state.get((fid,pid), (PLAYER_POS_MAP.get(pid,0), 0, 0))
 
+                # Updates
                 update_msgs: List[str] = []
                 if "assists" in neg_pool.get(fid, {}) and "assists" in pos_pool.get(fid, {}):
                     while neg_pool[fid]["assists"] and pos_pool[fid]["assists"]:
@@ -792,9 +825,10 @@ async def live_monitor_loop():
                         rows.append((PLAYER_NAME_MAP.get(pid,f'P{pid}'), total_pts))
                 if rows:
                     rows.sort(key=lambda x:(-x[1], x[0].lower()))
-                    lines=[header]
+                    width = max(len(header), max((len(f"{i}. {nm}: {pts} pts") for i,(nm,pts) in enumerate(rows,1)), default=0))
+                    lines=[header.center(width)]
                     for i,(name,pts) in enumerate(rows,1):
-                        lines.append(f"{i}. {name}: {pts} pts")
+                        lines.append(f"{i}. {name}: {pts} pts".center(width))
                     await send_once("\n".join(lines), season, gw)
                 _fixture_summary_sent.add(sum_key)
 
@@ -804,19 +838,75 @@ async def live_monitor_loop():
             await asyncio.sleep(LIVE_POLL_INTERVAL)
     logger.info("Live loop stopped")
 
-# ===== Telegram Commands =====
+# ===== Season month helper =====
+RUS_MONTH = {
+    1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
+    7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"
+}
+SEASON_MONTH_ORDER = [8,9,10,11,12,1,2,3,4,5]  # Авг..Май
 
-async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    results = await get_league_results_cached(LEAGUE_ID)
-    if not results:
-        await update.message.reply_text("Standings недоступны")
+def season_month_index(month_num: int) -> Optional[int]:
+    try:
+        return SEASON_MONTH_ORDER.index(month_num) + 1
+    except ValueError:
+        return None
+
+async def month_points(entries: List[Dict], events: List[Dict]) -> Tuple[List[Tuple[str,str,int]], int]:
+    tz_offset = get_timezone_offset()
+    now_local = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+    month = now_local.month
+    year = now_local.year
+    month_event_ids: List[int] = []
+    remaining = 0
+    for ev in events:
+        dt = parse_deadline(ev.get("deadline_time"))
+        if not dt: continue
+        local_dt = dt + timedelta(hours=tz_offset)
+        if local_dt.month == month and local_dt.year == year:
+            month_event_ids.append(ev.get("id"))
+            if not ev.get("finished"):
+                remaining += 1
+    if not month_event_ids:
+        return [], 0
+    finished_ids = [ev.get("id") for ev in events if ev.get("finished") and ev.get("id") in month_event_ids]
+    async def fetch_entry(eid: int, e_name: str, p_name: str):
+        total = 0
+        for gw_id in finished_ids:
+            data = await get_entry_picks_cached(eid, gw_id)
+            if data:
+                pts = data.get("entry_history", {}).get("points")
+                if isinstance(pts,int):
+                    total += pts
+        return (p_name, e_name, total)
+    tasks=[]
+    for r in entries:
+        eid = r.get("entry")
+        if isinstance(eid,int):
+            tasks.append(asyncio.create_task(fetch_entry(eid, r.get("entry_name"), r.get("player_name"))))
+    fetched = await asyncio.gather(*tasks, return_exceptions=True)
+    rows=[]
+    for f in fetched:
+        if isinstance(f, tuple):
+            rows.append(f)
+    rows.sort(key=lambda x: (-x[2], x[0].lower()))
+    return rows, remaining
+
+# ===== Commands =====
+async def settz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /settz <offset>, пример: /settz +5 или /settz -2 или /settz 3")
         return
-    league_name = LEAGUE_NAME or f"League {LEAGUE_ID}"
-    lines=[f"Положение лиги: {league_name}"]
-    for r in sorted(results, key=lambda x: x.get("rank", 10**9)):
-        lines.append(f"{r.get('rank')}. {r.get('player_name')} — {r.get('entry_name')}: {r.get('total')} pts")
-    for chunk in split_message_chunks("\n".join(lines)):
-        await update.message.reply_text(chunk)
+    raw = context.args[0].strip()
+    if raw.startswith("+"): raw = raw[1:]
+    if not raw.lstrip("-").isdigit():
+        await update.message.reply_text("Offset должен быть целым числом, пример: 5 или -3.")
+        return
+    offset = int(raw)
+    if offset < -12 or offset > 14:
+        await update.message.reply_text("Диапазон смещения допустим: -12 .. +14.")
+        return
+    set_timezone_offset(offset)
+    await update.message.reply_text(f"Таймзона установлена: UTC{offset:+d}")
 
 async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bs = await get_bootstrap_cached()
@@ -824,31 +914,90 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет bootstrap")
         return
     events = bs.get("events", [])
-    now = datetime.now(timezone.utc)
-    future = []
+    now_utc = datetime.now(timezone.utc)
+    future=[]
     for e in events:
         dt = parse_deadline(e.get("deadline_time"))
-        if dt and dt > now:
+        if dt and dt > now_utc:
             future.append((dt,e))
     if not future:
         await update.message.reply_text("Нет будущих дедлайнов")
         return
     dt,e = min(future, key=lambda x: x[0])
-    gw_num = e.get("id")
-    # Перевод в локальную таймзону (offset)
-    local_dt = dt + timedelta(hours=TIMEZONE_OFFSET_HOURS)
-    left_seconds = int((local_dt - (datetime.now(timezone.utc)+timedelta(hours=TIMEZONE_OFFSET_HOURS))).total_seconds())
-    if left_seconds < 0:
-        left_seconds = 0
+    tz_offset = get_timezone_offset()
+    # Первый запуск без tz — подсказка
+    if INITIAL_TZ_OFFSET is None and _tz_offset_memory is None:
+        need = True
+        if redis_client:
+            try:
+                if redis_client.get(TZ_REDIS_KEY) is not None:
+                    need = False
+            except Exception:
+                pass
+        if need:
+            await update.message.reply_text("Таймзона не настроена. Установи командой /settz <offset> (например /settz +5). Пока показываю время в текущем смещении.")
+    local_dt = dt + timedelta(hours=tz_offset)
+    now_local = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+    left_seconds = int((local_dt - now_local).total_seconds())
+    if left_seconds < 0: left_seconds = 0
     days = left_seconds // 86400
     hours = (left_seconds % 86400) // 3600
     minutes = (left_seconds % 3600) // 60
+    gw_num = e.get("id")
     text = (
         f"Ближайший дедлайн: Gameweek {gw_num}\n"
-        f"Когда: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC+{TIMEZONE_OFFSET_HOURS}\n"
+        f"Когда: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC{tz_offset:+d}\n"
         f"Осталось: {days} д. {hours} ч. {minutes} мин."
     )
     await update.message.reply_text(text)
+
+async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    results = await get_league_results_cached(LEAGUE_ID)
+    if not results:
+        await update.message.reply_text("Standings недоступны")
+        return
+    league_name = LEAGUE_NAME or "League"
+    rows=[]
+    for r in sorted(results, key=lambda x: x.get("rank", 10**9)):
+        rank = r.get("rank")
+        last = r.get("last_rank")
+        delta = None
+        if isinstance(rank,int) and isinstance(last,int) and rank>0 and last>0:
+            d = last - rank
+            if d > 0:
+                delta = f"↑{d}"
+            elif d < 0:
+                delta = f"↓{abs(d)}"
+            else:
+                delta = "→0"
+        player_name = r.get("player_name")
+        entry_name = r.get("entry_name")
+        total = r.get("total")
+        rows.append((rank, player_name, entry_name, total, delta))
+    # Center formatting
+    rank_w = max(len("Rank"), max((len(str(r[0])) for r in rows), default=4))
+    player_w = max(len("Player"), max((len(r[1]) for r in rows), default=6))
+    entry_w = max(len("Team"), max((len(r[2]) for r in rows), default=4))
+    total_w = max(len("Pts"), max((len(str(r[3])) for r in rows), default=3))
+    delta_w = max(len("Δ"), max((len(r[4]) if r[4] else 2 for r in rows), default=2))
+    header = f"{'Rank'.center(rank_w)}  {'Player'.center(player_w)}  {'Team'.center(entry_w)}  {'Pts'.center(total_w)}  {'Δ'.center(delta_w)}"
+    sep = "-"*len(header)
+    lines=[f"{league_name}".center(len(header)), "```", header, sep]
+    for r in rows:
+        delta = r[4] or "→0"
+        lines.append(
+            f"{str(r[0]).center(rank_w)}  {r[1].center(player_w)}  {r[2].center(entry_w)}  {str(r[3]).center(total_w)}  {delta.center(delta_w)}"
+        )
+    lines.append("```")
+    text = "\n".join(lines)
+    for chunk in split_message_chunks(text):
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            safe = text.replace("```","")
+            for c2 in split_message_chunks(safe):
+                await update.message.reply_text(c2)
+            break
 
 async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -856,23 +1005,21 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /gwinfo <номер>")
         return
     gw = int(args[0])
-
+    # Обновим имя лиги
+    await get_league_results_cached(LEAGUE_ID)
     live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
     if not live:
         await update.message.reply_text("live недоступен")
         return
-
     league_players = await get_league_player_ids_cached(gw)
     live_elements = live.get("elements", [])
-    rows = []
+    rows=[]
     for el in live_elements:
         pid = el.get("id")
-        if pid not in league_players:
-            continue
+        if pid not in league_players: continue
         stats = el.get("stats", {}) or {}
         pos = PLAYER_POS_MAP.get(pid, 0)
-        total_points = int(stats.get("total_points", 0) or 0)
-
+        total_points = int(stats.get("total_points",0) or 0)
         stat_parts=[]
         g=int(stats.get("goals_scored",0) or 0); 
         if g>0: stat_parts.append(f"G{g}")
@@ -892,41 +1039,35 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         og=int(stats.get("own_goals",0) or 0)
         if og>0: stat_parts.append(f"OG{og}")
         pen_m=int(stats.get("penalties_missed",0) or 0)
-        if pen_m>0: stat_parts.append(f"PM{pen_m}")  # replaced PenM
+        if pen_m>0: stat_parts.append(f"PM{pen_m}")
         pen_s=int(stats.get("penalties_saved",0) or 0)
-        if pen_s>0: stat_parts.append(f"PS{pen_s}")  # replaced PenS
+        if pen_s>0: stat_parts.append(f"PS{pen_s}")
         bonus=int(stats.get("bonus",0) or 0)
         if bonus>0: stat_parts.append(f"B{bonus}")
-
         if not stat_parts and total_points <= 2:
             continue
         name = PLAYER_NAME_MAP.get(pid,f"P{pid}")
         rows.append({"name":name,"stats":" ".join(stat_parts) if stat_parts else "-", "pts":total_points})
-
     if not rows:
         await update.message.reply_text("Нет игроков для отображения.")
         return
-
     rows.sort(key=lambda r: (-r["pts"], r["name"].lower()))
-    name_w = max(len(r["name"]) for r in rows + [{"name":"Player"}])
-    stats_w = max(len(r["stats"]) for r in rows + [{"stats":"Stats"}])
-    pts_w = max(len(str(r["pts"])) for r in rows + [{"pts":"Pts"}])
-
-    header = f"{'Player'.ljust(name_w)}  {'Stats'.ljust(stats_w)}  {'Pts'.rjust(pts_w)}"
-    sep = "-" * len(header)
-
-    league_name = LEAGUE_NAME or f"League {LEAGUE_ID}"
-    desc = ("Сокращения: G=Goals, A=Assists, CS=Clean sheet, DC=Defensive contribution, "
+    name_w = max(len("Player"), max(len(r["name"]) for r in rows))
+    stats_w = max(len("Stats"), max(len(r["stats"]) for r in rows))
+    pts_w = max(len("Pts"), max(len(str(r["pts"])) for r in rows))
+    header = f"{'Player'.center(name_w)}  {'Stats'.center(stats_w)}  {'Pts'.center(pts_w)}"
+    sep = "-"*len(header)
+    league_name = LEAGUE_NAME or "League"
+    desc = ("G=Goals, A=Assists, CS=Clean sheet, DC=Defensive contribution, "
             "YC=Yellow cards, RC=Red card, GKS=GK save points, OG=Own goals, PM=Penalties missed, "
             "PS=Penalties saved, B=Bonus")
-
-    lines = [f"*GW {gw} — Игроки лиги ({league_name})*", desc, "```", header, sep]
+    lines=[f"GW {gw} — {league_name}".center(len(header)), desc.center(len(header)), "```", header, sep]
     for r in rows:
-        line = f"{r['name'].ljust(name_w)}  {r['stats'].ljust(stats_w)}  {str(r['pts']).rjust(pts_w)}"
-        lines.append(line)
+        lines.append(
+            f"{r['name'].center(name_w)}  {r['stats'].center(stats_w)}  {str(r['pts']).center(pts_w)}"
+        )
     lines.append("```")
-
-    full_text = "\n".join(lines)
+    full_text="\n".join(lines)
     for chunk in split_message_chunks(full_text):
         try:
             await update.message.reply_text(chunk, parse_mode="Markdown")
@@ -945,8 +1086,7 @@ async def gwpoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = await get_league_results_cached(LEAGUE_ID)
     if not results:
         await update.message.reply_text("Standings недоступны"); return
-    league_name = LEAGUE_NAME or f"League {LEAGUE_ID}"
-    # Собираем очки участников за GW (entry_history.points)
+    league_name = LEAGUE_NAME or "League"
     async def one(r):
         data=await get_entry_picks_cached(r.get("entry"), gw)
         pts=data.get("entry_history",{}).get("points") if data else None
@@ -957,16 +1097,65 @@ async def gwpoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for item in got:
         if isinstance(item, tuple):
             entries.append(item)
-    # сортировка по очкам (убывание), далее по имени игрока
     entries.sort(key=lambda x: (-x[2], x[0].lower()))
-    lines=[f"Очки за тур {gw} — {league_name}"]
-    rank=1
-    for player_name, entry_name, pts in entries:
-        val = pts if pts>=0 else "n/a"
-        lines.append(f"{rank}. {player_name} — {entry_name}: {val}")
-        rank+=1
-    for chunk in split_message_chunks("\n".join(lines)):
-        await update.message.reply_text(chunk)
+    player_w = max(len("Player"), max(len(e[0]) for e in entries))
+    team_w = max(len("Team"), max(len(e[1]) for e in entries))
+    pts_w = max(len("Pts"), max(len(str(e[2])) for e in entries))
+    header = f"{'Player'.center(player_w)}  {'Team'.center(team_w)}  {'Pts'.center(pts_w)}"
+    sep = "-"*len(header)
+    lines=[f"GW {gw} — {league_name}".center(len(header)), "```", header, sep]
+    for e in entries:
+        val = e[2] if e[2] >= 0 else "n/a"
+        lines.append(f"{e[0].center(player_w)}  {e[1].center(team_w)}  {str(val).center(pts_w)}")
+    lines.append("```")
+    text = "\n".join(lines)
+    for chunk in split_message_chunks(text):
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            safe = text.replace("```","")
+            for c2 in split_message_chunks(safe):
+                await update.message.reply_text(c2)
+            break
+
+async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bs = await get_bootstrap_cached()
+    if not bs:
+        await update.message.reply_text("Нет bootstrap")
+        return
+    events = bs.get("events", [])
+    results = await get_league_results_cached(LEAGUE_ID)
+    if not results:
+        await update.message.reply_text("Standings недоступны")
+        return
+    rows, remaining = await month_points(results, events)
+    tz_offset = get_timezone_offset()
+    now_local = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+    rus_name = RUS_MONTH.get(now_local.month, f"Месяц {now_local.month}")
+    season_idx = season_month_index(now_local.month)
+    league_name = LEAGUE_NAME or "League"
+    # Топ‑10
+    top = rows[:10]
+    player_w = max(len("Player"), max((len(r[0]) for r in top), default=6))
+    team_w = max(len("Team"), max((len(r[1]) for r in top), default=4))
+    pts_w = max(len("MonthPts"), max((len(str(r[2])) for r in top), default=8))
+    header = f"{'Player'.center(player_w)}  {'Team'.center(team_w)}  {'MonthPts'.center(pts_w)}"
+    sep = "-"*len(header)
+    title = f"Месяц {season_idx if season_idx else '?'} — {rus_name} — {league_name}"
+    rem_line = f"Осталось туров в месяце: {remaining}"
+    lines=[title.center(len(header)), rem_line.center(len(header)), "```", header, sep]
+    for r in top:
+        lines.append(f"{r[0].center(player_w)}  {r[1].center(team_w)}  {str(r[2]).center(pts_w)}")
+    lines.append("```")
+    text="\n".join(lines)
+    for chunk in split_message_chunks(text):
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            safe = text.replace("```","")
+            for c2 in split_message_chunks(safe):
+                await update.message.reply_text(c2)
+            break
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled", exc_info=context.error)
@@ -977,6 +1166,8 @@ async def setup_bot_commands(bot):
         BotCommand("deadline","Next deadline"),
         BotCommand("gwinfo","Live GW players"),
         BotCommand("gwpoints","Points per GW"),
+        BotCommand("month","Points per month"),
+        BotCommand("settz","Set timezone"),
     ]
     try:
         await bot.set_my_commands(cmds)
@@ -1000,6 +1191,8 @@ async def run_bot():
     application.add_handler(CommandHandler("deadline", deadline_command))
     application.add_handler(CommandHandler("gwinfo", gwinfo_command))
     application.add_handler(CommandHandler("gwpoints", gwpoints_command))
+    application.add_handler(CommandHandler("month", month_command))
+    application.add_handler(CommandHandler("settz", settz_command))
     application.add_error_handler(error_handler)
 
     await application.initialize()
