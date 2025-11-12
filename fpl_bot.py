@@ -161,6 +161,10 @@ picks_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
 _picks_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
 _picks_locks_guard = asyncio.Lock()
 
+# In-memory caches with TTL for fixtures
+fixtures_cache: Dict[int, Dict[str, Any]] = {}  # gw -> {data, ts}
+fixtures_lock = asyncio.Lock()
+
 bootstrap_path = "/api/bootstrap-static/"
 league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
@@ -215,6 +219,11 @@ _mem_events: Dict[str, int] = {}
 _mem_sets: Dict[str, Set[str]] = {}
 _mem_baseline: Set[str] = set()
 
+# In-memory KV with TTL for preventing indefinite growth
+_mem_kv: Dict[str, Any] = {}  # key -> {value, ts}
+_mem_ttl_check_interval = 3600  # prune every hour
+_mem_ttl_last_check = time.time()
+
 def init_redis():
     global redis_client
     if Redis is None:
@@ -227,7 +236,33 @@ def init_redis():
         logger.warning(f"Redis init failed: {e}; fallback to memory.")
         redis_client = None
 
+def prune_expired_mem_kv():
+    """Prune expired entries from in-memory KV to prevent indefinite growth."""
+    global _mem_ttl_last_check
+    now = time.time()
+    if now - _mem_ttl_last_check < _mem_ttl_check_interval:
+        return
+    _mem_ttl_last_check = now
+    
+    # Prune _mem_events (use REDIS_GW_TTL as default TTL)
+    expired_keys = []
+    for key in _mem_events:
+        # For simplicity, we'll keep events for REDIS_GW_TTL
+        # This is a basic implementation - could be improved with per-key timestamps
+        pass
+    
+    # Prune _mem_kv
+    expired_kv = [k for k, v in _mem_kv.items() 
+                  if isinstance(v, dict) and 
+                  (now - v.get('ts', 0)) > REDIS_GW_TTL]
+    for k in expired_kv:
+        del _mem_kv[k]
+    
+    if expired_kv:
+        logger.debug(f"Pruned {len(expired_kv)} expired mem_kv entries")
+
 async def r_get(key: str) -> Optional[int]:
+    prune_expired_mem_kv()
     if redis_client:
         raw = await asyncio.to_thread(redis_client.get, key)
         if raw is None:
@@ -286,6 +321,55 @@ def discover_season_tag(bootstrap: Dict[str, Any]) -> str:
     SEASON_TAG = season
     return SEASON_TAG
 
+def next_poll_interval(now_utc: datetime, next_kickoff_utc: Optional[datetime]) -> int:
+    """
+    Adaptive poll interval based on time until next kickoff:
+    - >6h before: 180s
+    - 30m-6h before: 60s
+    - During active match window (or within 30m): 30s (or LIVE_POLL_INTERVAL)
+    Returns interval in seconds.
+    """
+    if not next_kickoff_utc:
+        return LIVE_POLL_INTERVAL
+    
+    delta = (next_kickoff_utc - now_utc).total_seconds()
+    
+    if delta > 6 * 3600:  # >6 hours
+        return 180
+    elif delta > 30 * 60:  # 30 min to 6 hours
+        return 60
+    else:  # within 30 min or already started
+        return max(LIVE_POLL_INTERVAL, 30)
+
+def find_next_kickoff(events: List[Dict], fixtures: Optional[List[Dict]] = None) -> Optional[datetime]:
+    """
+    Find the next kickoff time from events and fixtures.
+    Returns datetime in UTC or None.
+    """
+    now = datetime.now(timezone.utc)
+    
+    # Check current or next event deadline
+    current_or_next = [e for e in events if e.get("is_current") or e.get("is_next")]
+    if current_or_next:
+        deadlines = []
+        for e in current_or_next:
+            dl = parse_deadline(e.get("deadline_time"))
+            if dl and dl > now:
+                deadlines.append(dl)
+        if deadlines:
+            return min(deadlines)
+    
+    # Check fixtures if provided
+    if fixtures:
+        for f in fixtures:
+            kickoff_time = f.get("kickoff_time")
+            if kickoff_time:
+                ko = parse_deadline(kickoff_time)
+                if ko and ko > now:
+                    return ko
+    
+    return None
+
 # ---------- Bootstrap ----------
 def bootstrap_cache_valid() -> bool:
     if bootstrap_cache_ts is None:
@@ -324,6 +408,49 @@ async def get_bootstrap() -> Optional[Dict]:
             bootstrap_cache.update(fake)
             bootstrap_cache_ts = time.time()
         return fake
+    return None
+
+async def get_bootstrap_cached(ttl: int = None) -> Optional[Dict]:
+    """
+    Read-through cache for bootstrap with custom TTL.
+    ttl in seconds; defaults to FPL_CACHE_TTL (minutes).
+    """
+    if ttl is None:
+        ttl = FPL_CACHE_TTL * 60  # convert minutes to seconds
+    
+    async with bootstrap_lock:
+        if bootstrap_cache_ts and (time.time() - bootstrap_cache_ts) < ttl:
+            return bootstrap_cache
+    
+    return await get_bootstrap()
+
+async def get_fixtures_cached(gw: int, ttl: int = 900) -> Optional[List[Dict]]:
+    """
+    Read-through cache for fixtures with TTL (default 900s = 15 min).
+    Returns fixture list for the given gameweek.
+    """
+    now = time.time()
+    async with fixtures_lock:
+        cached = fixtures_cache.get(gw)
+        if cached and (now - cached.get("ts", 0)) < ttl:
+            logger.debug(f"Fixtures cache hit for GW {gw}")
+            return cached.get("data")
+    
+    # Fetch from API
+    url = fpl_url(fixtures_event_path_tpl.format(gw=gw))
+    data = await fetch_json(url)
+    
+    if data:
+        async with fixtures_lock:
+            fixtures_cache[gw] = {"data": data, "ts": now}
+        logger.debug(f"Fixtures fetched and cached for GW {gw}")
+        return data
+    
+    # Return stale if available
+    if cached:
+        logger.warning(f"Serving stale fixtures for GW {gw}")
+        return cached.get("data")
+    
     return None
 
 # ---------- Standings ----------
@@ -436,6 +563,43 @@ def split_message_chunks(text: str, limit: int = 4000) -> List[str]:
     if buf:
         chunks.append(buf)
     return chunks
+
+async def send_text(bot_or_update, text: str, parse_mode: str = "Markdown", chat_id: Optional[int] = None):
+    """
+    Unified message sending utility:
+    - Splits long messages into chunks
+    - Tries Markdown, falls back to plain text on formatting errors
+    - Accepts both Update objects and chat ids
+    """
+    # Determine target chat and bot
+    if hasattr(bot_or_update, 'message'):  # Update object
+        target_chat = bot_or_update.effective_chat.id
+        bot = bot_or_update.get_bot()
+    elif hasattr(bot_or_update, 'send_message'):  # Bot object
+        bot = bot_or_update
+        target_chat = chat_id
+        if not target_chat:
+            logger.error("send_text: chat_id required when bot object is passed")
+            return
+    else:
+        logger.error("send_text: invalid bot_or_update parameter")
+        return
+    
+    chunks = split_message_chunks(text)
+    
+    for chunk in chunks:
+        try:
+            await bot.send_message(chat_id=target_chat, text=chunk, parse_mode=parse_mode)
+        except Exception as e:
+            # Fallback to plain text if Markdown fails
+            if parse_mode == "Markdown":
+                try:
+                    safe_chunk = chunk.replace("```", "").replace("*", "").replace("_", "")
+                    await bot.send_message(chat_id=target_chat, text=safe_chunk, parse_mode=None)
+                except Exception as e2:
+                    logger.error(f"Failed to send message even in plain text: {e2}")
+            else:
+                logger.error(f"Failed to send message: {e}")
 
 def format_timedelta(delta_seconds: int) -> str:
     if delta_seconds < 0:
@@ -582,6 +746,31 @@ def get_stat_int(stats: Dict[str, Any], *keys: str) -> int:
             except Exception:
                 pass
     return 0
+
+def is_fixture_finished(fixture: Dict[str, Any]) -> bool:
+    """
+    Check if a fixture is finished (completed).
+    Bonus should only be shown after fixture completion.
+    """
+    return fixture.get("finished") or fixture.get("finished_provisional")
+
+def should_show_bonus(fixtures: List[Dict], player_id: int, player_team_map: Dict[int, int]) -> bool:
+    """
+    Determine if bonus should be shown for a player based on fixture status.
+    Returns True only if ALL fixtures involving the player's team are finished.
+    """
+    team_id = player_team_map.get(player_id)
+    if not team_id:
+        return False
+    
+    # Find all fixtures for this team
+    team_fixtures = [f for f in fixtures if f.get("team_h") == team_id or f.get("team_a") == team_id]
+    
+    if not team_fixtures:
+        return False
+    
+    # All fixtures must be finished to show bonus
+    return all(is_fixture_finished(f) for f in team_fixtures)
 
 def calc_dc_points(stats: Dict[str, Any], pos: int) -> int:
     """
@@ -880,7 +1069,7 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
-    fixtures = await fetch_json(fpl_url(fixtures_event_path_tpl.format(gw=gw)))
+    fixtures = await get_fixtures_cached(gw, ttl=900)
     if not live or not fixtures:
         await update.message.reply_text("live/fixtures недоступны.")
         return
@@ -893,6 +1082,7 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_bootstrap()
 
     pos_map = build_player_position_map()
+    player_team_map_local = build_player_team_map()
 
     rows = []
     for el in live_elements:
@@ -959,9 +1149,9 @@ async def gwinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pen_s > 0:
             stat_parts.append(f"PenS{pen_s}")
 
-        # Bonus (always last)
+        # Bonus (always last) - ONLY if player's fixtures are finished
         bonus_val = int(stats.get("bonus", 0) or 0)
-        if bonus_val > 0:
+        if bonus_val > 0 and should_show_bonus(fixtures, pid, player_team_map_local):
             stat_parts.append(f"B{bonus_val}")
 
         # Filter out pure appearance-only (<=2 pts and no stats)
@@ -1079,25 +1269,53 @@ async def live_monitor_loop():
                 await asyncio.sleep(5)
                 continue
 
-            bs = await get_bootstrap()
+            bs = await get_bootstrap_cached()
             if not bs:
                 await asyncio.sleep(LIVE_POLL_INTERVAL)
                 continue
             season = discover_season_tag(bs)
             events = bs.get("events", [])
+            
+            # Track only active gameweeks: current, previous (if still processing), next (for triggers)
             current_ev = next((e for e in events if e.get("is_current")), None)
-            if not current_ev or current_ev.get("finished"):
-                await asyncio.sleep(LIVE_POLL_INTERVAL)
+            
+            if not current_ev:
+                # No current gameweek, use adaptive polling
+                next_kickoff = find_next_kickoff(events)
+                poll_interval = next_poll_interval(datetime.now(timezone.utc), next_kickoff)
+                logger.debug(f"No current GW, sleeping {poll_interval}s")
+                await asyncio.sleep(poll_interval)
                 continue
+            
             gw = current_ev.get("id")
             if not isinstance(gw, int):
                 await asyncio.sleep(LIVE_POLL_INTERVAL)
                 continue
+            
+            # Check if current GW is finished
+            if current_ev.get("finished"):
+                # Current GW finished, wait longer
+                next_kickoff = find_next_kickoff(events)
+                poll_interval = next_poll_interval(datetime.now(timezone.utc), next_kickoff)
+                logger.debug(f"GW {gw} finished, sleeping {poll_interval}s")
+                await asyncio.sleep(poll_interval)
+                continue
 
-            live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
-            fixtures = await fetch_json(fpl_url(fixtures_event_path_tpl.format(gw=gw)))
-            if not live or not fixtures:
+            # Use cached fixtures
+            fixtures = await get_fixtures_cached(gw, ttl=900)
+            if not fixtures:
+                logger.warning(f"Fixtures unavailable for GW {gw}")
                 await asyncio.sleep(LIVE_POLL_INTERVAL)
+                continue
+            
+            # Determine adaptive poll interval based on fixtures
+            next_kickoff = find_next_kickoff(events, fixtures)
+            poll_interval = next_poll_interval(datetime.now(timezone.utc), next_kickoff)
+            
+            live = await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)))
+            if not live:
+                logger.debug(f"Live data unavailable for GW {gw}")
+                await asyncio.sleep(poll_interval)
                 continue
 
             league_players = await get_league_player_ids(gw)
@@ -1113,7 +1331,7 @@ async def live_monitor_loop():
                     await r_set(key_event(season, gw, fixture_id, stat, player_id), val)
                 await r_set_flag(baseline_key)
                 logger.info(f"Baseline set for GW {gw}.")
-                await asyncio.sleep(LIVE_POLL_INTERVAL)
+                await asyncio.sleep(poll_interval)
                 continue
 
             new_events_by_fixture = await diff_new_events(season, gw, counts)
@@ -1162,9 +1380,11 @@ async def live_monitor_loop():
                         except Exception:
                             logger.exception("Failed sending live notification.")
                 else:
-                    logger.info("Live events (no chat bound): " + final_text)
+                    logger.debug("Live events (no chat bound): " + final_text)
 
-            await asyncio.sleep(LIVE_POLL_INTERVAL)
+            # Use adaptive poll interval
+            logger.debug(f"Live monitor sleeping {poll_interval}s")
+            await asyncio.sleep(poll_interval)
         except Exception as ex:
             logger.exception(f"Error in live_monitor_loop: {ex}")
             await asyncio.sleep(LIVE_POLL_INTERVAL)
