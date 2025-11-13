@@ -1,16 +1,15 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# Variant A diagnostic revision:
-# - /players_pts -> /players, /gwpoints -> /gw (already done earlier)
-# - Added diagnostic commands: /ping (always replies), /debug (owner only)
-# - Expanded is_authorized(): logs decisions, temporarily ALLOW private users if membership check fails (to diagnose issues)
-# - Added detailed logging inside safe_command wrapper for every incoming command
-# - Keeps existing architecture: manual initialize/start + updater.start_polling + stop_event
-# - Global Redis lock retained (fpl:bot:lock)
-# - Webhook is deleted automatically in polling mode (USE_WEBHOOK=0)
-# - If USE_WEBHOOK=1 you must implement an external webhook receiver (not included)
-# - Squid Game final report includes cycle/start GW
-# - Players table features & sorting improvements preserved
-# - Center alignment & month table formatting retained
+# Full version with restored live event processing:
+# - Command renames: /players_pts -> /players, /gwpoints -> /gw
+# - Fixed command scopes (default, private, groups, admins)
+# - Full live monitor logic restored (goals, assists, VAR, OG, PM/PS, cards, DC, CS subbed, final summaries)
+# - Squid final report shows cycle and start GW
+# - Manager name fallback + Redis cache for Squid
+# - Text cache for /rank and /players
+# - Global Redis lock + automatic webhook delete for polling to avoid getUpdates Conflict
+# - Diagnostic commands: /ping and /debug (owner only)
+# - Centered tables, truncated names, ownership tie-break, compact tokens (G,A,PM,PS,S without “1”)
+# - Silent replies for commands; auto notifications for live events
 
 import os
 import json
@@ -167,6 +166,29 @@ picks_semaphore = asyncio.Semaphore(PICKS_CONCURRENCY)
 BOT_LOCK_KEY = os.environ.get("BOT_LOCK_KEY", "fpl:bot:lock")
 BOT_LOCK_TTL = int(os.environ.get("BOT_LOCK_TTL", "1800"))
 
+# ===== HTTP helper =====
+async def fetch_json(url: str, timeout: float = 15.0, attempts: int = 3,
+                     extra_headers: Optional[Dict[str,str]]=None, return_response: bool=False):
+    headers = dict(FPL_BASE_HEADERS)
+    if extra_headers: headers.update(extra_headers)
+    for attempt in range(1, attempts+1):
+        await asyncio.sleep(random.uniform(0.02,0.06))
+        try:
+            async with fpl_semaphore:
+                resp = await http_client.get(url, headers=headers, timeout=timeout)
+            if return_response: return resp
+            if resp.status_code==200:
+                try: return resp.json()
+                except Exception: return None
+            if resp.status_code in (403,429) or 500<=resp.status_code<600:
+                if attempt<attempts:
+                    await asyncio.sleep(min(2**attempt,8)); continue
+            return None
+        except Exception:
+            if attempt<attempts:
+                await asyncio.sleep(min(2**attempt,8))
+    return None
+
 # ===== Caches =====
 bootstrap_path="/api/bootstrap-static/"
 league_path_tpl="/api/leagues-classic/{league_id}/standings/?page_standings={page}"
@@ -202,7 +224,7 @@ TEAM_SHORT_MAP: Dict[int,str]={}
 NAME_TO_ELEMENT_ID: Dict[str,int]={}
 
 _league_players_cache: Dict[int,Tuple[float,Set[int]]]={}
-_league_player_pick_counts: Dict[int, Tuple[float, Dict[int,int]]] = {}
+_league_player_pick_counts: Dict[int, Tuple[float, Dict[int,int]]] = {}  # gw -> (ts, {pid: count})
 
 _second_yellow_processed:set=set()
 _red_card_processed:set=set()
@@ -269,7 +291,7 @@ def cache_set_text(feature: str, sig: str, text: str, ttl: int):
         except Exception: pass
     _text_cache_mem[feature]=rec
 
-# ===== Authorization (diagnostic version) =====
+# ===== Authorization (diagnostic-friendly) =====
 async def is_authorized(update: Update) -> bool:
     u = update.effective_user
     c = update.effective_chat
@@ -289,7 +311,6 @@ async def is_authorized(update: Update) -> bool:
             logger.debug(f"Auth private: user={u.id} membership={ok} status={member.status}")
             return ok
         except Exception as e:
-            # Temporarily allow to diagnose (remove after stable)
             logger.warning(f"Auth private: get_chat_member failed {e}; ALLOW user {u.id}")
             return True
     logger.debug(f"Auth: denied user={u.id} chat={c.id} type={c.type}")
@@ -327,7 +348,8 @@ def manager_name(entry:int)->str:
 def init_redis():
     global redis_client
     if Redis is None: return
-    try: redis_client=Redis.from_env()
+    try:
+        redis_client=Redis.from_env()
     except Exception as e:
         logger.warning("Redis init failed: %s", e)
         redis_client=None
@@ -724,7 +746,7 @@ def parse_deadline(dt_str:str)->Optional[datetime]:
 def format_minute_str(minutes:int,fid:int,fixture_max_minute:Dict[int,int])->str:
     return f"{minutes}'"
 
-# ===== Price parsing / ownership features (unchanged from prior revision) =====
+# ===== Price Parsing (Enhanced) =====
 CATEGORY_ALIASES={
     "already reached target":"Already reached target",
     "projected to reach today":"Projected to reach target",
@@ -1058,18 +1080,22 @@ async def rank_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not bs: return
     results=await get_league_results_cached(LEAGUE_ID)
     if not results: return
+
     sig=f"{standings_cache_ts or 0}|{len(results)}"
     cached=cache_get_text("rank")
     if cached and cached.get("sig")==sig and isinstance(cached.get("text"),str):
         await reply_silent(update, cached["text"], parse_mode="Markdown"); return
+
     sorted_rows=sorted(results,key=lambda r:r.get("rank",10**9))
     table_rows=[]
     for i,r in enumerate(sorted_rows, start=1):
         table_rows.append([str(i), r.get('player_name',''), str(r.get('total'))])
+
     headers=["#","Manager","Pts"]
     header_line, body_lines, width = build_centered_table(headers, table_rows)
     title=(LEAGUE_NAME or 'League').center(width)
     upd=format_updated_line(update.effective_user.id, await get_last_fpl_update_dt(), width)
+
     text="\n".join([title, upd, "```", header_line, *body_lines, "```"])
     cache_set_text("rank", sig, text, ttl=300)
     await reply_silent(update, text, parse_mode="Markdown")
@@ -1119,6 +1145,7 @@ async def players_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not bs: return
     gw=int(context.args[0]) if context.args and context.args[0].isdigit() else get_current_or_next_gw(bs)
     if not isinstance(gw,int): return
+
     last_update=await get_last_fpl_update_dt()
     sig=f"{gw}|{int(last_update.timestamp())}"
     feature_key=f"players:{gw}"
@@ -1130,11 +1157,14 @@ async def players_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text(chunk.replace("```",""), disable_notification=True)
         return
+
     await get_league_results_cached(LEAGUE_ID)
     counts_map=await get_league_player_pick_counts_cached(gw)
+
     live=await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)), timeout=10, attempts=2)
     if not live: return
     league_players=await get_league_player_ids_cached(gw)
+
     rows_raw=[]
     for el in live.get("elements",[]):
         pid=el.get("id")
@@ -1142,7 +1172,10 @@ async def players_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         s=el.get("stats",{}) or {}
         pos=PLAYER_POS_MAP.get(pid,0)
         total=int(s.get("total_points",0) or 0)
+
         tokens=format_stats_tokens(s,pos)
+
+        # DC flag (non-GK)
         dc_show=False
         if pos!=1 and (dc_threshold_met(s,pos) or has_any_dc(s)):
             dc_show=True
@@ -1158,20 +1191,27 @@ async def players_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
                     dc_show=True
         if dc_show:
             tokens.insert(0,"DC")
+
         if not tokens and total<=2:
             continue
+
         nm = truncate_name(PLAYER_NAME_MAP.get(pid,f"P{pid}"), 12)
         own = counts_map.get(pid, 0)
         rows_raw.append((pid, nm, " ".join(tokens), total, own))
+
     if not rows_raw: return
+    # Sort by points desc, then by league ownership desc, then by name
     rows_raw.sort(key=lambda x: (-x[3], -x[4], x[1].lower()))
+
     headers=["#","Player","Stats","Pts"]
     table_rows=[]
     for i, (_pid, nm, stats, pts, _own) in enumerate(rows_raw, start=1):
         table_rows.append([str(i), nm, stats, str(pts)])
+
     header_line, body_lines, width = build_centered_table(headers, table_rows)
     title = f"{(LEAGUE_NAME or 'League')} — GW {gw}".center(width)
     upd = format_updated_line(update.effective_user.id, last_update, width)
+
     legend=[
         "Legend:",
         "G - goal",
@@ -1186,8 +1226,10 @@ async def players_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "PS - penalty saved",
         "B - bonus"
     ]
+
     text = "\n".join([title, upd, "```", header_line, *body_lines, "```", *legend])
     cache_set_text(feature_key, sig, text, ttl=120)
+
     for chunk in split_message_chunks(text):
         try:
             await update.message.reply_text(chunk, parse_mode="Markdown", disable_notification=True)
@@ -1210,13 +1252,16 @@ async def gw_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     got=await gather_limited([one(r) for r in results if isinstance(r.get("entry"),int)], PICKS_CONCURRENCY)
     entries=[e for e in got if isinstance(e,tuple)]
     entries.sort(key=lambda x:(-(x[1] if isinstance(x[1],int) else -1), x[0].lower()))
+
     headers=["#","Manager","Pts"]
     table_rows=[]
     for i,(name, pts) in enumerate(entries, start=1):
         table_rows.append([str(i), name, str(pts if isinstance(pts,int) and pts>=0 else "n/a")])
+
     header_line, body_lines, width = build_centered_table(headers, table_rows)
     title=f"{(LEAGUE_NAME or 'League')} — GW {gw}".center(width)
     upd=format_updated_line(update.effective_user.id, await get_last_fpl_update_dt(), width)
+
     text="\n".join([title, upd, "```", header_line, *body_lines, "```"])
     await reply_silent(update, text, parse_mode="Markdown")
 
@@ -1275,14 +1320,17 @@ async def month_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     rows,played,remaining=await month_points_for(results,events,cal_m,cal_y)
     month_name=RUS_MONTH.get(cal_m,f"M{cal_m}")
     league_name=LEAGUE_NAME or "League"
+
     headers=["#","Manager","Pts"]
     table_rows=[]
     for i,(eid,_nm,pts) in enumerate(rows[:10], start=1):
         table_rows.append([str(i), manager_name(eid), str(pts)])
+
     header_line, body_lines, width = build_centered_table(headers, table_rows)
     title=f"{league_name} — {month_name}".center(width)
     info_line=f"Сыграно: {played} осталось: {remaining}"
     upd=format_updated_line(update.effective_user.id, await get_last_fpl_update_dt(), width)
+
     text="\n".join([title, info_line, upd, "```", header_line, *body_lines, "```"])
     await reply_silent(update, text, parse_mode="Markdown")
 
@@ -1332,7 +1380,8 @@ async def ensure_entry_names(entries: List[int]):
             ENTRY_TO_MANAGER_NAME[e] = nm
         else:
             missing.append(e)
-    if not missing: return
+    if not missing:
+        return
     async def fetch_name(eid: int):
         data = await fetch_json(fpl_url(f"/api/entry/{eid}/"), timeout=10, attempts=2)
         if not isinstance(data, dict): return
@@ -1382,6 +1431,7 @@ async def squid_rules_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 @safe_command
 async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    # Prefer the latest final report
     if redis_client:
         try:
             rep=redis_client.get(SQUID_LAST_REPORT_KEY)
@@ -1391,11 +1441,14 @@ async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE)
         except Exception: pass
     if LAST_SQUID_REPORT_TEXT:
         await reply_silent(update, LAST_SQUID_REPORT_TEXT); return
+
+    # Fallback: live status with names ensured
     await get_league_results_cached(LEAGUE_ID)
     if not squid_active_state:
         await reply_silent(update, "Цикл не активен."); return
     alive=squid_active_state.get("players_alive",[]) or []
     await ensure_entry_names(alive)
+
     start_gw=squid_active_state["start_gw"]
     current_gw=squid_active_state["current_gw"]
     lines=[
@@ -1444,6 +1497,7 @@ async def process_squid_after_gw_finish(finished_gw:int):
         winner=passed[0] if passed else max(alive,key=lambda e:pmap.get(e,0))
     cycle=squid_active_state.get("cycle",1)
     start_gw=squid_active_state.get("start_gw")
+    # Include cycle number and start GW in header line
     lines=[f"Squid Game — цикл {cycle} (старт GW {start_gw}) — GW {finished_gw} завершён. Среднее: {avg:.2f}"]
     if winner:
         await ensure_entry_names([winner])
@@ -1506,9 +1560,7 @@ async def prices_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
                 prices_cache_data=obj; prices_cache_ts=obj.get("ts")
         except Exception: pass
     data=await get_prices_data()
-    if not data.get("ok"):
-        await reply_silent(update, "Нет данных цен.")
-        return
+    if not data.get("ok"): await reply_silent(update, "Нет данных цен."); return
     parsed=data["parsed"]
     lines=format_prices_mobile(parsed)
     await reply_silent(update, "\n".join(lines))
@@ -1519,6 +1571,7 @@ async def ensure_update_mode(bot, use_webhook: bool, webhook_url: Optional[str] 
         info = await bot.get_webhook_info()
     except Exception:
         info = None
+
     if not use_webhook:
         try:
             if info and info.url:
@@ -1527,6 +1580,7 @@ async def ensure_update_mode(bot, use_webhook: bool, webhook_url: Optional[str] 
         except Exception as e:
             logger.warning("delete_webhook failed: %s", e)
         return
+
     if webhook_url:
         try:
             if (not info) or (info and info.url != webhook_url):
@@ -1550,14 +1604,16 @@ def acquire_global_lock() -> bool:
         return True
 
 def refresh_global_lock():
-    if not redis_client: return
+    if not redis_client:
+        return
     try:
         redis_client.expire(BOT_LOCK_KEY, BOT_LOCK_TTL)
     except Exception:
         pass
 
 def release_global_lock():
-    if not redis_client: return
+    if not redis_client:
+        return
     try:
         val = redis_client.get(BOT_LOCK_KEY)
         if _ensure_str(val) == str(os.getpid()):
@@ -1566,7 +1622,7 @@ def release_global_lock():
     except Exception:
         pass
 
-# ===== Live monitor loop (unchanged logic) =====
+# ===== Live Monitor Loop (FULL) =====
 async def live_monitor_loop():
     global _current_gw,last_live_tick_time,last_active_fixtures_count
     while not stop_event.is_set():
@@ -1577,16 +1633,18 @@ async def live_monitor_loop():
             season=discover_season_tag(bs)
             last_live_tick_time=time.time()
             await measure_redis_latency()
-            # Squid post-processing
+
+            # Squid post-processing on finished events
             for e in bs.get("events",[]):
                 if e.get("finished") and isinstance(e.get("id"),int):
                     await process_squid_after_gw_finish(e.get("id"))
+
             current_ev=next((e for e in bs.get("events",[]) if e.get("is_current")),None)
             if not current_ev or current_ev.get("finished"):
                 await asyncio.sleep(LIVE_POLL_INTERVAL); continue
             gw=current_ev.get("id")
+
             if _current_gw!=gw:
-                logger.info(f"Switching to current GW {gw}")
                 _current_gw=gw
                 _second_yellow_processed.clear()
                 _red_card_processed.clear()
@@ -1595,25 +1653,31 @@ async def live_monitor_loop():
                 _cs_subbed_sent.clear()
                 _fixture_summary_sent.clear()
                 _last_counts.clear()
+                # cleanup old picks cache
                 for (entry,g) in list(picks_cache.keys()):
                     if g < gw-1: del picks_cache[(entry,g)]
+
             fixtures=await get_fixtures_cached(gw)
             active=get_active_fixture_ids(fixtures)
             last_active_fixtures_count=len(active)
             if not active:
                 await asyncio.sleep(min(300,LIVE_POLL_INTERVAL*2))
                 continue
+
             live=await fetch_json(fpl_url(event_live_path_tpl.format(gw=gw)), timeout=10, attempts=2)
             if not live:
                 await asyncio.sleep(LIVE_POLL_INTERVAL); continue
+
             elements=live.get("elements",[])
             league_players=await get_league_player_ids_cached(gw)
             live_by_id={el.get("id"):el for el in elements if isinstance(el.get("id"),int)}
             fixture_index={fx.get("id"):fx for fx in fixtures if isinstance(fx.get("id"),int)}
+
             pos_pool={}; neg_pool={}
             player_state={}
             fixture_max_minute={}
             any_delta=False
+
             for pid,el in live_by_id.items():
                 if pid not in league_players: continue
                 pos=PLAYER_POS_MAP.get(pid,0)
@@ -1639,9 +1703,10 @@ async def live_monitor_loop():
                             tgt.setdefault(fid,{}).setdefault(ident,[])
                             tgt[fid][ident].extend([pid]*abs(delta))
                         _last_counts[key]=value
+
             if not any_delta:
                 await asyncio.sleep(LIVE_POLL_INTERVAL); continue
-            # (Event processing as previous)
+
             for fid in sorted(set(list(pos_pool.keys())+list(neg_pool.keys()))):
                 fx=fixture_index.get(fid,{})
                 if not fx: continue
@@ -1649,11 +1714,16 @@ async def live_monitor_loop():
                 base_a=fx.get("team_a_score") or 0
                 team_h=fx.get("team_h"); team_a=fx.get("team_a")
                 local_h=base_h; local_a=base_a
+
                 def header_line():
                     return f"{TEAM_SHORT_MAP.get(team_h,'T?')} {local_h}-{local_a} {TEAM_SHORT_MAP.get(team_a,'T?')}"
+
                 def get_state(pid:int)->Tuple[int,int,int]:
                     return player_state.get((fid,pid),(PLAYER_POS_MAP.get(pid,0),0,0))
+
                 update_msgs=[]
+
+                # Assist reassignment
                 if "assists" in neg_pool.get(fid,{}) and "assists" in pos_pool.get(fid,{}):
                     while neg_pool[fid]["assists"] and pos_pool[fid]["assists"]:
                         from_pid=neg_pool[fid]["assists"].pop(0)
@@ -1667,6 +1737,8 @@ async def live_monitor_loop():
                             f"{header_line()}\n{m} Update: Assist reassigned - {PLAYER_NAME_MAP.get(from_pid)} {format_points(-pts_from)}, total ({tot_from}).\n"
                             f"Assist - {PLAYER_NAME_MAP.get(to_pid)} {format_points(pts_to)}, total ({tot_to})."
                         )
+
+                # Penalty retake sequence: remove PS and PM, add GS
                 while neg_pool.get(fid,{}).get("penalties_missed") and neg_pool.get(fid,{}).get("penalties_saved") and pos_pool.get(fid,{}).get("goals_scored"):
                     m_pid=neg_pool[fid]["penalties_missed"].pop(0)
                     s_pid=neg_pool[fid]["penalties_saved"].pop(0)
@@ -1686,6 +1758,8 @@ async def live_monitor_loop():
                         f"Penalty missed removed - {PLAYER_NAME_MAP.get(m_pid)} {format_points(-pts_m)}, total ({tot_m}).\n"
                         f"Goal - {PLAYER_NAME_MAP.get(g_pid)} {format_points(pts_g)}, total ({tot_g})."
                     )
+
+                # Negative cancellations
                 for ident,label,base_event in [
                     ("goals_scored","Update: Goal cancelled (VAR)","Goal"),
                     ("assists","Update: Assist cancelled","Assist"),
@@ -1701,18 +1775,24 @@ async def live_monitor_loop():
                         m=format_minute_str(m_p,fid,fixture_max_minute)
                         update_msgs.append(f"{header_line()}\n{m} {label} - {PLAYER_NAME_MAP.get(pid)} {format_points(-pts)}, total ({tot_p}).")
                         neg_pool[fid][ident].remove(pid)
+
+                # DC removal when previously awarded
                 for pid in list(PLAYER_TEAM_MAP.keys()):
-                    if (fid,pid) in player_state and ns_key(_current_gw,fid,pid) in _dc_awarded:
+                    if (fid,pid) in player_state and ns_key(gw,fid,pid) in _dc_awarded:
                         pos_d,m_d,tot_d=get_state(pid)
                         stats_overall=live_by_id.get(pid,{}).get("stats",{}) or {}
-                        if not (dc_threshold_met(stats_overall,pos_d) or has_any_dc(stats_overall)) and ns_key(_current_gw,fid,pid) not in _dc_removed_sent:
-                            _dc_removed_sent.add(ns_key(_current_gw,fid,pid))
+                        if not (dc_threshold_met(stats_overall,pos_d) or has_any_dc(stats_overall)) and ns_key(gw,fid,pid) not in _dc_removed_sent:
+                            _dc_removed_sent.add(ns_key(gw,fid,pid))
                             pts=event_points_for(pos_d,"DC")
                             m=format_minute_str(m_d,fid,fixture_max_minute)
                             update_msgs.append(f"{header_line()}\n{m} Update: DC removed - {PLAYER_NAME_MAP.get(pid)} {format_points(-pts)}, total ({tot_d}).")
+
                 for um in update_msgs:
-                    await send_once(um, season, _current_gw)
+                    await send_once(um, season, gw)
+
                 pos_events=pos_pool.get(fid,{})
+
+                # Goals with (optional) assist from same team
                 goals=list(pos_events.get("goals_scored",[]))
                 assists=list(pos_events.get("assists",[]))
                 while goals:
@@ -1730,9 +1810,11 @@ async def live_monitor_loop():
                     if a_pid:
                         pos_a,_ma,tot_a=get_state(a_pid)
                         pts_a=event_points_for(pos_a,"Assist")
-                        await send_once(f"{header_line()}\n{m} Goal - {PLAYER_NAME_MAP.get(gid)} {format_points(pts_g)}, total ({tot_g}).\nAssist - {PLAYER_NAME_MAP.get(a_pid)} {format_points(pts_a)}, total ({tot_a}).", season, _current_gw)
+                        await send_once(f"{header_line()}\n{m} Goal - {PLAYER_NAME_MAP.get(gid)} {format_points(pts_g)}, total ({tot_g}).\nAssist - {PLAYER_NAME_MAP.get(a_pid)} {format_points(pts_a)}, total ({tot_a}).", season, gw)
                     else:
-                        await send_once(f"{header_line()}\n{m} Goal - {PLAYER_NAME_MAP.get(gid)} {format_points(pts_g)}, total ({tot_g}).", season, _current_gw)
+                        await send_once(f"{header_line()}\n{m} Goal - {PLAYER_NAME_MAP.get(gid)} {format_points(pts_g)}, total ({tot_g}).", season, gw)
+
+                # Own goals; try to pair an assist from opposite team
                 own_goals=list(pos_events.get("own_goals",[]))
                 while own_goals:
                     ogid=own_goals.pop(0)
@@ -1749,9 +1831,11 @@ async def live_monitor_loop():
                     if a_pid:
                         pos_a,_ma,tot_a=get_state(a_pid)
                         pts_a=event_points_for(pos_a,"Assist")
-                        await send_once(f"{header_line()}\n{m} Own goal - {PLAYER_NAME_MAP.get(ogid)} {format_points(pts_og)}, total ({tot_og}).\nAssist - {PLAYER_NAME_MAP.get(a_pid)} {format_points(pts_a)}, total ({tot_a}).", season, _current_gw)
+                        await send_once(f"{header_line()}\n{m} Own goal - {PLAYER_NAME_MAP.get(ogid)} {format_points(pts_og)}, total ({tot_og}).\nAssist - {PLAYER_NAME_MAP.get(a_pid)} {format_points(pts_a)}, total ({tot_a}).", season, gw)
                     else:
-                        await send_once(f"{header_line()}\n{m} Own goal - {PLAYER_NAME_MAP.get(ogid)} {format_points(pts_og)}, total ({tot_og}).", season, _current_gw)
+                        await send_once(f"{header_line()}\n{m} Own goal - {PLAYER_NAME_MAP.get(ogid)} {format_points(pts_og)}, total ({tot_og}).", season, gw)
+
+                # Penalties missed/saved (pair if both present)
                 pens_missed=list(pos_events.get("penalties_missed",[]))
                 pens_saved=list(pos_events.get("penalties_saved",[]))
                 while pens_missed and pens_saved:
@@ -1761,37 +1845,41 @@ async def live_monitor_loop():
                     pts_pm=event_points_for(pos_pm,"Penalty missed")
                     pts_ps=event_points_for(pos_ps,"Penalty saved")
                     m=format_minute_str(m_pm,fid,fixture_max_minute)
-                    await send_once(f"{header_line()}\n{m} Penalty missed - {PLAYER_NAME_MAP.get(pm)} {format_points(pts_pm)}, total ({tot_pm}).\n{m} Penalty saved - {PLAYER_NAME_MAP.get(ps)} {format_points(pts_ps)}, total ({tot_ps}).", season, _current_gw)
+                    await send_once(f"{header_line()}\n{m} Penalty missed - {PLAYER_NAME_MAP.get(pm)} {format_points(pts_pm)}, total ({tot_pm}).\n{m} Penalty saved - {PLAYER_NAME_MAP.get(ps)} {format_points(pts_ps)}, total ({tot_ps}).", season, gw)
                 for pm in pens_missed:
                     pos_pm,m_pm,tot_pm=get_state(pm)
                     pts_pm=event_points_for(pos_pm,"Penalty missed")
                     m=format_minute_str(m_pm,fid,fixture_max_minute)
-                    await send_once(f"{header_line()}\n{m} Penalty missed - {PLAYER_NAME_MAP.get(pm)} {format_points(pts_pm)}, total ({tot_pm}).", season, _current_gw)
+                    await send_once(f"{header_line()}\n{m} Penalty missed - {PLAYER_NAME_MAP.get(pm)} {format_points(pts_pm)}, total ({tot_pm}).", season, gw)
                 for ps in pens_saved:
                     pos_ps,m_ps,tot_ps=get_state(ps)
                     pts_ps=event_points_for(pos_ps,"Penalty saved")
                     m=format_minute_str(m_ps,fid,fixture_max_minute)
-                    await send_once(f"{header_line()}\n{m} Penalty saved - {PLAYER_NAME_MAP.get(ps)} {format_points(pts_ps)}, total ({tot_ps}).", season, _current_gw)
+                    await send_once(f"{header_line()}\n{m} Penalty saved - {PLAYER_NAME_MAP.get(ps)} {format_points(pts_ps)}, total ({tot_ps}).", season, gw)
+
+                # Cards: distinguish second yellow -> red
                 yellow_totals={}
                 for (kgw,kfid,kpid,ident), val in _last_counts.items():
-                    if kgw==_current_gw and kfid==fid and ident=="yellow_cards":
+                    if kgw==gw and kfid==fid and ident=="yellow_cards":
                         yellow_totals[kpid]=val
                 reds=list(pos_events.get("red_cards",[]))
                 for pid_r in reds:
                     pos_r,m_r,tot_r=get_state(pid_r)
                     m=format_minute_str(m_r,fid,fixture_max_minute)
-                    key=ns_key(_current_gw,fid,pid_r)
+                    key=ns_key(gw,fid,pid_r)
                     yc_total=yellow_totals.get(pid_r,0)
                     if yc_total>=2:
                         if key not in _second_yellow_processed:
                             _second_yellow_processed.add(key)
                             pts=event_points_for(pos_r,"Second yellow → red")
-                            await send_once(f"{header_line()}\n{m} Second yellow → red - {PLAYER_NAME_MAP.get(pid_r)} {format_points(pts)}, total ({tot_r}).", season, _current_gw)
+                            await send_once(f"{header_line()}\n{m} Second yellow → red - {PLAYER_NAME_MAP.get(pid_r)} {format_points(pts)}, total ({tot_r}).", season, gw)
                     else:
                         if key not in _red_card_processed:
                             _red_card_processed.add(key)
                             pts=event_points_for(pos_r,"Red card")
-                            await send_once(f"{header_line()}\n{m} Red card - {PLAYER_NAME_MAP.get(pid_r)} {format_points(pts)}, total ({tot_r}).", season, _current_gw)
+                            await send_once(f"{header_line()}\n{m} Red card - {PLAYER_NAME_MAP.get(pid_r)} {format_points(pts)}, total ({tot_r}).", season, gw)
+
+                # Clean sheet for DEF/GK subbed off at/after 60', conceded=0
                 for (pfid,pid),(pos_c,m_c,tot_c) in list(player_state.items()):
                     if pfid!=fid or pos_c==4: continue
                     if fx.get("finished"): continue
@@ -1802,25 +1890,27 @@ async def live_monitor_loop():
                     if team_id==team_h: conceded=fx.get("team_a_score") or 0
                     elif team_id==team_a: conceded=fx.get("team_h_score") or 0
                     if conceded!=0: continue
-                    cs_total=_last_counts.get((_current_gw,fid,pid,"clean_sheets"),0)
+                    cs_total=_last_counts.get((gw,fid,pid,"clean_sheets"),0)
                     if cs_total<=0:
                         stats_overall=live_by_id.get(pid,{}).get("stats",{}) or {}
                         cs_total=int(stats_overall.get("clean_sheets",0) or 0)
-                        _last_counts[(_current_gw,fid,pid,"clean_sheets")]=cs_total
+                        _last_counts[(gw,fid,pid,"clean_sheets")]=cs_total
                     if cs_total<=0: continue
                     maxm=fixture_max_minute.get(fid,m_c)
                     if m_c>=maxm: continue
-                    key=ns_key(_current_gw,fid,pid)
+                    key=ns_key(gw,fid,pid)
                     if key in _cs_subbed_sent: continue
                     pts=event_points_for(pos_c,"Clean sheet")
                     if pts<=0: continue
                     _cs_subbed_sent.add(key)
                     m=format_minute_str(m_c,fid,fixture_max_minute)
-                    await send_once(f"{header_line()}\n{m} Clean sheet (subbed off) - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({tot_c}).", season, _current_gw)
+                    await send_once(f"{header_line()}\n{m} Clean sheet (subbed off) - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({tot_c}).", season, gw)
+
+                # DC award (or heuristic)
                 for (pfid,pid),(pos_d,m_d,tot_d) in list(player_state.items()):
                     if pfid!=fid: continue
                     if pos_d==1: continue
-                    key=ns_key(_current_gw,fid,pid)
+                    key=ns_key(gw,fid,pid)
                     if key in _dc_awarded: continue
                     el=live_by_id.get(pid,{})
                     stats_overall=el.get("stats",{}) or {}
@@ -1828,7 +1918,7 @@ async def live_monitor_loop():
                         _dc_awarded.add(key)
                         pts=event_points_for(pos_d,"DC")
                         m=format_minute_str(m_d,fid,fixture_max_minute)
-                        await send_once(f"{header_line()}\n{m} DC - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({tot_d}).", season, _current_gw)
+                        await send_once(f"{header_line()}\n{m} DC - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({tot_d}).", season, gw)
                     else:
                         total_pts=int(stats_overall.get("total_points",0) or 0)
                         base=compute_base_points(stats_overall,pos_d)
@@ -1837,12 +1927,14 @@ async def live_monitor_loop():
                             _dc_awarded.add(key)
                             pts=2
                             m=format_minute_str(m_d,fid,fixture_max_minute)
-                            await send_once(f"{header_line()}\n{m} DC (heuristic) - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({total_pts}).", season, _current_gw)
+                            await send_once(f"{header_line()}\n{m} DC (heuristic) - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({total_pts}).", season, gw)
+
+            # Fixture summaries when finished
             finished=[fx for fx in fixtures if fx.get("finished")]
             for fx in finished:
                 fid=fx.get("id")
                 if not isinstance(fid,int): continue
-                sum_key=f"{_current_gw}:{fid}"
+                sum_key=f"{gw}:{fid}"
                 if sum_key in _fixture_summary_sent: continue
                 team_h=fx.get("team_h"); team_a=fx.get("team_a")
                 hs=fx.get("team_h_score") or 0
@@ -1860,8 +1952,9 @@ async def live_monitor_loop():
                     lines=[header]
                     for i,(nm,pts) in enumerate(rows,1):
                         lines.append(f"{i}. {nm}: {pts}")
-                    await send_once("\n".join(lines), season, _current_gw)
+                    await send_once("\n".join(lines), season, gw)
                 _fixture_summary_sent.add(sum_key)
+
             await asyncio.sleep(LIVE_POLL_INTERVAL)
         except Exception as e:
             logger.warning("Live loop error: %s", e)
@@ -1895,7 +1988,7 @@ async def deadline_notifier():
             logger.warning("Deadline notifier error: %s", e)
             await asyncio.sleep(600)
 
-# ===== Setup bot commands =====
+# ===== Setup bot commands (scopes fixed) =====
 async def setup_bot_commands(bot):
     cmds=[
         BotCommand("help","Описание"),
@@ -1914,6 +2007,7 @@ async def setup_bot_commands(bot):
         BotCommand("ping","Ping"),
         BotCommand("debug","Debug (owner)")
     ]
+    # Clean previous commands in common scopes to avoid stale sets
     try:
         await bot.delete_my_commands(scope=BotCommandScopeDefault())
         await bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
@@ -1921,6 +2015,7 @@ async def setup_bot_commands(bot):
         await bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
     except Exception:
         pass
+    # Set commands for all main scopes (with RU locale)
     try:
         await bot.set_my_commands(cmds, scope=BotCommandScopeDefault(), language_code="ru")
         await bot.set_my_commands(cmds, scope=BotCommandScopeAllPrivateChats(), language_code="ru")
@@ -1936,9 +2031,12 @@ async def error_handler(update:object, context:ContextTypes.DEFAULT_TYPE):
 async def run_bot():
     global http_client, application
     init_redis()
+
+    # Global lock: ensure single instance
     if not acquire_global_lock():
         logger.error("Another bot instance is running (global lock). Exiting.")
         return
+
     try:
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=50)
         use_http2=ENABLE_HTTP2
@@ -1947,7 +2045,6 @@ async def run_bot():
         http_client=httpx.AsyncClient(http2=use_http2, limits=limits, timeout=20.0)
 
         application=Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
-        # Handlers
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("deadline", deadline_command))
         application.add_handler(CommandHandler("players", players_command))
@@ -1969,6 +2066,7 @@ async def run_bot():
         await application.initialize()
         await application.start()
 
+        # Ensure update mode matches USE_WEBHOOK
         WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE_URL")
         WEBHOOK_PATH = f"/telegram/{BOT_TOKEN}"
         WEBHOOK_URL = f"{WEBHOOK_BASE}{WEBHOOK_PATH}" if (USE_WEBHOOK and WEBHOOK_BASE) else None
@@ -1980,9 +2078,10 @@ async def run_bot():
         load_squid_from_redis()
 
         if USE_WEBHOOK:
-            logger.info("Bot running in WEBHOOK mode%s", f" ({WEBHOOK_URL})" if WEBHOOK_URL else "")
+            logger.info("Bot is running in WEBHOOK mode%s", f" at {WEBHOOK_URL}" if WEBHOOK_URL else "")
+            # Note: webhook receiver endpoint is not implemented here
         else:
-            logger.info("Bot running in POLLING mode, starting updater.start_polling()")
+            logger.info("Bot is running in POLLING mode")
             try:
                 await application.updater.start_polling()
                 logger.info("Polling started successfully")
@@ -1990,11 +2089,13 @@ async def run_bot():
                 logger.error("Conflict: another getUpdates consumer is running. Exiting.")
                 return
 
+        # Refresh global lock periodically
         async def _lock_refresher():
             while not stop_event.is_set():
                 refresh_global_lock()
-                await asyncio.sleep(max(10,BOT_LOCK_TTL//3))
+                await asyncio.sleep(max(10, BOT_LOCK_TTL // 3))
         asyncio.create_task(_lock_refresher())
+
         asyncio.create_task(live_monitor_loop())
         asyncio.create_task(deadline_notifier())
 
@@ -2016,8 +2117,7 @@ async def run_bot():
     finally:
         release_global_lock()
         try:
-            if http_client:
-                await http_client.aclose()
+            if http_client: await http_client.aclose()
         except Exception:
             pass
 
