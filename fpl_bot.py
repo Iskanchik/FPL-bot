@@ -1027,7 +1027,7 @@ async def deadline_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     now_local=now_utc+timedelta(hours=offset)
     left=int((local_dt-now_local).total_seconds())
     if left<0: left=0
-    d=left//86400; h=(left%86400)//3600); m=(left%3600)//60
+    d=left//86400; h=(left%86400)//3600; m=(left%3600)//60
     await reply_silent(update, f"Дедлайн GW {e.get('id')}: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({tz_name} UTC{offset:+d})\nОсталось: {d}д {h}ч {m}м")
 
 @safe_command
