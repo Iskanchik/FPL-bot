@@ -1,18 +1,15 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# FULL CODE (с учётом всех последних требований).
-# Изменения и особенности:
-# - Реальное имя лиги берётся из API standings (fallback "Zakynule Fantasy Vibe").
-# - /players_pts: показывает DC (Defensive Contribution) снова при выполнении порога.
-# - Сортировка /players_pts при равных очках: по убыванию частоты выбора в лиге (ownership count), затем по имени.
-# - /gwpoints и /players_pts: аргумент GW опционален.
-# - /month: локальная нумерация без "#", сыграно / осталось туров.
-# - Squid Game: локальная нумерация, очки тура, победитель цикла и перезапуск.
-# - Все таблицы адаптированы под телефон (узкие заголовки, выравнивание, моноширинные блоки).
-# - В таблицах добавлена строка "Обновлено: ..." с датой/временем по таймзоне пользователя.
-# - Price parser: многоисточниковый (JSON кандидаты → embedded JSON → regex fallback), фильтр ownership >= 1%.
-# - Исправлена ошибка смешивания naive/aware datetimes: везде используется datetime.now(timezone.utc).
-# - Live мониторинг оставлен полным (голы, ассисты, own goals, пенальти, карточки, CS, DC и финальные сводки).
-# - Добавлена вспомогательная функция format_minute_str (для совместимости), сейчас упрощённая.
+# FULL CODE (с учётом последних правок).
+# Основные изменения в этом коммите:
+# - "Обновлено" теперь показывает время последнего обновления Fantasy (через /api/event-status/), а не время запроса.
+# - "Обновлено" выводится ТОЛЬКО в таблицах: /rank, /gwpoints, /month, и стоит в самом конце заголовка (после таблицы).
+# - /players_pts: убран столбец Own; DC снова отображается в Stats при выполнении порога (и очки учитываются).
+# - /month: показываются только Top-10.
+# - /squid_status: диапазон завершённых GW корректен (до последнего завершённого; текущий GW не включаем в диапазон).
+# - /prices: формат вывода переработан под “Predicted Rises / Predicted Falls” с категориями
+#   "Already reached target", "Projected to reach target", "Others who will be close (by end of day)".
+#   Для игроков добавляется позиция и цена из bootstrap, если удалось найти по имени.
+# - Исправлен баг с naive/aware datetime: везде используем datetime.now(timezone.utc).
 
 import os
 import json
@@ -189,6 +186,7 @@ league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={p
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
 event_live_path_tpl = "/api/event/{gw}/live/"
 fixtures_event_path_tpl = "/api/fixtures/?event={gw}"
+event_status_path = "/api/event-status/"
 
 # ===== Caches / Globals =====
 bootstrap_cache: Dict[str, Any] = {}
@@ -215,6 +213,9 @@ PLAYER_NAME_MAP: Dict[int, str] = {}
 PLAYER_POS_MAP: Dict[int, int] = {}
 PLAYER_TEAM_MAP: Dict[int, int] = {}
 TEAM_SHORT_MAP: Dict[int, str] = {}
+
+# Name normalization -> element id
+NAME_TO_ELEMENT_ID: Dict[str, int] = {}
 
 _league_players_cache: Dict[int, Tuple[float, Set[int]]] = {}
 _league_player_pick_counts: Dict[int, Tuple[float, Dict[int,int]]] = {}
@@ -246,6 +247,11 @@ prices_cache_data: Optional[Dict[str, Any]] = None
 prices_cache_ts: Optional[float] = None
 PRICES_CACHE_TTL = 600
 PRICES_URL = "https://www.livefpl.net/prices"
+
+# Last FPL update cache
+_last_fpl_update_dt: Optional[datetime] = None
+_last_fpl_update_cache_ts: Optional[float] = None
+LAST_FPL_UPDATE_TTL = 60  # seconds
 
 # ===== Helpers =====
 async def gather_limited(coros: Iterable[Awaitable], limit: int) -> List[Any]:
@@ -363,14 +369,25 @@ async def get_bootstrap_cached() -> Optional[Dict]:
             return bootstrap_cache if bootstrap_cache else None
         return bootstrap_cache if bootstrap_cache else None
 
+def _norm_name(s: str) -> str:
+    return re.sub(r"[\s\.\-’'`]", "", (s or "").lower())
+
 def refresh_bootstrap_maps():
-    global PLAYER_NAME_MAP,PLAYER_POS_MAP,PLAYER_TEAM_MAP,TEAM_SHORT_MAP
+    global PLAYER_NAME_MAP,PLAYER_POS_MAP,PLAYER_TEAM_MAP,TEAM_SHORT_MAP, NAME_TO_ELEMENT_ID
     elements=bootstrap_cache.get("elements",[])
     teams=bootstrap_cache.get("teams",[])
     PLAYER_NAME_MAP={el.get("id"):(el.get("web_name") or el.get("second_name") or f"P{el.get('id')}") for el in elements if isinstance(el.get("id"),int)}
     PLAYER_POS_MAP={el.get("id"):el.get("element_type") for el in elements if isinstance(el.get("id"),int) and isinstance(el.get("element_type"),int)}
     PLAYER_TEAM_MAP={el.get("id"):el.get("team") for el in elements if isinstance(el.get("id"),int) and isinstance(el.get("team"),int)}
     TEAM_SHORT_MAP={t.get("id"):(t.get("short_name") or t.get("name") or f"T{t.get('id')}") for t in teams if isinstance(t.get("id"),int)}
+    NAME_TO_ELEMENT_ID = {}
+    for el in elements:
+        pid = el.get("id")
+        if not isinstance(pid, int):
+            continue
+        nm = (el.get("web_name") or el.get("second_name") or "").strip()
+        if nm:
+            NAME_TO_ELEMENT_ID[_norm_name(nm)] = pid
 
 def fixtures_cache_valid(ts: float) -> bool:
     return (time.time()-ts) < FIXTURES_TTL
@@ -637,20 +654,40 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
         return None
 
 def format_minute_str(minutes: int, fid: int, fixture_max_minute: Dict[int,int]) -> str:
-    # Упрощённая версия (можно расширить под доп. контекст)
     return f"{minutes}'"
 
-# Helper for timestamp lines
-def user_timestamp_line(user_id: Optional[int], width: int) -> str:
+# ===== Last FPL update =====
+async def get_last_fpl_update_dt() -> datetime:
+    global _last_fpl_update_dt, _last_fpl_update_cache_ts
+    now = time.time()
+    if _last_fpl_update_dt and _last_fpl_update_cache_ts and (now - _last_fpl_update_cache_ts) <= LAST_FPL_UPDATE_TTL:
+        return _last_fpl_update_dt
+    data = await fetch_json(fpl_url(event_status_path))
+    dt_utc = datetime.now(timezone.utc)
+    try:
+        if isinstance(data, dict) and isinstance(data.get("status"), list):
+            dates = []
+            for st in data["status"]:
+                ds = st.get("date")
+                d = parse_deadline(ds) if isinstance(ds, str) else None
+                if d:
+                    dates.append(d.astimezone(timezone.utc))
+            if dates:
+                dt_utc = max(dates)
+    except Exception:
+        pass
+    _last_fpl_update_dt = dt_utc
+    _last_fpl_update_cache_ts = now
+    return dt_utc
+
+def format_updated_line_for_user(user_id: Optional[int], dt_utc: datetime, width: int) -> str:
     if user_id is None:
-        tz_name="UTC"
-        offset=0
-        now_local=datetime.now(timezone.utc)
+        tz_name="UTC"; offset=0
     else:
         tz_name, offset = get_user_tz(user_id)
-        now_local = datetime.now(timezone.utc) + timedelta(hours=offset)
-    ts_line = f"Обновлено: {now_local.strftime('%Y-%m-%d %H:%M')} ({tz_name} UTC{offset:+d})"
-    return ts_line.center(width) if width > 0 else ts_line
+    local_dt = dt_utc + timedelta(hours=offset)
+    line = f"Обновлено: {local_dt.strftime('%Y-%m-%d %H:%M')} ({tz_name} UTC{offset:+d})"
+    return line if width <= 0 else line.center(width)
 
 # ===== Squid Game =====
 SQUID_ACTIVE_KEY="fpl:squid:active"
@@ -702,46 +739,46 @@ async def squid_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def squid_rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text=(
         "Squid Game — правила:\n"
-        "• Старт с указанного GW.\n"
-        "• После тура считаем GW очки оставшихся.\n"
-        "• Проходят те, у кого очки >= среднего.\n"
-        "• Игра до одного победителя или GW38.\n"
-        "• Победитель раньше 38 → новый цикл со следующего GW.\n"
-        "• В GW38 выигрывает самый результативный по GW очкам среди живых."
+        "• Игра начинается с указанного GW.\n"
+        "• После каждого завершённого GW считаем очки тура оставшихся.\n"
+        "• Проходят те, у кого очки не ниже среднего по оставшимся.\n"
+        "• Цикл продолжается до единственного победителя (или до GW38, где побеждает лучший по GW очкам).\n"
+        "• Победитель найден — со следующего GW стартует новый цикл."
     )
     await update.message.reply_text(text)
 
 async def squid_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Диапазон должен отражать завершённые GW (не включать текущий незавершённый)
     if not squid_active_state:
         await update.message.reply_text("Турнир не активен. /squid_start <gw>")
         return
-    current_gw=squid_active_state["current_gw"]
-    alive=squid_active_state["players_alive"]
-    pts_map={}
-    coros=[get_entry_picks_cached(eid,current_gw) for eid in alive]
-    data_all=await gather_limited(coros,PICKS_CONCURRENCY)
-    for eid,data in zip(alive,data_all):
-        if isinstance(data,dict):
-            pts=data.get("entry_history",{}).get("points")
-            pts_map[eid]=pts if isinstance(pts,int) else 0
-        else:
-            pts_map[eid]=0
-    ordered=sorted(alive,key=lambda e: pts_map.get(e,0), reverse=True)
+    start_gw = squid_active_state["start_gw"]
+    current_gw = squid_active_state["current_gw"]  # текущий GW цикла (идущий/следующий)
+    # Показать диапазон завершённых: от start_gw до current_gw-1 (если current_gw > start_gw)
+    if current_gw > start_gw:
+        range_text = f"Диапазон (завершено): GW {start_gw} - GW {current_gw - 1}"
+    else:
+        range_text = f"Стартовый тур: GW {start_gw} (в процессе)"
+
+    alive = squid_active_state["players_alive"]
     lines=[
         f"Squid Game статус (цикл {squid_active_state.get('cycle',1)})",
-        f"Диапазон: GW {squid_active_state['start_gw']} - GW {current_gw}",
-        f"Живых: {len(alive)}",
-        user_timestamp_line(update.effective_user.id if update.effective_user else None,0)
+        range_text,
+        f"Текущий: GW {current_gw}",
+        f"Живых: {len(alive)}"
     ]
-    for i,eid in enumerate(ordered, start=1):
-        lines.append(f"{i}. {manager_name(eid)} ({pts_map.get(eid,0)} pts)")
+    # Без очков (так как текущий тур может быть не завершён)
+    for i,eid in enumerate(alive[:50], start=1):
+        lines.append(f"{i}. {manager_name(eid)}")
+    if len(alive) > 50:
+        lines.append(f"... и ещё {len(alive)-50}")
     await update.message.reply_text("\n".join(lines))
 
 async def squid_winners_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not squid_winner_history:
         await update.message.reply_text("Победителей пока нет.")
         return
-    lines=["Прошлые победители:", user_timestamp_line(update.effective_user.id if update.effective_user else None,0)]
+    lines=["Прошлые победители:"]
     for w in squid_winner_history:
         lines.append(f"Цикл {w.get('cycle')} — {manager_name(w.get('winner_entry'))} (GW {w.get('start_gw')} - GW {w.get('end_gw')})")
     await update.message.reply_text("\n".join(lines))
@@ -898,6 +935,23 @@ def dedup_keep_order(items: List[Tuple[str,str]]) -> List[Tuple[str,str]]:
         seen.add(key); out.append((nm,pr))
     return out
 
+CATEGORY_ALIASES = {
+    "already reached target": "Already reached target",
+    "projected to reach today": "Projected to reach target",
+    "projected": "Projected to reach target",
+    "close by end of day": "Others who will be close (by end of day)",
+    "others who will be close (by end of day)": "Others who will be close (by end of day)"
+}
+CATEGORY_ORDER = [
+    "Already reached target",
+    "Projected to reach target",
+    "Others who will be close (by end of day)"
+]
+
+def _norm_category(cat: str) -> str:
+    k = (cat or "").strip().lower()
+    return CATEGORY_ALIASES.get(k, cat)
+
 def parse_prices_from_json(data: Any, ownership_map: Dict[str,float]) -> Dict[str,Dict[str,List[Tuple[str,str]]]]:
     blocks={"Rises":{}, "Falls":{}}
     rises=[]; falls=[]
@@ -916,8 +970,8 @@ def parse_prices_from_json(data: Any, ownership_map: Dict[str,float]) -> Dict[st
                     rises.extend(buf)
                 elif any(w in parent for w in ["fall","faller","falls","down"]):
                     falls.extend(buf)
-    if rises: blocks["Rises"]["Projected"] = dedup_keep_order(rises)
-    if falls: blocks["Falls"]["Projected"] = dedup_keep_order(falls)
+    if rises: blocks["Rises"]["Projected to reach target"] = dedup_keep_order(rises)
+    if falls: blocks["Falls"]["Projected to reach target"] = dedup_keep_order(falls)
     return blocks
 
 def parse_prices_from_html(html: str, ownership_map: Dict[str,float]) -> Dict[str,Dict[str,List[Tuple[str,str]]]]:
@@ -942,8 +996,24 @@ def parse_prices_from_html(html: str, ownership_map: Dict[str,float]) -> Dict[st
         if ownership_map.get(nm.lower(),0.0)>=1.0:
             pct=f"{pr}%"
             rises.append((nm,pct))
-    if rises: blocks["Rises"]["Detected"]=dedup_keep_order(rises)
+    if rises: blocks["Rises"]["Projected to reach target"]=dedup_keep_order(rises)
     return blocks
+
+def player_meta_by_name(name: str) -> Optional[Tuple[str,str,str]]:
+    # Returns (TEAM_SHORT, POS_SHORT, PRICE_STR) if found
+    pid = NAME_TO_ELEMENT_ID.get(_norm_name(name))
+    if not pid:
+        return None
+    team_id = PLAYER_TEAM_MAP.get(pid)
+    team = TEAM_SHORT_MAP.get(team_id, "") if team_id else ""
+    pos_id = PLAYER_POS_MAP.get(pid, 0)
+    pos_short = {1:"GK", 2:"DEF", 3:"MID", 4:"FWD"}.get(pos_id, "")
+    # price: now_cost is in tenths in bootstrap elements
+    el = next((e for e in bootstrap_cache.get("elements",[]) if e.get("id")==pid), None)
+    price = ""
+    if el and isinstance(el.get("now_cost"), int):
+        price = f"£{el['now_cost']/10:.1f}"
+    return (team, pos_short, price)
 
 async def get_prices_data() -> Dict[str,Any]:
     global prices_cache_data, prices_cache_ts
@@ -958,6 +1028,12 @@ async def get_prices_data() -> Dict[str,Any]:
         if not html:
             return {"ok":False,"error":"fetch_failed"}
         parsed=parse_prices_from_html(html, ownership_map)
+    # Normalize category names
+    for side in ("Rises","Falls"):
+        norm_block={}
+        for cat, items in parsed.get(side, {}).items():
+            norm_block[_norm_category(cat)] = items
+        parsed[side]=norm_block
     data={"ok":True,"parsed":parsed,"ts":time.time()}
     prices_cache_data=data; prices_cache_ts=time.time()
     if redis_client:
@@ -982,21 +1058,34 @@ async def prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Price data unavailable.")
         return
     parsed=data["parsed"]
-    user_id = update.effective_user.id if update.effective_user else None
-    ts_line = user_timestamp_line(user_id,0)
-    lines=[f"Price Predictions (>=1% ownership)", ts_line, "```"]
-    for side in ("Rises","Falls"):
-        block=parsed.get(side,{})
-        lines.append(f"{side}:")
-        if not block:
-            lines.append("  (none)")
-        else:
-            for cat,items in block.items():
-                lines.append(f"  {cat}:")
-                for nm,pr in items:
-                    lines.append(f"    - {nm}: {pr}")
-    lines.append("```")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    # Render in sections: Predicted Rises / Predicted Falls with categories in fixed order
+    def render_side(side: str) -> List[str]:
+        block = parsed.get(side,{})
+        out=[f"{side}:"]
+        any_items = False
+        for cat in CATEGORY_ORDER:
+            items = block.get(cat, [])
+            if items:
+                any_items = True
+                out.append(f"- {cat}")
+                for nm, pr in items:
+                    meta = player_meta_by_name(nm)
+                    if meta:
+                        team, pos, price = meta
+                        meta_str = " ".join(x for x in [team, pos, price] if x)
+                        if meta_str:
+                            out.append(f"    • {nm} — {meta_str} — {pr}")
+                        else:
+                            out.append(f"    • {nm} — {pr}")
+                    else:
+                        out.append(f"    • {nm} — {pr}")
+        if not any_items:
+            out.append("  (none)")
+        return out
+    lines=["Price Predictions (>=1% ownership)"]
+    lines += render_side("Rises")
+    lines += render_side("Falls")
+    await update.message.reply_text("\n".join(lines))
 
 # ===== Inline TZ keyboards =====
 def build_tz_main_keyboard():
@@ -1078,10 +1167,9 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hours=(left_seconds%86400)//3600
     minutes=(left_seconds%3600)//60
     gw_num=e.get("id")
-    ts_line=user_timestamp_line(user_id,0)
     text=(
         f"Дедлайн GW {gw_num}: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({tz_name} UTC{offset:+d})\n"
-        f"Осталось: {days}д {hours}ч {minutes}м\n{ts_line}"
+        f"Осталось: {days}д {hours}ч {minutes}м"
     )
     await update.message.reply_text(text)
 
@@ -1096,11 +1184,14 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pts_w=max(len("Pts"), max(len(str(r.get("total"))) for r in rows))
     header=f"{'R'.ljust(rank_w)} {'Manager'.ljust(player_w)} {'Pts'.rjust(pts_w)}"
     user_id = update.effective_user.id if update.effective_user else None
-    ts_line = user_timestamp_line(user_id, len(header))
-    lines=[f"{league_name} Standings".center(len(header)), ts_line, "```", header]
+    lines=[f"{league_name} Standings".center(len(header)), "```", header]
     for r in rows:
         lines.append(f"{str(r.get('rank')).ljust(rank_w)} {r.get('player_name','').ljust(player_w)} {str(r.get('total')).rjust(pts_w)}")
     lines.append("```")
+    # Обновлено — в самом конце заголовка (после таблицы)
+    dt_utc = await get_last_fpl_update_dt()
+    ts_line = format_updated_line_for_user(user_id, dt_utc, len(header))
+    lines.append(ts_line)
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def players_pts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1119,7 +1210,6 @@ async def players_pts_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not live:
         await update.message.reply_text("live недоступен"); return
     league_players=await get_league_player_ids_cached(gw)
-    pick_counts=await get_league_player_pick_counts(gw)
     live_elements=live.get("elements",[])
     rows=[]
     for el in live_elements:
@@ -1158,26 +1248,22 @@ async def players_pts_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         rows.append({
             "name":name,
             "stats":" ".join(parts) if parts else "-",
-            "pts":total_points,
-            "own":pick_counts.get(pid,0)
+            "pts":total_points
         })
     if not rows:
         await update.message.reply_text("Нет игроков для отображения.")
         return
-    rows.sort(key=lambda r:(-r["pts"], -r["own"], r["name"].lower()))
+    rows.sort(key=lambda r:(-r["pts"], r["name"].lower()))
     name_w=max(len("Player"), max(len(r["name"]) for r in rows))
     stats_w=max(len("Stats"), max(len(r["stats"]) for r in rows))
     pts_w=max(len("Pts"), max(len(str(r["pts"])) for r in rows))
-    own_w=max(len("Own"), max(len(str(r["own"])) for r in rows))
-    header=f"{'Player'.ljust(name_w)} {'Stats'.ljust(stats_w)} {'Pts'.rjust(pts_w)} {'Own'.rjust(own_w)}"
+    header=f"{'Player'.ljust(name_w)} {'Stats'.ljust(stats_w)} {'Pts'.rjust(pts_w)}"
     league_name=LEAGUE_NAME or "Zakynule Fantasy Vibe"
     legend=("G=Goals A=Assists CS=Clean sheet DC=Def contrib YC=Yellow RC=Red "
             "GKS=GK save pts OG=Own goal PM=Pen miss PS=Pen saved B=Bonus")
-    user_id = update.effective_user.id if update.effective_user else None
-    ts_line = user_timestamp_line(user_id, len(header))
-    lines=[f"{league_name} — GW {gw}".center(len(header)), ts_line, "```", header]
+    lines=[f"{league_name} — GW {gw}".center(len(header)), "```", header]
     for r in rows:
-        lines.append(f"{r['name'].ljust(name_w)} {r['stats'].ljust(stats_w)} {str(r['pts']).rjust(pts_w)} {str(r['own']).rjust(own_w)}")
+        lines.append(f"{r['name'].ljust(name_w)} {r['stats'].ljust(stats_w)} {str(r['pts']).rjust(pts_w)}")
     lines.append("```")
     lines.append(legend)
     for chunk in split_message_chunks("\n".join(lines)):
@@ -1214,12 +1300,15 @@ async def gwpoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pts_w=max(len("Pts"), max(len(str(e[2])) for e in entries))
     header=f"{'Player'.ljust(name_w)} {'Pts'.rjust(pts_w)}"
     user_id = update.effective_user.id if update.effective_user else None
-    ts_line = user_timestamp_line(user_id, len(header))
-    lines=[f"{league_name} — GW {gw}".center(len(header)), ts_line, "```", header]
+    lines=[f"{league_name} — GW {gw}".center(len(header)), "```", header]
     for i,e in enumerate(entries):
         val=e[2] if e[2]>=0 else "n/a"
         lines.append(f"{name_col[i].ljust(name_w)} {str(val).rjust(pts_w)}")
     lines.append("```")
+    # Обновлено — в самом конце
+    dt_utc = await get_last_fpl_update_dt()
+    ts_line = format_updated_line_for_user(user_id, dt_utc, len(header))
+    lines.append(ts_line)
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 RUS_MONTH={
@@ -1288,18 +1377,21 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows,played,remaining=await month_points_for(results, events, cal_month, cal_year)
     month_name=RUS_MONTH.get(cal_month,f"Месяц {cal_month}")
     league_name=LEAGUE_NAME or "Zakynule Fantasy Vibe"
-    top=rows[:15]
+    top=rows[:10]  # только топ-10
     display=[f"{i+1} {manager_name(eid)}" for i,(eid,mgr,pts) in enumerate(top)]
     name_w=max(len("Player"), max((len(s) for s in display), default=6))
     pts_w=max(len("Pts"), max((len(str(pts)) for (_eid,_mgr,pts) in top), default=3))
     header=f"{'Player'.ljust(name_w)} {'Pts'.rjust(pts_w)}"
     info=f"Сыграно туров: {played}, осталось: {remaining}"
     user_id = update.effective_user.id if update.effective_user else None
-    ts_line = user_timestamp_line(user_id, len(header))
-    lines=[f"{league_name} — {month_name}".center(len(header)), ts_line, info.center(len(header)), "```", header]
+    lines=[f"{league_name} — {month_name}".center(len(header)), info.center(len(header)), "```", header]
     for i,(eid,mgr,pts) in enumerate(top):
         lines.append(f"{display[i].ljust(name_w)} {str(pts).rjust(pts_w)}")
     lines.append("```")
+    # Обновлено — в самом конце
+    dt_utc = await get_last_fpl_update_dt()
+    ts_line = format_updated_line_for_user(user_id, dt_utc, len(header))
+    lines.append(ts_line)
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 # ===== LIVE MONITOR LOOP =====
@@ -1728,17 +1820,29 @@ async def run_bot():
                     data=await get_prices_data()
                     if data.get("ok"):
                         parsed=data["parsed"]
-                        lines=["Price Predictions (>=1%)", user_timestamp_line(None,0)]
-                        for side in ("Rises","Falls"):
+                        lines=["Price Predictions (>=1%)"]
+                        def render_side(side:str)->List[str]:
                             block=parsed.get(side,{})
-                            lines.append(f"{side}:")
-                            if not block:
-                                lines.append("  (none)")
-                            else:
-                                for cat,items in block.items():
-                                    lines.append(f"  {cat}:")
+                            out=[f"{side}:"]
+                            any_items=False
+                            for cat in CATEGORY_ORDER:
+                                items=block.get(cat,[])
+                                if items:
+                                    any_items=True
+                                    out.append(f"- {cat}")
                                     for nm,pr in items:
-                                        lines.append(f"    - {nm}: {pr}")
+                                        meta=player_meta_by_name(nm)
+                                        if meta:
+                                            team,pos,price=meta
+                                            meta_str=" ".join(x for x in [team,pos,price] if x)
+                                            out.append(f"    • {nm} — {meta_str} — {pr}" if meta_str else f"    • {nm} — {pr}")
+                                        else:
+                                            out.append(f"    • {nm} — {pr}")
+                            if not any_items:
+                                out.append("  (none)")
+                            return out
+                        lines+=render_side("Rises")
+                        lines+=render_side("Falls")
                         text="\n".join(lines)
                     else:
                         text="Price data unavailable"
