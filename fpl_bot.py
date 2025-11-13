@@ -1,22 +1,23 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
 # This revision includes:
-# - Variant 1 for Squid status: /squid_status returns the last final Squid report; auto-report now shows cycle number and start GW.
-# - Players table (/players_pts):
+# - Command renames: /players_pts -> /players, /gwpoints -> /gw
+# - Fixed command scopes: sets commands for default, all private chats, all group chats, and all chat admins
+# - Players table (/players):
 #   * Center alignment for all columns and header
 #   * Player names truncated to 12 chars
 #   * Tie-break: when points equal, sort by league ownership (picked count) descending
-#   * Tokens PM, PS, S do NOT show count when it is 1 (PM, PS, S). If >1 → PM2, PS2, S2...
-#   * Legend: “S - saves” (no extra explanation)
+#   * Tokens PM, PS, S show no count when it is 1 (PM, PS, S). If >1 → PM2, PS2, S2...
+#   * Legend: “S - saves”
 # - Month table:
 #   * Center alignment for table
 #   * Info line on its own row: "Сыграно: X осталось: Y" (lowercase 'осталось', no extra spaces)
-# - Rank and GW-points tables are centered
-# - Caches and optimizations kept:
-#   * Signature + text cache for /rank and /players_pts
-#   * Reduced attempts/timeouts for frequent endpoints
-#   * Cleanup of old picks cache
-#   * Redis-backed idempotency for live messages
+# - Rank and GW tables are centered
+# - Squid final report header includes cycle number and start GW; /squid_status returns last final report (variant 1)
 # - Ensure manager names available for Squid (fallback to FPL entry endpoint + Redis cache)
+# - Signature + text cache for /rank and /players
+# - Reduced attempts/timeouts for frequent endpoints
+# - Cleanup of old picks cache
+# - Redis-backed idempotency for live messages
 # - Silent replies for commands; auto notifications with sound
 
 import os
@@ -45,7 +46,11 @@ from telegram import (
     Update,
     BotCommand,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
 )
 
 try:
@@ -727,7 +732,8 @@ async def send_once(text:str, season:str, gw:int):
         should=h not in _sent_msg_hashes
     if should:
         if not redis_client: _sent_msg_hashes.add(h)
-        if application: await send_text_raw(ALLOWED_GROUP_ID, text)
+        if application:
+            await send_text_raw(ALLOWED_GROUP_ID, text)
 
 def parse_deadline(dt_str:str)->Optional[datetime]:
     if not dt_str: return None
@@ -951,7 +957,7 @@ def build_tz_main_keyboard():
         [InlineKeyboardButton("Москва (UTC+3)",callback_data="tz|Москва"),
          InlineKeyboardButton("Киев (UTC+2)",callback_data="tz|Киев")],
         [InlineKeyboardButton("Центральная Европа (UTC+1)",callback_data="tz|Центральная Европа"),
-        InlineKeyboardButton("Лондон (UTC+0)",callback_data="tz|Лондон")],
+         InlineKeyboardButton("Лондон (UTC+0)",callback_data="tz|Лондон")],
         [InlineKeyboardButton("Другое…",callback_data="tz_more")]
     ])
 
@@ -988,8 +994,8 @@ async def help_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     owner=is_owner(update)
     lines=["Команды:"]
     lines.append("/deadline — ближайший дедлайн")
-    lines.append("/players_pts [gw] — live очки игроков")
-    lines.append("/gwpoints [gw] — очки менеджеров тура")
+    lines.append("/players [gw] — live очки игроков")
+    lines.append("/gw [gw] — очки менеджеров тура")
     lines.append("/month [1..10] — топ-10 месяц")
     lines.append("/rank — таблица лиги")
     if owner:
@@ -1098,7 +1104,7 @@ def format_stats_tokens(s:Dict[str,Any], pos:int)->List[str]:
     return tokens
 
 @safe_command
-async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def players_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     bs=await get_bootstrap_cached()
     if not bs: return
     gw=int(context.args[0]) if context.args and context.args[0].isdigit() else get_current_or_next_gw(bs)
@@ -1106,7 +1112,7 @@ async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
     last_update=await get_last_fpl_update_dt()
     sig=f"{gw}|{int(last_update.timestamp())}"
-    feature_key=f"players_pts:{gw}"
+    feature_key=f"players:{gw}"
     cached=cache_get_text(feature_key)
     if cached and cached.get("sig")==sig and isinstance(cached.get("text"),str):
         for chunk in split_message_chunks(cached["text"]):
@@ -1195,7 +1201,7 @@ async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(chunk.replace("```",""), disable_notification=True)
 
 @safe_command
-async def gwpoints_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def gw_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     bs=await get_bootstrap_cached()
     if not bs: return
     gw=int(context.args[0]) if context.args and context.args[0].isdigit() else get_current_or_next_gw(bs)
@@ -1882,13 +1888,13 @@ async def deadline_notifier():
             logger.warning("Deadline notifier error: %s", e)
             await asyncio.sleep(600)
 
-# ===== Setup bot commands =====
+# ===== Setup bot commands (scopes fixed) =====
 async def setup_bot_commands(bot):
     cmds=[
         BotCommand("help","Описание"),
         BotCommand("deadline","Дедлайн"),
-        BotCommand("players_pts","Очки игроков"),
-        BotCommand("gwpoints","Очки тура"),
+        BotCommand("players","Очки игроков"),
+        BotCommand("gw","Очки тура"),
         BotCommand("month","Очки месяца"),
         BotCommand("rank","Таблица"),
         BotCommand("prices","Цены (owner)"),
@@ -1899,8 +1905,22 @@ async def setup_bot_commands(bot):
         BotCommand("squid_rules","Squid правила"),
         BotCommand("tz","Таймзона"),
     ]
-    try: await bot.set_my_commands(cmds)
-    except Exception: pass
+    # Clean previous commands in common scopes to avoid stale sets
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeDefault())
+        await bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
+        await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
+        await bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
+    except Exception:
+        pass
+    # Set commands for all main scopes (with RU locale)
+    try:
+        await bot.set_my_commands(cmds, scope=BotCommandScopeDefault(), language_code="ru")
+        await bot.set_my_commands(cmds, scope=BotCommandScopeAllPrivateChats(), language_code="ru")
+        await bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats(), language_code="ru")
+        await bot.set_my_commands(cmds, scope=BotCommandScopeAllChatAdministrators(), language_code="ru")
+    except Exception as e:
+        logger.warning("set_my_commands failed: %s", e)
 
 async def error_handler(update:object, context:ContextTypes.DEFAULT_TYPE):
     logger.debug("Unhandled error: %s", context.error)
@@ -1917,8 +1937,8 @@ async def run_bot():
     application=Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("deadline", deadline_command))
-    application.add_handler(CommandHandler("players_pts", players_pts_command))
-    application.add_handler(CommandHandler("gwpoints", gwpoints_command))
+    application.add_handler(CommandHandler("players", players_command))
+    application.add_handler(CommandHandler("gw", gw_command))
     application.add_handler(CommandHandler("month", month_command))
     application.add_handler(CommandHandler("rank", rank_command))
     application.add_handler(CommandHandler("prices", prices_command))
