@@ -1,10 +1,18 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# FULL CODE with timestamp enhancement.
-# New change (per request):
-# In every command that outputs a table (/rank, /players_pts, /gwpoints, /month, /prices) the header now includes
-# a line "Обновлено: YYYY-MM-DD HH:MM (Таймзона UTC±X)" based on the requesting user's timezone.
-# DC (Defensive Contribution) is SHOWN again in players_pts Stats column when threshold met.
-# Nothing from previous logic has been deliberately removed; live event logic preserved.
+# FULL CODE (с учётом всех последних требований).
+# Изменения и особенности:
+# - Реальное имя лиги берётся из API standings (fallback "Zakynule Fantasy Vibe").
+# - /players_pts: показывает DC (Defensive Contribution) снова при выполнении порога.
+# - Сортировка /players_pts при равных очках: по убыванию частоты выбора в лиге (ownership count), затем по имени.
+# - /gwpoints и /players_pts: аргумент GW опционален.
+# - /month: локальная нумерация без "#", сыграно / осталось туров.
+# - Squid Game: локальная нумерация, очки тура, победитель цикла и перезапуск.
+# - Все таблицы адаптированы под телефон (узкие заголовки, выравнивание, моноширинные блоки).
+# - В таблицах добавлена строка "Обновлено: ..." с датой/временем по таймзоне пользователя.
+# - Price parser: многоисточниковый (JSON кандидаты → embedded JSON → regex fallback), фильтр ownership >= 1%.
+# - Исправлена ошибка смешивания naive/aware datetimes: везде используется datetime.now(timezone.utc).
+# - Live мониторинг оставлен полным (голы, ассисты, own goals, пенальти, карточки, CS, DC и финальные сводки).
+# - Добавлена вспомогательная функция format_minute_str (для совместимости), сейчас упрощённая.
 
 import os
 import json
@@ -462,7 +470,7 @@ def discover_season_tag(bootstrap: Dict[str,Any]) -> str:
     if SEASON_TAG: return SEASON_TAG
     season=bootstrap.get("game_settings",{}).get("season")
     if not season:
-        y=datetime.now().year
+        y=datetime.now(timezone.utc).year
         season=f"{y}/{str((y+1)%100).zfill(2)}"
     SEASON_TAG=season
     return SEASON_TAG
@@ -497,7 +505,7 @@ async def get_league_player_pick_counts(gw: int) -> Dict[int,int]:
     if cached and now-cached[0] <= LEAGUE_PLAYERS_TTL:
         return cached[1]
     results=await get_league_results_cached(LEAGUE_ID)
-    counts: Dict[int,int]={}
+    counts={}
     if not results:
         _league_player_pick_counts[gw]=(now,counts); return counts
     coros=[]
@@ -628,19 +636,21 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
     except Exception:
         return None
 
+def format_minute_str(minutes: int, fid: int, fixture_max_minute: Dict[int,int]) -> str:
+    # Упрощённая версия (можно расширить под доп. контекст)
+    return f"{minutes}'"
+
 # Helper for timestamp lines
 def user_timestamp_line(user_id: Optional[int], width: int) -> str:
     if user_id is None:
         tz_name="UTC"
         offset=0
-        now_local=datetime.utcnow()
+        now_local=datetime.now(timezone.utc)
     else:
         tz_name, offset = get_user_tz(user_id)
-        now_local = datetime.utcnow() + timedelta(hours=offset)
+        now_local = datetime.now(timezone.utc) + timedelta(hours=offset)
     ts_line = f"Обновлено: {now_local.strftime('%Y-%m-%d %H:%M')} ({tz_name} UTC{offset:+d})"
-    if width > 0:
-        return ts_line.center(width)
-    return ts_line
+    return ts_line.center(width) if width > 0 else ts_line
 
 # ===== Squid Game =====
 SQUID_ACTIVE_KEY="fpl:squid:active"
@@ -1051,22 +1061,29 @@ async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     future=[]
     for e in events:
         dt=parse_deadline(e.get("deadline_time"))
-        if dt and dt>now_utc: future.append((dt,e))
+        if dt and dt>now_utc:
+            future.append((dt,e))
     if not future:
         await update.message.reply_text("Нет будущих дедлайнов"); return
     dt,e=min(future,key=lambda x:x[0])
+
     user_id=update.effective_user.id
     tz_name, offset = get_user_tz(user_id)
-    local_dt=dt+timedelta(hours=offset)
-    now_local=datetime.utcnow()+timedelta(hours=offset)
-    left=max(0,int((local_dt-now_local).total_seconds()))
-    d=left//86400; h=(left%86400)//3600; m=(left%3600)//60
-    gw=e.get("id")
+    dt_utc=dt.astimezone(timezone.utc)
+    local_dt=dt_utc+timedelta(hours=offset)
+    now_local=now_utc+timedelta(hours=offset)
+    left_seconds=int((local_dt-now_local).total_seconds())
+    if left_seconds<0: left_seconds=0
+    days=left_seconds//86400
+    hours=(left_seconds%86400)//3600
+    minutes=(left_seconds%3600)//60
+    gw_num=e.get("id")
     ts_line=user_timestamp_line(user_id,0)
-    await update.message.reply_text(
-        f"Дедлайн GW {gw}: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({tz_name} UTC{offset:+d})\n"
-        f"Осталось: {d}д {h}ч {m}м\n{ts_line}"
+    text=(
+        f"Дедлайн GW {gw_num}: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({tz_name} UTC{offset:+d})\n"
+        f"Осталось: {days}д {hours}ч {minutes}м\n{ts_line}"
     )
+    await update.message.reply_text(text)
 
 async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results=await get_league_results_cached(LEAGUE_ID)
@@ -1220,9 +1237,9 @@ def season_month_index_to_calendar(index:int, season_tag:Optional[str])->Tuple[i
     month=SEASON_MONTH_ORDER[index-1]
     if season_tag and "/" in season_tag:
         try: start_year=int(season_tag.split("/")[0])
-        except Exception: start_year=datetime.now().year
+        except Exception: start_year=datetime.now(timezone.utc).year
     else:
-        start_year=datetime.now().year
+        start_year=datetime.now(timezone.utc).year
     year=start_year if month>=8 else start_year+1
     return month,year
 
@@ -1285,7 +1302,7 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("```")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-# ===== LIVE MONITOR LOOP (detailed) =====
+# ===== LIVE MONITOR LOOP =====
 async def live_monitor_loop():
     global _current_gw,last_live_tick_time,last_active_fixtures_count
     logger.info("Live loop started")
@@ -1383,7 +1400,6 @@ async def live_monitor_loop():
 
                 update_msgs=[]
 
-                # Assist reassignment
                 if "assists" in neg_pool.get(fid,{}) and "assists" in pos_pool.get(fid,{}):
                     while neg_pool[fid]["assists"] and pos_pool[fid]["assists"]:
                         from_pid=neg_pool[fid]["assists"].pop(0)
@@ -1392,13 +1408,12 @@ async def live_monitor_loop():
                         pos_to, _m_to, total_to = get_state(to_pid)
                         pts=event_points_for(pos_from,"Assist")
                         pts_to=event_points_for(pos_to,"Assist")
-                        mstr=f"{minutes_from}'"
+                        mstr=format_minute_str(minutes_from,fid,fixture_max_minute)
                         msg=(f"{header_line()}\n"
                              f"{mstr} Update: Assist reassigned - {PLAYER_NAME_MAP.get(from_pid,f'P{from_pid}')} {format_points(-pts)}, total ({total_from}).\n"
                              f"Assist - {PLAYER_NAME_MAP.get(to_pid,f'P{to_pid}')} {format_points(pts_to)}, total ({total_to}).")
                         update_msgs.append(msg)
 
-                # Penalty retake undo → goal
                 while neg_pool.get(fid,{}).get("penalties_missed") and neg_pool.get(fid,{}).get("penalties_saved") and pos_pool.get(fid,{}).get("goals_scored"):
                     m_pid=neg_pool[fid]["penalties_missed"].pop(0)
                     s_pid=neg_pool[fid]["penalties_saved"].pop(0)
@@ -1412,14 +1427,13 @@ async def live_monitor_loop():
                     scorer_team=PLAYER_TEAM_MAP.get(g_pid)
                     if scorer_team==team_h: local_h+=1
                     elif scorer_team==team_a: local_a+=1
-                    mstr=f"{minutes_m}'"
+                    mstr=format_minute_str(minutes_m,fid,fixture_max_minute)
                     msg=(f"{header_line()}\n"
                          f"{mstr} Update: Penalty saved removed - {PLAYER_NAME_MAP.get(s_pid,f'P{s_pid}')} {format_points(-pts_s)}, total ({total_s}).\n"
                          f"Penalty missed removed - {PLAYER_NAME_MAP.get(m_pid,f'P{m_pid}')} {format_points(-pts_m)}, total ({total_m}).\n"
                          f"Goal - {PLAYER_NAME_MAP.get(g_pid,f'P{g_pid}')} {format_points(pts_g)}, total ({total_g}).")
                     update_msgs.append(msg)
 
-                # Generic cancellations
                 for ident,label,base_event in [
                     ("goals_scored","Update: Goal cancelled (VAR)","Goal"),
                     ("assists","Update: Assist cancelled","Assist"),
@@ -1432,13 +1446,12 @@ async def live_monitor_loop():
                     for pid in list(neg_pool.get(fid,{}).get(ident,[])):
                         pos_p, minutes_p, total_p = get_state(pid)
                         pts=event_points_for(pos_p,base_event)
-                        mstr=f"{minutes_p}'"
+                        mstr=format_minute_str(minutes_p,fid,fixture_max_minute)
                         msg=(f"{header_line()}\n"
                              f"{mstr} {label} - {PLAYER_NAME_MAP.get(pid,f'P{pid}')} {format_points(-pts)}, total ({total_p}).")
                         update_msgs.append(msg)
                         neg_pool[fid][ident].remove(pid)
 
-                # DC removed
                 for pid in list(PLAYER_TEAM_MAP.keys()):
                     if (fid,pid) in player_state and ns_key(gw,fid,pid) in _dc_awarded:
                         pos_d, minutes_d, total_d = get_state(pid)
@@ -1447,7 +1460,7 @@ async def live_monitor_loop():
                         if not dc_threshold_met(stats_overall,pos_d) and ns_key(gw,fid,pid) not in _dc_removed_sent:
                             _dc_removed_sent.add(ns_key(gw,fid,pid))
                             pts=event_points_for(pos_d,"DC")
-                            mstr=f"{minutes_d}'"
+                            mstr=format_minute_str(minutes_d,fid,fixture_max_minute)
                             msg=(f"{header_line()}\n"
                                  f"{mstr} Update: DC removed - {PLAYER_NAME_MAP.get(pid,f'P{pid}')} {format_points(-pts)}, total ({total_d}).")
                             update_msgs.append(msg)
@@ -1455,10 +1468,8 @@ async def live_monitor_loop():
                 for um in update_msgs:
                     await send_once(um, season, gw)
 
-                # Positives
                 pos_events=pos_pool.get(fid,{})
 
-                # Goals (+ optional assist)
                 goals=list(pos_events.get("goals_scored",[]))
                 assists=list(pos_events.get("assists",[]))
                 while goals:
@@ -1473,7 +1484,7 @@ async def live_monitor_loop():
                         if aid!=gid and PLAYER_TEAM_MAP.get(aid)==scorer_team:
                             a_pid=aid; assists.pop(i); break
                     header=header_line()
-                    mstr=f"{minutes_g}'"
+                    mstr=format_minute_str(minutes_g,fid,fixture_max_minute)
                     line1=f"{mstr} Goal - {PLAYER_NAME_MAP.get(gid,f'P{gid}')} {format_points(pts_g)}, total ({total_g})."
                     if a_pid:
                         pos_a,_m_a,total_a=get_state(a_pid)
@@ -1484,7 +1495,6 @@ async def live_monitor_loop():
                         msg=f"{header}\n{line1}"
                     await send_once(msg, season, gw)
 
-                # Own goals
                 own_goals=list(pos_events.get("own_goals",[]))
                 while own_goals:
                     ogid=own_goals.pop(0)
@@ -1498,7 +1508,7 @@ async def live_monitor_loop():
                         if PLAYER_TEAM_MAP.get(aid)!=og_team:
                             a_pid=aid; assists.pop(i); break
                     header=header_line()
-                    mstr=f"{minutes_og}'"
+                    mstr=format_minute_str(minutes_og,fid,fixture_max_minute)
                     line1=f"{mstr} Own goal - {PLAYER_NAME_MAP.get(ogid,f'P{ogid}')} {format_points(pts_og)}, total ({total_og})."
                     if a_pid:
                         pos_a,_m_a,total_a=get_state(a_pid)
@@ -1509,7 +1519,6 @@ async def live_monitor_loop():
                         msg=f"{header}\n{line1}"
                     await send_once(msg, season, gw)
 
-                # Pens missed/saved
                 pens_missed=list(pos_events.get("penalties_missed",[]))
                 pens_saved=list(pos_events.get("penalties_saved",[]))
                 while pens_missed and pens_saved:
@@ -1518,22 +1527,21 @@ async def live_monitor_loop():
                     pos_s,_m_s,total_s=get_state(ps)
                     pts_m=event_points_for(pos_m,"Penalty missed")
                     pts_s=event_points_for(pos_s,"Penalty saved")
-                    header=header_line(); mstr=f"{minutes_m}'"
+                    header=header_line(); mstr=format_minute_str(minutes_m,fid,fixture_max_minute)
                     line1=f"{mstr} Penalty missed - {PLAYER_NAME_MAP.get(pm,f'P{pm}')} {format_points(pts_m)}, total ({total_m})."
                     line2=f"{mstr} Penalty saved - {PLAYER_NAME_MAP.get(ps,f'P{ps}')} {format_points(pts_s)}, total ({total_s})."
                     await send_once(f"{header}\n{line1}\n{line2}", season, gw)
                 for pm in pens_missed:
                     pos_m, minutes_m, total_m = get_state(pm)
                     pts_m=event_points_for(pos_m,"Penalty missed")
-                    header=header_line(); mstr=f"{minutes_m}'"
+                    header=header_line(); mstr=format_minute_str(minutes_m,fid,fixture_max_minute)
                     await send_once(f"{header}\n{mstr} Penalty missed - {PLAYER_NAME_MAP.get(pm,f'P{pm}')} {format_points(pts_m)}, total ({total_m}).", season, gw)
                 for ps in pens_saved:
                     pos_s, minutes_s, total_s = get_state(ps)
                     pts_s=event_points_for(pos_s,"Penalty saved")
-                    header=header_line(); mstr=f"{minutes_s}'"
+                    header=header_line(); mstr=format_minute_str(minutes_s,fid,fixture_max_minute)
                     await send_once(f"{header}\n{mstr} Penalty saved - {PLAYER_NAME_MAP.get(ps,f'P{ps}')} {format_points(pts_s)}, total ({total_s}).", season, gw)
 
-                # Cards
                 yellow_totals={}
                 for (kgw,kfid,kpid,ident), val in _last_counts.items():
                     if kgw==gw and kfid==fid and ident=="yellow_cards":
@@ -1543,7 +1551,8 @@ async def live_monitor_loop():
                     pos_r, minutes_r, total_r = get_state(pid_r)
                     key=ns_key(gw,fid,pid_r)
                     yc_total=yellow_totals.get(pid_r,0)
-                    header=header_line(); mstr=f"{minutes_r}'"
+                    header=header_line()
+                    mstr=format_minute_str(minutes_r,fid,fixture_max_minute)
                     if yc_total>=2:
                         if key not in _second_yellow_processed:
                             _second_yellow_processed.add(key)
@@ -1557,7 +1566,6 @@ async def live_monitor_loop():
                             line=f"{mstr} Red card - {PLAYER_NAME_MAP.get(pid_r,f'P{pid_r}')} {format_points(pts)}, total ({total_r})."
                             await send_once(f"{header}\n{line}", season, gw)
 
-                # Clean sheet (subbed off)
                 for (pfid,pid),(pos_c, minutes_c, total_c) in list(player_state.items()):
                     if pfid!=fid: continue
                     if pos_c==4: continue
@@ -1582,11 +1590,11 @@ async def live_monitor_loop():
                     pts=event_points_for(pos_c,"Clean sheet")
                     if pts<=0: continue
                     _cs_subbed_sent.add(key)
-                    header=header_line(); mstr=f"{minutes_c}'"
+                    header=header_line()
+                    mstr=format_minute_str(minutes_c,fid,fixture_max_minute)
                     line=f"{mstr} Clean sheet (subbed off) - {PLAYER_NAME_MAP.get(pid,f'P{pid}')} {format_points(pts)}, total ({total_c})."
                     await send_once(f"{header}\n{line}", season, gw)
 
-                # DC award
                 for (pfid,pid),(pos_d, minutes_d, total_d) in list(player_state.items()):
                     if pfid!=fid: continue
                     key=ns_key(gw,fid,pid)
@@ -1596,11 +1604,11 @@ async def live_monitor_loop():
                     if dc_threshold_met(stats_overall,pos_d):
                         _dc_awarded.add(key)
                         pts=event_points_for(pos_d,"DC")
-                        header=header_line(); mstr=f"{minutes_d}'"
+                        header=header_line()
+                        mstr=format_minute_str(minutes_d,fid,fixture_max_minute)
                         line=f"{mstr} DC - {PLAYER_NAME_MAP.get(pid,f'P{pid}')} {format_points(pts)}, total ({total_d})."
                         await send_once(f"{header}\n{line}", season, gw)
 
-            # Post-match summaries
             finished=[fx for fx in fixtures if fx.get("finished")]
             for fx in finished:
                 fid=fx.get("id")
