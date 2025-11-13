@@ -18,6 +18,7 @@
 # - Reduced attempts/timeouts for frequent endpoints
 # - Cleanup of old picks cache
 # - Redis-backed idempotency for live messages
+# - Polling/Webhook mode guard + Redis global lock to avoid getUpdates Conflict; auto delete webhook in polling mode
 # - Silent replies for commands; auto notifications with sound
 
 import os
@@ -52,6 +53,7 @@ from telegram import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
 )
+from telegram.error import Conflict
 
 try:
     from upstash_redis import Redis
@@ -282,6 +284,10 @@ PRICES_URL="https://www.livefpl.net/prices"
 _last_fpl_update_dt: Optional[datetime]=None
 _last_fpl_update_cache_ts: Optional[float]=None
 LAST_FPL_UPDATE_TTL=60
+
+# Global lock to avoid duplicate polling instances
+BOT_LOCK_KEY = os.environ.get("BOT_LOCK_KEY", "fpl:bot:lock")
+BOT_LOCK_TTL = int(os.environ.get("BOT_LOCK_TTL", "1800"))
 
 # ===== Text cache (feature key -> {sig, hash, text}) =====
 _text_cache_mem: Dict[str, Dict[str, Any]] = {}
@@ -1529,6 +1535,57 @@ async def prices_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     lines=format_prices_mobile(parsed)
     await reply_silent(update, "\n".join(lines))
 
+# ===== Update mode helpers & global lock =====
+async def ensure_update_mode(bot, use_webhook: bool, webhook_url: Optional[str] = None):
+    try:
+        info = await bot.get_webhook_info()
+    except Exception:
+        info = None
+
+    if not use_webhook:
+        try:
+            if info and info.url:
+                await bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logger.warning("delete_webhook failed: %s", e)
+        return
+
+    if webhook_url:
+        try:
+            if (not info) or (info and info.url != webhook_url):
+                await bot.delete_webhook(drop_pending_updates=True)
+                await bot.set_webhook(webhook_url)
+        except Exception as e:
+            logger.warning("set_webhook failed: %s", e)
+
+def acquire_global_lock() -> bool:
+    if not redis_client:
+        return True
+    try:
+        ok = redis_client.set(BOT_LOCK_KEY, str(os.getpid()), nx=True, ex=BOT_LOCK_TTL)
+        return bool(ok)
+    except Exception as e:
+        logger.warning("acquire_global_lock: %s", e)
+        return True
+
+def refresh_global_lock():
+    if not redis_client:
+        return
+    try:
+        redis_client.expire(BOT_LOCK_KEY, BOT_LOCK_TTL)
+    except Exception:
+        pass
+
+def release_global_lock():
+    if not redis_client:
+        return
+    try:
+        val = redis_client.get(BOT_LOCK_KEY)
+        if _ensure_str(val) == str(os.getpid()):
+            redis_client.delete(BOT_LOCK_KEY)
+    except Exception:
+        pass
+
 # ===== Live Monitor Loop =====
 async def live_monitor_loop():
     global _current_gw,last_live_tick_time,last_active_fixtures_count
@@ -1928,63 +1985,93 @@ async def error_handler(update:object, context:ContextTypes.DEFAULT_TYPE):
 async def run_bot():
     global http_client, application
     init_redis()
-    limits=httpx.Limits(max_keepalive_connections=10, max_connections=50)
-    use_http2=ENABLE_HTTP2
-    try: import h2  # noqa
-    except Exception: use_http2=False
-    http_client=httpx.AsyncClient(http2=use_http2, limits=limits, timeout=20.0)
 
-    application=Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("deadline", deadline_command))
-    application.add_handler(CommandHandler("players", players_command))
-    application.add_handler(CommandHandler("gw", gw_command))
-    application.add_handler(CommandHandler("month", month_command))
-    application.add_handler(CommandHandler("rank", rank_command))
-    application.add_handler(CommandHandler("prices", prices_command))
-    application.add_handler(CommandHandler("squid_start", squid_start_command))
-    application.add_handler(CommandHandler("squid_stop", squid_stop_command))
-    application.add_handler(CommandHandler("squid_status", squid_status_command))
-    application.add_handler(CommandHandler("squid_winners", squid_winners_command))
-    application.add_handler(CommandHandler("squid_rules", squid_rules_command))
-    application.add_handler(CommandHandler("tz", settz_command))
-    application.add_handler(CallbackQueryHandler(tz_inline_callback, pattern="^tz"))
-    application.add_error_handler(error_handler)
+    # Global lock: ensure single instance
+    if not acquire_global_lock():
+        logger.error("Another bot instance is running (global lock). Exiting.")
+        return
 
-    await application.initialize()
-    await application.start()
-    await setup_bot_commands(application.bot)
+    try:
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=50)
+        use_http2=ENABLE_HTTP2
+        try: import h2  # noqa
+        except Exception: use_http2=False
+        http_client=httpx.AsyncClient(http2=use_http2, limits=limits, timeout=20.0)
 
-    await get_bootstrap_cached()
-    load_squid_from_redis()
+        application=Application.builder().token(BOT_TOKEN).concurrent_updates(TELEGRAM_CONCURRENCY).build()
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("deadline", deadline_command))
+        application.add_handler(CommandHandler("players", players_command))
+        application.add_handler(CommandHandler("gw", gw_command))
+        application.add_handler(CommandHandler("month", month_command))
+        application.add_handler(CommandHandler("rank", rank_command))
+        application.add_handler(CommandHandler("prices", prices_command))
+        application.add_handler(CommandHandler("squid_start", squid_start_command))
+        application.add_handler(CommandHandler("squid_stop", squid_stop_command))
+        application.add_handler(CommandHandler("squid_status", squid_status_command))
+        application.add_handler(CommandHandler("squid_winners", squid_winners_command))
+        application.add_handler(CommandHandler("squid_rules", squid_rules_command))
+        application.add_handler(CommandHandler("tz", settz_command))
+        application.add_handler(CallbackQueryHandler(tz_inline_callback, pattern="^tz"))
+        application.add_error_handler(error_handler)
 
-    if not USE_WEBHOOK:
+        await application.initialize()
+        await application.start()
+
+        # Ensure update mode matches USE_WEBHOOK (delete webhook when polling)
+        WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE_URL")
+        WEBHOOK_PATH = f"/telegram/{BOT_TOKEN}"
+        WEBHOOK_URL = f"{WEBHOOK_BASE}{WEBHOOK_PATH}" if (USE_WEBHOOK and WEBHOOK_BASE) else None
+        await ensure_update_mode(application.bot, USE_WEBHOOK, WEBHOOK_URL)
+
+        await setup_bot_commands(application.bot)
+
+        await get_bootstrap_cached()
+        load_squid_from_redis()
+
+        if USE_WEBHOOK:
+            logger.info("Bot is running in WEBHOOK mode%s", f" at {WEBHOOK_URL}" if WEBHOOK_URL else "")
+            # Note: webhook handler endpoint is not implemented in this file.
+        else:
+            logger.info("Bot is running in POLLING mode")
+            try:
+                await application.updater.start_polling()
+            except Conflict:
+                logger.error("Conflict: another getUpdates consumer is running. Exiting.")
+                return
+
+        # Refresh global lock periodically
+        async def _lock_refresher():
+            while not stop_event.is_set():
+                refresh_global_lock()
+                await asyncio.sleep(max(10, BOT_LOCK_TTL // 3))
+        asyncio.create_task(_lock_refresher())
+
+        asyncio.create_task(live_monitor_loop())
+        asyncio.create_task(deadline_notifier())
+
         try:
-            await application.updater.start_polling()
-        except Exception as e:
-            logger.error("Polling start failed: %s", e)
-            return
+            me=await application.bot.get_me()
+            logger.info(f"Bot started @{me.username}")
+        except Exception:
+            pass
 
-    asyncio.create_task(live_monitor_loop())
-    asyncio.create_task(deadline_notifier())
+        await stop_event.wait()
 
-    try:
-        me=await application.bot.get_me()
-        logger.info(f"Bot started @{me.username}")
-    except Exception:
-        pass
-
-    await stop_event.wait()
-
-    try:
-        if not USE_WEBHOOK:
-            await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-    except Exception: pass
-    try:
-        if http_client: await http_client.aclose()
-    except Exception: pass
+        try:
+            if not USE_WEBHOOK:
+                await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+        except Exception:
+            pass
+    finally:
+        release_global_lock()
+        try:
+            if http_client:
+                await http_client.aclose()
+        except Exception:
+            pass
 
 def handle_sigterm(signum, frame):
     try:
