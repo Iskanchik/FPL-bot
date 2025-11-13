@@ -1,23 +1,15 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# FULL RESTORED CODE
-# Request summary:
-# - Restored full live event processing (no truncation).
-# - Correct DC logic: Andersen case (3 pts = 2 minutes + 2 DC -1 for 2 goals conceded).
-#   Added goals_conceded penalty (-1 per 2 conceded for GK/DEF) into base point heuristic.
-# - DC detection:
-#   Show DC if:
-#     * threshold met OR
-#     * any DC stat field >0 OR
-#     * (total_points - base_points_without_other_events) >= 2 and no other events (heuristic).
-#   Base points now include minutes, clean sheet, save points for GK, card penalties,
-#   own goal, penalty missed, goals_conceded penalty.
-# - Authorization unchanged: replies only to owner or members of ALLOWED_GROUP_ID (4973694653).
-# - Live messages go to ALLOWED_GROUP_ID.
-# - Price prediction parser remains enhanced (categorization via progress thresholds; HTML fallback).
-# - Removed "(нет новых обновлений)" suffix (per prior request).
-# - Players points table uses Player header; month uses Manager; DC shows properly.
-# - Squid stop fully resets active cycle & winners history.
-# - Logging of command exceptions suppressed in safe_command/error_handler.
+# Full updated file (improvements applied except earlier optimization points 3 and 8)
+# Key points:
+# - Updated scoring per provided table (GK goal=10, DEF=6, MID=5, FWD=4, etc.).
+# - DC never awarded to GK.
+# - Stats show counts for repeated events: G2, A3, YC2, OG2, PM2, PS2, S2 (each S unit = 3 saves). CS/DC/RC/B remain without counts.
+# - Silent replies for user commands (disable_notification=True); auto notifications (live events, deadline reminders) with sound.
+# - Price parser outputs categories with "Rises:" / "Falls:" labels; improved HTML + JSON parse.
+# - Month table alignment fixed for "Сыграно: ... Осталось: ..." (centered precisely).
+# - Squid stop fully resets state and history.
+# - DC heuristic uses base points incl. goals_conceded penalty and excludes GK; shows DC only for non-GK if thresholds or diff>=2 with no other events.
+# - Full live event processing restored.
 
 import os
 import json
@@ -92,16 +84,12 @@ async def is_user_in_group(user_id: int) -> bool:
         return False
 
 async def is_authorized(update: Update) -> bool:
-    if is_owner(update):
-        return True
+    if is_owner(update): return True
     chat = update.effective_chat
     user = update.effective_user
-    if not chat or not user:
-        return False
-    if chat.id == ALLOWED_GROUP_ID:
-        return True
-    if chat.type == "private":
-        return await is_user_in_group(user.id)
+    if not chat or not user: return False
+    if chat.id == ALLOWED_GROUP_ID: return True
+    if chat.type == "private": return await is_user_in_group(user.id)
     return False
 
 # ===== Config =====
@@ -109,7 +97,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required")
 
-TARGET_CHAT_ID = str(ALLOWED_GROUP_ID)  # forced
+TARGET_CHAT_ID = str(ALLOWED_GROUP_ID)  # force group id for auto messages
 LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -206,10 +194,8 @@ async def fetch_json(url: str, timeout: float = 15.0, attempts: int = 3,
                 resp = await http_client.get(url, headers=headers, timeout=timeout)
             if return_response: return resp
             if resp.status_code==200:
-                try:
-                    return resp.json()
-                except Exception:
-                    return None
+                try: return resp.json()
+                except Exception: return None
             if resp.status_code in (403,429) or 500<=resp.status_code<600:
                 if attempt<attempts:
                     await asyncio.sleep(min(2**attempt,8)); continue
@@ -284,6 +270,13 @@ PRICES_URL="https://www.livefpl.net/prices"
 _last_fpl_update_dt: Optional[datetime]=None
 _last_fpl_update_cache_ts: Optional[float]=None
 LAST_FPL_UPDATE_TTL=60
+
+# ===== Helpers: notifications =====
+async def reply_silent(update: Update, text: str, parse_mode: Optional[str]=None):
+    try:
+        await update.message.reply_text(text, parse_mode=parse_mode, disable_notification=True)
+    except Exception:
+        pass
 
 def safe_command(fn:Callable):
     @wraps(fn)
@@ -544,24 +537,6 @@ async def get_league_player_ids_cached(gw:int)->Set[int]:
     _league_players_cache[gw]=(now,players)
     return players
 
-async def get_league_player_pick_counts(gw:int)->Dict[int,int]:
-    now=time.time()
-    cached=_league_player_pick_counts.get(gw)
-    if cached and now-cached[0]<=LEAGUE_PLAYERS_TTL: return cached[1]
-    results=await get_league_results_cached(LEAGUE_ID)
-    counts={}
-    if not results:
-        _league_player_pick_counts[gw]=(now,counts); return counts
-    coros=[get_entry_picks_cached(r["entry"],gw) for r in results if isinstance(r.get("entry"),int)]
-    data_all=await gather_limited(coros,PICKS_CONCURRENCY)
-    for pkg in data_all:
-        if isinstance(pkg,dict):
-            for p in pkg.get("picks",[]):
-                elid=p.get("element")
-                if isinstance(elid,int): counts[elid]=counts.get(elid,0)+1
-    _league_player_pick_counts[gw]=(now,counts)
-    return counts
-
 def get_current_or_next_gw(bootstrap:Dict[str,Any])->Optional[int]:
     cur=next((e for e in bootstrap.get("events",[]) if e.get("is_current")),None)
     if cur and isinstance(cur.get("id"),int): return cur["id"]
@@ -589,8 +564,10 @@ def total_no_bonus(stats:Dict[str,Any])->int:
     return int(stats.get("total_points",0) or 0)-int(stats.get("bonus",0) or 0)
 
 def event_points_for(pos:int, etype:str)->int:
+    # Updated per provided scoring
     if etype=="Goal":
-        if pos in (1,2): return 6
+        if pos==1: return 10
+        if pos==2: return 6
         if pos==3: return 5
         return 4
     if etype=="Assist": return 3
@@ -629,18 +606,18 @@ def compute_base_points(stats:Dict[str,Any], pos:int)->int:
     if cs:
         if pos in (1,2): base+=4
         elif pos==3: base+=1
+    # negative / per-event modifications
     yc=int(stats.get("yellow_cards",0) or 0)
     rc=int(stats.get("red_cards",0) or 0)
     og=int(stats.get("own_goals",0) or 0)
     pm=int(stats.get("penalties_missed",0) or 0)
-    # saves points (every 3 saves)
+    # saves
     if pos==1:
         base += int((stats.get("saves",0) or 0)//3)
-    # goals conceded penalty for GK/DEF (-1 per 2 conceded)
+    # goals conceded penalty
     gc=int(stats.get("goals_conceded",0) or 0)
     if pos in (1,2) and gc>=2:
         base -= (gc//2)
-    # card & negative events
     base -= yc
     base -= rc*3
     base -= og*2
@@ -669,14 +646,14 @@ def split_message_chunks(text:str, limit:int=3900)->List[str]:
 async def send_text_raw(chat_id:int, text:str):
     for c in split_message_chunks(text):
         try:
-            await application.bot.send_message(chat_id=chat_id, text=c)
+            await application.bot.send_message(chat_id=chat_id, text=c, disable_notification=False)
             await asyncio.sleep(0.03)
         except Exception:
             pass
 
 async def send_once(text:str, season:str, gw:int):
-    key=idempotency_set_key(season,gw)
     h=message_hash(text)
+    key=idempotency_set_key(season,gw)
     should=True
     if redis_client:
         try:
@@ -786,7 +763,7 @@ def parse_prices_from_json_enhanced(data:Any, ownership_map:Dict[str,float])->Di
 
 def parse_prices_from_html_enhanced(html:str, ownership_map:Dict[str,float])->Dict[str,Dict[str,List[Tuple[str,float]]]]:
     out={"Rises":{}, "Falls":{}}
-    pattern=r"([A-Z][A-Za-z\.' -]{2,})[^%]{0,60}?([-+]\d{1,3}\.\d{2})%"
+    pattern=r"([A-Z][A-Za-z\.' -]{2,})[^%]{0,80}?([-+]\d{1,3}\.\d{2})%"
     for nm,val_s in re.findall(pattern, html):
         try: val=float(val_s)
         except Exception: continue
@@ -798,6 +775,24 @@ def parse_prices_from_html_enhanced(html:str, ownership_map:Dict[str,float])->Di
         out[side].setdefault(cat,[])
         if not any(x[0].lower()==nm.lower() for x in out[side][cat]):
             out[side][cat].append((nm,val))
+    if BeautifulSoup:
+        try:
+            soup=BeautifulSoup(html,"html.parser")
+            for script in soup.find_all("script"):
+                if script.get("type")=="application/json":
+                    try:
+                        data=json.loads(script.string or "")
+                        nested=parse_prices_from_json_enhanced(data, ownership_map)
+                        for side in ("Rises","Falls"):
+                            for cat,items in nested[side].items():
+                                out[side].setdefault(cat,[])
+                                for nm,val in items:
+                                    if not any(x[0].lower()==nm.lower() for x in out[side][cat]):
+                                        out[side][cat].append((nm,val))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
     return out
 
 def player_meta_by_name(name:str)->Optional[Tuple[str,str,str]]:
@@ -871,8 +866,8 @@ def format_prices_mobile(parsed:Dict[str,Dict[str,List[Tuple[str,float]]]])->Lis
         lines.append(cat)
         rises=parsed.get("Rises",{}).get(cat,[])
         falls=parsed.get("Falls",{}).get(cat,[])
-        def fmt(items,prefix):
-            if not items: return f"  {prefix}: (нет)"
+        def fmt(items,label):
+            if not items: return f"  {label}: (нет)"
             parts=[]
             for nm,val in items:
                 meta=player_meta_by_name(nm)
@@ -883,12 +878,12 @@ def format_prices_mobile(parsed:Dict[str,Dict[str,List[Tuple[str,float]]]])->Lis
                 else:
                     tag=f"{nm} {pct}"
                 parts.append(tag)
-            return "  "+prefix+": "+", ".join(parts)
-        lines.append(fmt(rises,"R"))
-        lines.append(fmt(falls,"F"))
+            return "  "+label+": "+", ".join(parts)
+        lines.append(fmt(rises,"Rises"))
+        lines.append(fmt(falls,"Falls"))
     return lines
 
-# TZ Keyboards
+# ===== TZ Keyboards =====
 def build_tz_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Астана (UTC+5)",callback_data="tz|Астана"),
@@ -896,7 +891,7 @@ def build_tz_main_keyboard():
         [InlineKeyboardButton("Москва (UTC+3)",callback_data="tz|Москва"),
          InlineKeyboardButton("Киев (UTC+2)",callback_data="tz|Киев")],
         [InlineKeyboardButton("Центральная Европа (UTC+1)",callback_data="tz|Центральная Европа"),
-         InlineKeyboardButton("Лондон (UTC+0)",callback_data="tz|Лондон")],
+        InlineKeyboardButton("Лондон (UTC+0)",callback_data="tz|Лондон")],
         [InlineKeyboardButton("Другое…",callback_data="tz_more")]
     ])
 
@@ -927,7 +922,7 @@ async def tz_inline_callback(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await q.answer("Ок")
         await q.edit_message_text(f"Таймзона: {rn} (UTC{off:+d})")
 
-# Commands
+# ===== Commands =====
 @safe_command
 async def help_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     owner=is_owner(update)
@@ -945,7 +940,7 @@ async def help_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     lines.append("/squid_winners — победители Squid")
     lines.append("/squid_rules — правила Squid")
     lines.append("/tz <название|смещение> — таймзона")
-    await update.message.reply_text("\n".join(lines))
+    await reply_silent(update, "\n".join(lines))
 
 @safe_command
 async def settz_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -955,7 +950,7 @@ async def settz_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not info: return
     rn,off,zone=info
     set_user_tz(update.effective_user.id,rn,off,zone)
-    await update.message.reply_text(f"Таймзона: {rn} (UTC{off:+d})")
+    await reply_silent(update, f"Таймзона: {rn} (UTC{off:+d})")
 
 @safe_command
 async def deadline_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -975,7 +970,7 @@ async def deadline_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     left=int((local_dt-now_local).total_seconds())
     if left<0: left=0
     d=left//86400; h=(left%86400)//3600; m=(left%3600)//60
-    await update.message.reply_text(f"Дедлайн GW {e.get('id')}: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({tz_name} UTC{offset:+d})\nОсталось: {d}д {h}ч {m}м")
+    await reply_silent(update, f"Дедлайн GW {e.get('id')}: {local_dt.strftime('%Y-%m-%d %H:%M:%S')} ({tz_name} UTC{offset:+d})\nОсталось: {d}д {h}ч {m}м")
 
 @safe_command
 async def rank_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -995,7 +990,7 @@ async def rank_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     for r in rows:
         lines.append(f"{str(r.get('rank')).rjust(num_w)} {r.get('player_name','').ljust(name_w)} {str(r.get('total')).rjust(pts_w)}")
     lines.append("```")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_silent(update, "\n".join(lines), parse_mode="Markdown")
 
 @safe_command
 async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -1011,31 +1006,32 @@ async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     for el in live.get("elements",[]):
         pid=el.get("id")
         if pid not in league_players: continue
-        stats=el.get("stats",{}) or {}
+        s=el.get("stats",{}) or {}
         pos=PLAYER_POS_MAP.get(pid,0)
-        total=int(stats.get("total_points",0) or 0)
+        total=int(s.get("total_points",0) or 0)
         parts=[]
-        if stats.get("goals_scored",0): parts.append("G")
-        if stats.get("assists",0): parts.append("A")
-        if stats.get("clean_sheets",0) and pos!=4: parts.append("CS")
+        g=int(s.get("goals_scored",0) or 0);        parts.append("G"+(str(g) if g>1 else "")) if g else None
+        a=int(s.get("assists",0) or 0);             parts.append("A"+(str(a) if a>1 else "")) if a else None
+        cs=int(s.get("clean_sheets",0) or 0);       parts.append("CS") if cs and pos!=4 else None
         dc_show=False
-        if dc_threshold_met(stats,pos) or has_any_dc(stats):
+        if pos!=1 and (dc_threshold_met(s,pos) or has_any_dc(s)):
             dc_show=True
         else:
-            base=compute_base_points(stats,pos)
-            diff=total-base
-            if diff>=2 and not parts:
-                dc_show=True
-        if dc_show: parts.append("DC")
-        if stats.get("yellow_cards",0): parts.append("YC")
-        if stats.get("red_cards",0): parts.append("RC")
+            if pos!=1:
+                base=compute_base_points(s,pos)
+                diff=total-base
+                if diff>=2 and not (g or a or cs or s.get("penalties_saved") or s.get("bonus") or s.get("own_goals") or s.get("penalties_missed") or s.get("red_cards") or s.get("yellow_cards")):
+                    dc_show=True
+        parts.append("DC") if dc_show else None
+        yc=int(s.get("yellow_cards",0) or 0);       parts.append("YC"+(str(yc) if yc>1 else "")) if yc else None
+        rc=int(s.get("red_cards",0) or 0);          parts.append("RC") if rc else None
         if pos==1:
-            saves=int(stats.get("saves",0) or 0)
-            if saves>=3: parts.append("S")
-        if stats.get("own_goals",0): parts.append("OG")
-        if stats.get("penalties_missed",0): parts.append("PM")
-        if stats.get("penalties_saved",0): parts.append("PS")
-        if stats.get("bonus",0): parts.append("B")
+            saves=int(s.get("saves",0) or 0); gks=saves//3
+            parts.append("S"+(str(gks) if gks>1 else "")) if gks>0 else None
+        og=int(s.get("own_goals",0) or 0);          parts.append("OG"+(str(og) if og>1 else "")) if og else None
+        pm=int(s.get("penalties_missed",0) or 0);   parts.append("PM"+(str(pm) if pm>1 else "")) if pm else None
+        ps=int(s.get("penalties_saved",0) or 0);    parts.append("PS"+(str(ps) if ps>1 else "")) if ps else None
+        b=int(s.get("bonus",0) or 0);               parts.append("B") if b else None
         if not parts and total<=2:
             continue
         rows.append({"name":PLAYER_NAME_MAP.get(pid,f'P{pid}'),
@@ -1069,9 +1065,12 @@ async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "B - bonus"
     ]
     lines.extend(legend)
-    for chunk in split_message_chunks("\n".join(lines)):
-        try: await update.message.reply_text(chunk, parse_mode="Markdown")
-        except Exception: await update.message.reply_text(chunk.replace("```",""))
+    text="\n".join(lines)
+    for chunk in split_message_chunks(text):
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown", disable_notification=True)
+        except Exception:
+            await update.message.reply_text(chunk.replace("```",""), disable_notification=True)
 
 @safe_command
 async def gwpoints_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -1100,7 +1099,7 @@ async def gwpoints_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         pts=e[2] if e[2]>=0 else "n/a"
         lines.append(f"{str(i).rjust(num_w)} {e[1].ljust(name_w)} {str(pts).rjust(pts_w)}")
     lines.append("```")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_silent(update, "\n".join(lines), parse_mode="Markdown")
 
 RUS_MONTH={1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
 SEASON_MONTH_ORDER=[8,9,10,11,12,1,2,3,4,5]
@@ -1171,9 +1170,9 @@ async def month_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     for i,(eid,_nm,pts) in enumerate(top, start=1):
         lines.append(f"{str(i).rjust(num_w)} {manager_name(eid).ljust(name_w)} {str(pts).rjust(pts_w)}")
     lines.append("```")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_silent(update, "\n".join(lines), parse_mode="Markdown")
 
-# Squid Game
+# ===== Squid Game =====
 SQUID_ACTIVE_KEY="fpl:squid:active"
 SQUID_WINNERS_KEY="fpl:squid:winners"
 
@@ -1217,7 +1216,7 @@ async def squid_start_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "cycle": (squid_winner_history[-1]["cycle"]+1) if squid_winner_history else 1
     }
     persist_squid()
-    await update.message.reply_text(f"Squid Game стартовал с GW {start_gw}. Участников: {len(players)}.")
+    await reply_silent(update, f"Squid Game стартовал с GW {start_gw}. Участников: {len(players)}.")
 
 @safe_command
 async def squid_stop_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -1226,16 +1225,16 @@ async def squid_stop_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     squid_active_state=None
     squid_winner_history=[]
     persist_squid()
-    await update.message.reply_text("Squid Game полностью сброшен.")
+    await reply_silent(update, "Squid Game полностью сброшен.")
 
 @safe_command
 async def squid_rules_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Squid: после каждого завершённого тура остаются менеджеры с очками >= среднего; игра до одного победителя или до GW38.")
+    await reply_silent(update, "Squid: после каждого завершённого тура остаются менеджеры с очками >= среднего; игра до одного победителя или до GW38.")
 
 @safe_command
 async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not squid_active_state:
-        await update.message.reply_text("Цикл не активен."); return
+        await reply_silent(update, "Цикл не активен."); return
     start_gw=squid_active_state["start_gw"]
     current_gw=squid_active_state["current_gw"]
     alive=squid_active_state["players_alive"]
@@ -1249,16 +1248,16 @@ async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE)
         lines.append(f"{i}. {manager_name(eid)}")
     if len(alive)>50:
         lines.append(f"... ещё {len(alive)-50}")
-    await update.message.reply_text("\n".join(lines))
+    await reply_silent(update, "\n".join(lines))
 
 @safe_command
 async def squid_winners_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not squid_winner_history:
-        await update.message.reply_text("Победителей нет."); return
+        await reply_silent(update, "Победителей нет."); return
     lines=["Победители:"]
     for w in squid_winner_history:
         lines.append(f"Цикл {w.get('cycle')} — {manager_name(w.get('winner_entry'))} ({w.get('start_gw')}–{w.get('end_gw')})")
-    await update.message.reply_text("\n".join(lines))
+    await reply_silent(update, "\n".join(lines))
 
 async def process_squid_after_gw_finish(finished_gw:int):
     global squid_active_state
@@ -1334,11 +1333,12 @@ async def prices_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
                 obj=json.loads(raw); prices_cache_data=obj; prices_cache_ts=obj.get("ts")
         except Exception: pass
     data=await get_prices_data()
-    if not data.get("ok"): await update.message.reply_text("Нет данных цен."); return
+    if not data.get("ok"): await reply_silent(update, "Нет данных цен."); return
     parsed=data["parsed"]
     lines=format_prices_mobile(parsed)
-    await update.message.reply_text("\n".join(lines))
+    await reply_silent(update, "\n".join(lines))
 
+# ===== Live Monitor Loop =====
 async def live_monitor_loop():
     global _current_gw,last_live_tick_time,last_active_fixtures_count
     while not stop_event.is_set():
@@ -1349,7 +1349,7 @@ async def live_monitor_loop():
             season=discover_season_tag(bs)
             last_live_tick_time=time.time()
             await measure_redis_latency()
-            # Squid post-processing for finished events
+            # Squid post-processing
             for e in bs.get("events",[]):
                 if e.get("finished") and isinstance(e.get("id"),int):
                     await process_squid_after_gw_finish(e.get("id"))
@@ -1413,7 +1413,6 @@ async def live_monitor_loop():
             if not any_delta:
                 await asyncio.sleep(LIVE_POLL_INTERVAL); continue
 
-            # Process each fixture
             for fid in sorted(set(list(pos_pool.keys())+list(neg_pool.keys()))):
                 fx=fixture_index.get(fid,{})
                 if not fx: continue
@@ -1445,7 +1444,7 @@ async def live_monitor_loop():
                             f"Assist - {PLAYER_NAME_MAP.get(to_pid)} {format_points(pts_to)}, total ({tot_to})."
                         )
 
-                # Penalty retake sequence (remove miss/save, add goal)
+                # Penalty retake sequence
                 while neg_pool.get(fid,{}).get("penalties_missed") and neg_pool.get(fid,{}).get("penalties_saved") and pos_pool.get(fid,{}).get("goals_scored"):
                     m_pid=neg_pool[fid]["penalties_missed"].pop(0)
                     s_pid=neg_pool[fid]["penalties_saved"].pop(0)
@@ -1497,10 +1496,9 @@ async def live_monitor_loop():
                 for um in update_msgs:
                     await send_once(um, season, gw)
 
-                # Positive events
                 pos_events=pos_pool.get(fid,{})
 
-                # Goals (with potential assist)
+                # Goals with assist
                 goals=list(pos_events.get("goals_scored",[]))
                 assists=list(pos_events.get("assists",[]))
                 while goals:
@@ -1617,6 +1615,7 @@ async def live_monitor_loop():
                 # DC award
                 for (pfid,pid),(pos_d,m_d,tot_d) in list(player_state.items()):
                     if pfid!=fid: continue
+                    if pos_d==1: continue
                     key=ns_key(gw,fid,pid)
                     if key in _dc_awarded: continue
                     el=live_by_id.get(pid,{})
@@ -1627,17 +1626,16 @@ async def live_monitor_loop():
                         m=format_minute_str(m_d,fid,fixture_max_minute)
                         await send_once(f"{header_line()}\n{m} DC - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({tot_d}).", season, gw)
                     else:
-                        # Heuristic detection: if awarding DC already included but fields missing
                         total_pts=int(stats_overall.get("total_points",0) or 0)
                         base=compute_base_points(stats_overall,pos_d)
                         diff=total_pts-base
-                        if diff>=2:  # treat as DC award
+                        if diff>=2:
                             _dc_awarded.add(key)
                             pts=2
                             m=format_minute_str(m_d,fid,fixture_max_minute)
                             await send_once(f"{header_line()}\n{m} DC (heuristic) - {PLAYER_NAME_MAP.get(pid)} {format_points(pts)}, total ({total_pts}).", season, gw)
 
-            # Fixture summaries (with bonus)
+            # Fixture summaries
             finished=[fx for fx in fixtures if fx.get("finished")]
             for fx in finished:
                 fid=fx.get("id")
@@ -1667,6 +1665,7 @@ async def live_monitor_loop():
         except Exception:
             await asyncio.sleep(LIVE_POLL_INTERVAL)
 
+# ===== Deadline notifier =====
 async def deadline_notifier():
     while not stop_event.is_set():
         try:
@@ -1693,6 +1692,7 @@ async def deadline_notifier():
         except Exception:
             await asyncio.sleep(600)
 
+# ===== Setup bot commands =====
 async def setup_bot_commands(bot):
     cmds=[
         BotCommand("help","Описание"),
