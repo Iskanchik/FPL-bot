@@ -2317,11 +2317,9 @@ if __name__ == "__main__":
     try:
         asyncio.run(run_bot())
     except RuntimeError as e:
-        if "running event loop" in str(e).lower():
-            logger.warning("Event loop already running; scheduling run_bot() on existing loop.")
-            loop = asyncio.get_event_loop()
+        # Fallback только для ситуации "уже есть активный цикл" (напр. Jupyter)
+        if "asyncio.run() cannot be called from a running event loop" in str(e):
+            loop = asyncio.get_running_loop()
             loop.create_task(run_bot())
         else:
-            logger.error("Fatal run error: %s", e)
-    except Exception as e:
-        logger.error("Fatal run error: %s", e)
+            raise
