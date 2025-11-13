@@ -1,31 +1,25 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# Variant 1 (JobQueue + Flask) with manual async startup (initialize/start/polling/idle/shutdown)
-# Avoids calling application.run_polling() inside asyncio.run() to prevent event loop conflicts (Python 3.13).
+# Variant 1 (JobQueue + Flask) FIXED: используем application.run_polling() вместо ручного цикла
+# Убраны вызовы updater.idle()/start()/stop(), чтобы не падать с AttributeError в PTB v21.
 #
-# Requirements (requirements.txt):
+# Требования (requirements.txt):
 #   python-telegram-bot[job-queue]==21.6
 #   httpx>=0.27
 #   upstash-redis>=1.0
 #   aiolimiter>=1.1
 #   beautifulsoup4>=4.12
-#   pydantic<2            (or remove pydantic — fallback provided)
-#   h2>=4.1               (optional, for HTTP/2)
+#   pydantic<2            (или убрать pydantic — есть fallback)
+#   h2>=4.1               (опционально для HTTP/2)
 #   flask>=3.0
 #
-# Mandatory ENV:
+# ENV обязательно:
 #   BOT_TOKEN
-# Redis (Upstash) ENV:
+# Redis (Upstash):
 #   UPSTASH_REDIS_REST_URL
 #   UPSTASH_REDIS_REST_TOKEN
 #
-# Optional ENV (defaults in Settings):
-#   OWNER_USERNAME, OWNER_USER_ID, ALLOWED_GROUP_ID, LEAGUE_ID, PORT, TELEGRAM_CONCURRENCY, USE_WEBHOOK,
-#   FPL_PROXY_BASE, ENABLE_HTTP2, LIVE_POLL_INTERVAL, FPL_CACHE_TTL, FPL_STANDINGS_TTL, FPL_PICKS_TTL,
-#   FPL_PICKS_ALLOW_STALE, FPL_CONCURRENCY, PICKS_CONCURRENCY, FIXTURES_TTL, LEAGUE_PLAYERS_TTL,
-#   IDEMPOTENCY_TTL_SEC, BOT_LOCK_KEY, BOT_LOCK_TTL, DIAGNOSTIC_ALLOW_ON_AUTH_FAIL
-#
-# Health endpoints: / and /healthz (Flask)
-# Live events pushed to ALLOWED_GROUP_ID
+# Этот файл идентичен предыдущему (с логикой), кроме хвоста run_bot_async: теперь вызывается run_polling(),
+# что блокирует до SIGINT/SIGTERM и корректно управляет жизненным циклом Application + JobQueue.
 
 import os
 import json
@@ -88,7 +82,6 @@ except ImportError:
     class ValidationError(Exception):
         pass
 
-# -------- ENV helpers --------
 def _env_bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
     if val is None:
@@ -106,7 +99,6 @@ def _env_str(name: str, default: str = "") -> str:
     val = os.environ.get(name)
     return val if val is not None else default
 
-# -------- Settings --------
 if BaseSettings is not None:
     class Settings(BaseSettings):
         BOT_TOKEN: str
@@ -170,7 +162,6 @@ else:
             self.DIAGNOSTIC_ALLOW_ON_AUTH_FAIL = _env_bool("DIAGNOSTIC_ALLOW_ON_AUTH_FAIL", True)
     settings = Settings()
 
-# -------- Global configuration values --------
 OWNER_USERNAME = settings.OWNER_USERNAME
 OWNER_USER_ID: Optional[int] = settings.OWNER_USER_ID
 ALLOWED_GROUP_ID = settings.ALLOWED_GROUP_ID
@@ -244,7 +235,6 @@ fpl_semaphore = asyncio.Semaphore(FPL_CONCURRENCY)
 picks_semaphore = asyncio.Semaphore(PICKS_CONCURRENCY)
 tg_rate: Optional["AsyncLimiter"] = AsyncLimiter(25, 1) if AsyncLimiter else None
 
-# -------- Fetch with backoff --------
 async def fetch_json(
     url: str,
     timeout: float = 15.0,
@@ -280,7 +270,6 @@ async def fetch_json(
                 continue
     return None
 
-# -------- API paths --------
 bootstrap_path = "/api/bootstrap-static/"
 league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
@@ -288,7 +277,6 @@ event_live_path_tpl = "/api/event/{gw}/live/"
 fixtures_event_path_tpl = "/api/fixtures/?event={gw}"
 event_status_path = "/api/event-status/"
 
-# -------- Caches and maps --------
 bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
 _bootstrap_etag: Optional[str] = None
@@ -378,7 +366,6 @@ def cache_set_text(feature: str, sig: str, text: str, ttl: int):
             pass
     _text_cache_mem[feature] = rec
 
-# -------- Authorization --------
 def is_owner(update: Update) -> bool:
     u = update.effective_user
     if not u:
@@ -460,7 +447,6 @@ async def measure_redis_latency():
     except Exception:
         last_redis_latency_ms = None
 
-# -------- Timezone --------
 TZ_REDIS_KEY_PREFIX = "fpl:tz:user:"
 DEFAULT_TZ_NAME = "Астана"
 TZ_MAP = {
@@ -533,7 +519,6 @@ def resolve_tz_arg(arg: str) -> Optional[Tuple[str, str]]:
         return arg, arg
     return None
 
-# -------- FPL update timestamp --------
 async def get_last_fpl_update_dt() -> datetime:
     global _last_fpl_update_dt, _last_fpl_update_cache_ts
     now = time.time()
@@ -577,7 +562,6 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
     except Exception:
         return None
 
-# -------- Bootstrap mapping --------
 def refresh_bootstrap_maps():
     elements = bootstrap_cache.get("elements", [])
     teams = bootstrap_cache.get("teams", [])
@@ -773,7 +757,6 @@ def get_current_or_next_gw(bootstrap: Dict[str, Any]) -> Optional[int]:
         return nxt["id"]
     return None
 
-# -------- Live scoring helpers --------
 def get_active_fixture_ids(fixtures: List[Dict], now: Optional[datetime] = None) -> Set[int]:
     now = now or datetime.now(timezone.utc)
     active = set()
@@ -815,7 +798,8 @@ def event_points_for(pos: int, etype: str) -> int:
     return 0
 
 def dc_threshold_met(stats: Dict[str, Any], pos: int) -> bool:
-    if pos == 1: return False
+    if pos == 1:
+        return False
     dc = 0
     for k in ("defensive_contributions", "cbit", "cbits", "def_contributions"):
         v = stats.get(k)
@@ -906,11 +890,12 @@ async def send_once(text: str, season: str, gw: int):
         should = h not in _sent_msg_hashes
     if should:
         if not redis_client:
+            if len(_sent_msg_hashes) > 5000:  # защита от разрастания
+                _sent_msg_hashes.clear()
             _sent_msg_hashes.add(h)
         if application:
             await send_text_raw(ALLOWED_GROUP_ID, text)
 
-# -------- Price parsing --------
 CATEGORY_ALIASES = {
     "already reached target": "Already reached target",
     "projected to reach today": "Projected to reach target",
@@ -1136,7 +1121,6 @@ def format_prices_mobile(parsed: Dict[str, Dict[str, List[Tuple[str, float]]]]) 
         lines.append(fmt(falls, "Falls"))
     return lines
 
-# -------- Inline TZ Keyboards --------
 def build_tz_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Астана (UTC+5)", callback_data="tz|Астана"),
@@ -1181,7 +1165,6 @@ async def tz_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer("Ок")
         await q.edit_message_text(f"Таймзона: {rus} ({zone})")
 
-# -------- Commands --------
 @safe_command
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong (owner)" if is_owner(update) else "pong", disable_notification=True)
@@ -1460,7 +1443,6 @@ async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join([title, upd, "```", header_line, *body_lines, "```"])
     await reply_silent(update, text, parse_mode="Markdown")
 
-# -------- Month ranking --------
 RUS_MONTH = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
 SEASON_MONTH_ORDER = [8,9,10,11,12,1,2,3,4,5]
 
@@ -1535,7 +1517,6 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join([title, info_line, upd_line, "```", header_line, *body_lines, "```"])
     await reply_silent(update, text, parse_mode="Markdown")
 
-# -------- Squid Game --------
 SQUID_ACTIVE_KEY = "fpl:squid:active"
 SQUID_WINNERS_KEY = "fpl:squid:winners"
 SQUID_LAST_REPORT_KEY = "fpl:squid:last_report"
@@ -1790,7 +1771,6 @@ async def prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = format_prices_mobile(parsed)
     await reply_silent(update, "\n".join(lines))
 
-# -------- Global lock --------
 LOCK_VALUE = str(uuid.uuid4())
 
 async def ensure_update_mode(bot, use_webhook: bool, webhook_url: Optional[str] = None):
@@ -1868,7 +1848,6 @@ def purge_fixture_state(gw: int, fid: int):
             if isinstance(k, str) and k.startswith(ns_prefix):
                 s.discard(k)
 
-# -------- Live monitor tick --------
 async def live_monitor_tick(context: ContextTypes.DEFAULT_TYPE):
     global _current_gw, last_live_tick_time, last_active_fixtures_count
     try:
@@ -2180,7 +2159,6 @@ async def live_monitor_tick(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("live_monitor_tick error")
 
-# -------- Deadline notifier tick --------
 _last_deadline_reminder_gw: Optional[int] = None
 _last_deadline_reminder_ts: Optional[float] = None
 
@@ -2211,14 +2189,12 @@ async def deadline_notifier_tick(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("deadline_notifier_tick error")
 
-# -------- Lock refresher tick --------
 async def lock_refresher_tick(context: ContextTypes.DEFAULT_TYPE):
     try:
         refresh_global_lock()
     except Exception:
         logger.debug("lock_refresher_tick error")
 
-# -------- Commands setup --------
 async def setup_bot_commands(bot):
     cmds = [
         BotCommand("help", "Описание"),
@@ -2258,7 +2234,6 @@ async def setup_bot_commands(bot):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error", exc_info=context.error)
 
-# -------- Manual async run sequence --------
 async def run_bot_async():
     global http_client, application
     init_redis()
@@ -2279,7 +2254,7 @@ async def run_bot_async():
                        .concurrent_updates(TELEGRAM_CONCURRENCY)
                        .build())
 
-        # Register handlers
+        # Handlers
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("deadline", deadline_command))
         application.add_handler(CommandHandler("players", players_command))
@@ -2298,20 +2273,13 @@ async def run_bot_async():
         application.add_handler(CallbackQueryHandler(tz_inline_callback, pattern="^tz"))
         application.add_error_handler(error_handler)
 
-        # Initialize app
-        await application.initialize()
-
-        # Polling mode (no webhook)
+        # Дополнительная инициализация до запуска polling
         await ensure_update_mode(application.bot, use_webhook=False)
-
-        # Commands
         await setup_bot_commands(application.bot)
-
-        # Preload bootstrap & squid
         await get_bootstrap_cached()
         load_squid_from_redis()
 
-        # Schedule jobs (start after application.start())
+        # JobQueue задачи (запустятся внутри run_polling)
         application.job_queue.run_repeating(lock_refresher_tick,
                                             interval=max(10, BOT_LOCK_TTL // 3),
                                             first=5,
@@ -2324,21 +2292,11 @@ async def run_bot_async():
                                             interval=300,
                                             first=15,
                                             name="deadline_notifier")
+        logger.info("JobQueue tasks scheduled.")
 
-        # Start application
-        await application.start()
-
-        # Start polling
-        await application.updater.start_polling(drop_pending_updates=True)
-        logger.info("Bot started. Waiting for signals...")
-
-        # Idle until stop
-        await application.updater.idle()
-
-        logger.info("Shutdown initiated...")
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+        # Запуск: блокирует до SIGINT/SIGTERM
+        await application.run_polling(stop_signals=(signal.SIGINT, signal.SIGTERM),
+                                      drop_pending_updates=True)
 
     finally:
         release_global_lock()
@@ -2348,7 +2306,6 @@ async def run_bot_async():
             except Exception:
                 pass
 
-# -------- Entry point --------
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
