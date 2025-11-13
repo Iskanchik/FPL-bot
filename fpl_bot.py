@@ -1,18 +1,23 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# Updates in this revision:
-# - Sorting in /players_pts: tie-break by league ownership (number of managers who picked the player this GW).
-# - Player names truncated to 12 chars in /players_pts to keep Stats column aligned; all tables are centered (headers and rows).
-# - Legend: removed the long explanation for saves (now "S - saves").
-# - Month info line: "Сыграно: X осталось: Y" on its own line, no extra spaces, "осталось" in lowercase.
-# - Kept earlier improvements:
-#   * Signature + text cache for /rank and /players_pts (per GW + last FPL update).
-#   * Reduced attempts/timeouts for high‑frequency live endpoints.
-#   * Cleanup of old picks to limit memory growth.
-#   * Warnings instead of fully silent exceptions in several places.
-#   * Counts for PM and PS always shown (PM1 / PS1), Bonus always shown with count (B1..B3).
-#   * Last Squid final report cached in memory + Redis; /squid_status returns it (variant 1).
-# - DC logic unchanged (never for GK).
-# - Silent replies for commands; auto notifications with sound.
+# This revision includes:
+# - Variant 1 for Squid status: /squid_status returns the last final Squid report; auto-report now shows cycle number and start GW.
+# - Players table (/players_pts):
+#   * Center alignment for all columns and header
+#   * Player names truncated to 12 chars
+#   * Tie-break: when points equal, sort by league ownership (picked count) descending
+#   * Tokens PM, PS, S do NOT show count when it is 1 (PM, PS, S). If >1 → PM2, PS2, S2...
+#   * Legend: “S - saves” (no extra explanation)
+# - Month table:
+#   * Center alignment for table
+#   * Info line on its own row: "Сыграно: X осталось: Y" (lowercase 'осталось', no extra spaces)
+# - Rank and GW-points tables are centered
+# - Caches and optimizations kept:
+#   * Signature + text cache for /rank and /players_pts
+#   * Reduced attempts/timeouts for frequent endpoints
+#   * Cleanup of old picks cache
+#   * Redis-backed idempotency for live messages
+# - Ensure manager names available for Squid (fallback to FPL entry endpoint + Redis cache)
+# - Silent replies for commands; auto notifications with sound
 
 import os
 import json
@@ -75,8 +80,7 @@ async def is_user_in_group(user_id: int) -> bool:
     if cached and (now - cached[0]) < GROUP_MEMBERSHIP_TTL:
         return cached[1]
     if not application:
-        _group_membership_cache[user_id] = (now, False)
-        return False
+        _group_membership_cache[user_id] = (now, False); return False
     try:
         member = await application.bot.get_chat_member(ALLOWED_GROUP_ID, user_id)
         ok = member.status not in ("left", "kicked")
@@ -100,7 +104,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN required")
 
-TARGET_CHAT_ID = str(ALLOWED_GROUP_ID)  # force group id for auto messages
+TARGET_CHAT_ID = str(ALLOWED_GROUP_ID)
 LEAGUE_ID = os.environ.get("LEAGUE_ID", "980121")
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -666,7 +670,6 @@ def compute_base_points(stats:Dict[str,Any], pos:int)->int:
     if cs:
         if pos in (1,2): base+=4
         elif pos==3: base+=1
-    # negatives and special
     yc=int(stats.get("yellow_cards",0) or 0)
     rc=int(stats.get("red_cards",0) or 0)
     og=int(stats.get("own_goals",0) or 0)
@@ -724,8 +727,7 @@ async def send_once(text:str, season:str, gw:int):
         should=h not in _sent_msg_hashes
     if should:
         if not redis_client: _sent_msg_hashes.add(h)
-        if application:
-            await send_text_raw(ALLOWED_GROUP_ID, text)
+        if application: await send_text_raw(ALLOWED_GROUP_ID, text)
 
 def parse_deadline(dt_str:str)->Optional[datetime]:
     if not dt_str: return None
@@ -1084,13 +1086,13 @@ def format_stats_tokens(s:Dict[str,Any], pos:int)->List[str]:
     if pos==1:
         saves=int(s.get("saves",0) or 0)
         blocks=saves//3
-        if blocks>0: tokens.append(f"S{blocks}")
+        if blocks>0: tokens.append("S" if blocks==1 else f"S{blocks}")
     og=int(s.get("own_goals",0) or 0)
     if og>0: tokens.append(f"OG{og}" if og>1 else "OG")
     pm=int(s.get("penalties_missed",0) or 0)
-    if pm>0: tokens.append(f"PM{pm}")
+    if pm>0: tokens.append("PM" if pm==1 else f"PM{pm}")
     ps=int(s.get("penalties_saved",0) or 0)
-    if ps>0: tokens.append(f"PS{ps}")
+    if ps>0: tokens.append("PS" if ps==1 else f"PS{ps}")
     b=int(s.get("bonus",0) or 0)
     if b>0: tokens.append(f"B{b}")
     return tokens
@@ -1294,6 +1296,7 @@ async def month_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
 SQUID_ACTIVE_KEY="fpl:squid:active"
 SQUID_WINNERS_KEY="fpl:squid:winners"
 SQUID_LAST_REPORT_KEY="fpl:squid:last_report"
+ENTRY_NAMES_HASH_KEY="fpl:entry_names"
 
 def load_squid_from_redis():
     global squid_active_state,squid_winner_history
@@ -1318,6 +1321,37 @@ def persist_squid():
         redis_client.set(SQUID_WINNERS_KEY,json.dumps(squid_winner_history))
     except Exception as e:
         logger.warning("Persist squid failed: %s", e)
+
+async def ensure_entry_names(entries: List[int]):
+    missing: List[int] = []
+    for e in entries:
+        if e in ENTRY_TO_MANAGER_NAME and ENTRY_TO_MANAGER_NAME[e]:
+            continue
+        nm = None
+        if redis_client:
+            try:
+                raw = redis_client.hget(ENTRY_NAMES_HASH_KEY, str(e))
+                nm = _ensure_str(raw)
+            except Exception:
+                nm = None
+        if nm:
+            ENTRY_TO_MANAGER_NAME[e] = nm
+        else:
+            missing.append(e)
+    if not missing:
+        return
+    async def fetch_name(eid: int):
+        data = await fetch_json(fpl_url(f"/api/entry/{eid}/"), timeout=10, attempts=2)
+        if not isinstance(data, dict): return
+        fn = (data.get("player_first_name") or "").strip()
+        ln = (data.get("player_last_name") or "").strip()
+        nm = (f"{fn} {ln}").strip() or (data.get("name") or "").strip()
+        if nm:
+            ENTRY_TO_MANAGER_NAME[eid] = nm
+            if redis_client:
+                try: redis_client.hset(ENTRY_NAMES_HASH_KEY, str(eid), nm)
+                except Exception: pass
+    await gather_limited([fetch_name(e) for e in missing], limit=5)
 
 @safe_command
 async def squid_start_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -1355,6 +1389,7 @@ async def squid_rules_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 @safe_command
 async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    # Prefer the latest final report
     if redis_client:
         try:
             rep=redis_client.get(SQUID_LAST_REPORT_KEY)
@@ -1364,11 +1399,16 @@ async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE)
         except Exception: pass
     if LAST_SQUID_REPORT_TEXT:
         await reply_silent(update, LAST_SQUID_REPORT_TEXT); return
+
+    # Fallback: live status with names ensured
+    await get_league_results_cached(LEAGUE_ID)
     if not squid_active_state:
         await reply_silent(update, "Цикл не активен."); return
+    alive=squid_active_state.get("players_alive",[]) or []
+    await ensure_entry_names(alive)
+
     start_gw=squid_active_state["start_gw"]
     current_gw=squid_active_state["current_gw"]
-    alive=squid_active_state["players_alive"]
     lines=[
         f"Squid Game статус (цикл {squid_active_state.get('cycle',1)})",
         f"Старт: GW {start_gw}",
@@ -1385,6 +1425,9 @@ async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE)
 async def squid_winners_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not squid_winner_history:
         await reply_silent(update, "Победителей нет."); return
+    await get_league_results_cached(LEAGUE_ID)
+    winner_ids = [w.get("winner_entry") for w in squid_winner_history if isinstance(w.get("winner_entry"), int)]
+    await ensure_entry_names(winner_ids)
     lines=["Победители:"]
     for w in squid_winner_history:
         lines.append(f"Цикл {w.get('cycle')} — {manager_name(w.get('winner_entry'))} ({w.get('start_gw')}–{w.get('end_gw')})")
@@ -1410,13 +1453,17 @@ async def process_squid_after_gw_finish(finished_gw:int):
         winner=max(alive,key=lambda e:pmap.get(e,0))
     elif len(passed)<=1:
         winner=passed[0] if passed else max(alive,key=lambda e:pmap.get(e,0))
-    lines=[f"Squid Game — GW {finished_gw} завершён. Среднее: {avg:.2f}"]
+    cycle=squid_active_state.get("cycle",1)
+    start_gw=squid_active_state.get("start_gw")
+    # Include cycle number and start GW in header line
+    lines=[f"Squid Game — цикл {cycle} (старт GW {start_gw}) — GW {finished_gw} завершён. Среднее: {avg:.2f}"]
     if winner:
+        await ensure_entry_names([winner])
         lines.append(f"Победитель: {manager_name(winner)}")
         squid_winner_history.append({
-            "cycle": squid_active_state.get("cycle",1),
+            "cycle": cycle,
             "winner_entry": winner,
-            "start_gw": squid_active_state["start_gw"],
+            "start_gw": start_gw,
             "end_gw": finished_gw
         })
         if not gw38 and finished_gw<38:
@@ -1430,7 +1477,7 @@ async def process_squid_after_gw_finish(finished_gw:int):
                     "players_alive":players,
                     "players_eliminated":[],
                     "season":SEASON_TAG,
-                    "cycle":squid_winner_history[-1]["cycle"]+1
+                    "cycle":cycle+1
                 }
                 lines.append(f"Новый цикл: GW {next_gw}")
             else:
@@ -1440,6 +1487,7 @@ async def process_squid_after_gw_finish(finished_gw:int):
             squid_active_state=None
             lines.append("Цикл завершён.")
     else:
+        await ensure_entry_names(passed+eliminated)
         lines.append(f"Прошли ({len(passed)}):")
         for i,e in enumerate(sorted(passed,key=lambda x:pmap.get(x,0), reverse=True), start=1):
             lines.append(f"{i}. {manager_name(e)} {pmap.get(e,0)}")
@@ -1887,7 +1935,6 @@ async def run_bot():
     await application.start()
     await setup_bot_commands(application.bot)
 
-    # Bootstrap at start (could be made lazy by running in background)
     await get_bootstrap_cached()
     load_squid_from_redis()
 
