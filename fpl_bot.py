@@ -1,23 +1,15 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# Improvements implemented (per request: 1-3, 5-8, 10, 14-15):
-# 1) Switched to Application.run_polling() for simpler, safer startup/shutdown.
-# 2) Safe Redis global lock using UUID + Lua compare-and-del.
-# 3) Telegram send rate limiting via aiolimiter (fallback if not installed).
-# 5) Centralized configuration/validation using Pydantic Settings (ENV-based).
-# 6) Timezone handling via zoneinfo; dynamic UTC offset from the IANA zone.
-# 7) Webhook explicitly disabled in polling mode; auto-delete webhook before polling.
-# 8) Purge per-fixture live state after final summary to control memory growth.
-# 10) Improved fetch_json with structured exponential backoff and per-endpoint timeouts.
-# 14) Cache signatures for /rank and /players tied to last FPL update and active fixtures.
-# 15) Added type hints and docstrings for key functions for maintainability.
-#
-# Other previously delivered features kept:
-# - Full live event monitor (goals, assists, VAR, OG, PM/PS, cards, DC, CS subbed, final summaries)
-# - Squid final report includes cycle and start GW
-# - Manager name fallback + Redis cache for Squid
-# - Text cache for /rank and /players
-# - Diagnostic commands: /ping and /debug (owner only)
-# - Centered tables, truncated names, ownership tie-break, compact tokens (G,A,PM,PS,S without “1”)
+# Improvements implemented (per request: 1-3, 5-8, 10, 14-15) + Safe Settings fallback when Pydantic is absent:
+# 1) Application.run_polling()
+# 2) Safe Redis lock (UUID + Lua)
+# 3) Telegram rate limiting via aiolimiter (fallback if not installed)
+# 5) Pydantic Settings OR fallback ENV loader when Pydantic is missing
+# 6) zoneinfo TZ handling
+# 7) Webhook disabled in polling
+# 8) Purge per-fixture live state
+# 10) fetch_json backoff
+# 14) Cache signatures tied to last FPL update and active fixtures
+# 15) Type hints & docstrings
 
 import os
 import json
@@ -74,55 +66,116 @@ try:
 except ImportError:
     AsyncLimiter = None
 
+# Pydantic is optional; provide safe fallback if missing
 try:
     from pydantic import BaseSettings, ValidationError
 except ImportError:
     BaseSettings = None
-    ValidationError = Exception
+    class ValidationError(Exception):
+        pass
 
-# ===== Settings (Pydantic) =====
-class Settings(BaseSettings):
-    """Application settings loaded from environment variables (.env supported)."""
-    BOT_TOKEN: str
-    OWNER_USERNAME: str = "Iskanchik"
-    OWNER_USER_ID: Optional[int] = None
-    ALLOWED_GROUP_ID: int = 4973694653
+# ===== Settings (Pydantic or fallback) =====
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
-    LEAGUE_ID: int = 980121
+def _env_int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    try:
+        return int(val) if val is not None else default
+    except Exception:
+        return default
 
-    PORT: int = 10000
-    TELEGRAM_CONCURRENCY: int = 4
-    USE_WEBHOOK: bool = False
+def _env_str(name: str, default: str = "") -> str:
+    val = os.environ.get(name)
+    return val if val is not None else default
 
-    FPL_PROXY_BASE: str = ""
-    ENABLE_HTTP2: bool = True
+if BaseSettings is not None:
+    class Settings(BaseSettings):
+        """Application settings loaded from environment variables (.env supported)."""
+        BOT_TOKEN: str
+        OWNER_USERNAME: str = "Iskanchik"
+        OWNER_USER_ID: Optional[int] = None
+        ALLOWED_GROUP_ID: int = 4973694653
 
-    LIVE_POLL_INTERVAL: int = 30
+        LEAGUE_ID: int = 980121
 
-    FPL_CACHE_TTL_MIN: int = 8
-    FPL_STANDINGS_TTL: int = 300
-    FPL_PICKS_TTL: int = 300
-    FPL_PICKS_ALLOW_STALE: bool = True
-    FPL_CONCURRENCY: int = 3
-    PICKS_CONCURRENCY: int = 10
+        PORT: int = 10000
+        TELEGRAM_CONCURRENCY: int = 4
+        USE_WEBHOOK: bool = False
 
-    FIXTURES_TTL: int = 900
-    LEAGUE_PLAYERS_TTL: int = 300
-    IDEMPOTENCY_TTL_SEC: int = 10 * 24 * 3600
+        FPL_PROXY_BASE: str = ""
+        ENABLE_HTTP2: bool = True
 
-    BOT_LOCK_KEY: str = "fpl:bot:lock"
-    BOT_LOCK_TTL: int = 1800
+        LIVE_POLL_INTERVAL: int = 30
 
-    DIAGNOSTIC_ALLOW_ON_AUTH_FAIL: bool = True
+        FPL_CACHE_TTL_MIN: int = 8
+        FPL_STANDINGS_TTL: int = 300
+        FPL_PICKS_TTL: int = 300
+        FPL_PICKS_ALLOW_STALE: bool = True
+        FPL_CONCURRENCY: int = 3
+        PICKS_CONCURRENCY: int = 10
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+        FIXTURES_TTL: int = 900
+        LEAGUE_PLAYERS_TTL: int = 300
+        IDEMPOTENCY_TTL_SEC: int = 10 * 24 * 3600
 
-try:
+        BOT_LOCK_KEY: str = "fpl:bot:lock"
+        BOT_LOCK_TTL: int = 1800
+
+        DIAGNOSTIC_ALLOW_ON_AUTH_FAIL: bool = True
+
+        class Config:
+            env_file = ".env"
+            case_sensitive = False
+
+    try:
+        settings = Settings()
+    except ValidationError as e:
+        raise RuntimeError(f"Invalid settings: {e}")
+else:
+    class Settings:
+        """Fallback settings loader when Pydantic is not available."""
+        def __init__(self):
+            self.BOT_TOKEN = _env_str("BOT_TOKEN")
+            if not self.BOT_TOKEN:
+                raise RuntimeError("BOT_TOKEN required in environment")
+
+            self.OWNER_USERNAME = _env_str("OWNER_USERNAME", "Iskanchik")
+            owner_id = os.environ.get("OWNER_USER_ID")
+            self.OWNER_USER_ID = int(owner_id) if (owner_id and owner_id.isdigit()) else None
+            self.ALLOWED_GROUP_ID = _env_int("ALLOWED_GROUP_ID", 4973694653)
+
+            self.LEAGUE_ID = _env_int("LEAGUE_ID", 980121)
+
+            self.PORT = _env_int("PORT", 10000)
+            self.TELEGRAM_CONCURRENCY = _env_int("TELEGRAM_CONCURRENCY", 4)
+            self.USE_WEBHOOK = _env_bool("USE_WEBHOOK", False)
+
+            self.FPL_PROXY_BASE = _env_str("FPL_PROXY_BASE", "").rstrip("/")
+            self.ENABLE_HTTP2 = _env_bool("ENABLE_HTTP2", True)
+
+            self.LIVE_POLL_INTERVAL = _env_int("LIVE_POLL_INTERVAL", 30)
+
+            self.FPL_CACHE_TTL_MIN = _env_int("FPL_CACHE_TTL", 8)
+            self.FPL_STANDINGS_TTL = _env_int("FPL_STANDINGS_TTL", 300)
+            self.FPL_PICKS_TTL = _env_int("FPL_PICKS_TTL", 300)
+            self.FPL_PICKS_ALLOW_STALE = _env_bool("FPL_PICKS_ALLOW_STALE", True)
+            self.FPL_CONCURRENCY = _env_int("FPL_CONCURRENCY", 3)
+            self.PICKS_CONCURRENCY = _env_int("PICKS_CONCURRENCY", 10)
+
+            self.FIXTURES_TTL = _env_int("FIXTURES_TTL", 900)
+            self.LEAGUE_PLAYERS_TTL = _env_int("LEAGUE_PLAYERS_TTL", 300)
+            self.IDEMPOTENCY_TTL_SEC = _env_int("IDEMPOTENCY_TTL_SEC", 10 * 24 * 3600)
+
+            self.BOT_LOCK_KEY = _env_str("BOT_LOCK_KEY", "fpl:bot:lock")
+            self.BOT_LOCK_TTL = _env_int("BOT_LOCK_TTL", 1800)
+
+            self.DIAGNOSTIC_ALLOW_ON_AUTH_FAIL = _env_bool("DIAGNOSTIC_ALLOW_ON_AUTH_FAIL", True)
+
     settings = Settings()
-except ValidationError as e:
-    raise RuntimeError(f"Invalid settings: {e}")
 
 # ===== Owner / Group Access =====
 OWNER_USERNAME = settings.OWNER_USERNAME
@@ -969,7 +1022,7 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
 def format_minute_str(minutes: int, fid: int, fixture_max_minute: Dict[int, int]) -> str:
     return f"{minutes}'"
 
-# ===== Price Parsing (unchanged core) =====
+# ===== Price Parsing (Enhanced) =====
 CATEGORY_ALIASES = {
     "already reached target": "Already reached target",
     "projected to reach today": "Projected to reach target",
@@ -1556,7 +1609,7 @@ async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def one(r):
         eid = r["entry"]
         data = await get_entry_picks_cached(eid, gw)
-        pts = data.get("entry_history", {}).get("points") if data else -1
+        pts = data.get("entry_history", {})..get("points") if data else -1
         return (r.get("player_name", ""), pts if isinstance(pts, int) else -1)
     got = await gather_limited([one(r) for r in results if isinstance(r.get("entry"), int)], PICKS_CONCURRENCY)
     entries = [e for e in got if isinstance(e, tuple)]
@@ -1614,7 +1667,7 @@ async def month_points_for(entries: List[Dict], events: List[Dict], target_month
         for g in finished:
             data = await get_entry_picks_cached(eid, g)
             if data:
-                pts = data.get("entry_history", {}).get("points")
+                pts = data.get("entry_history", {})..get("points")
                 if isinstance(pts, int):
                     total += pts
         return (eid, nm, total)
