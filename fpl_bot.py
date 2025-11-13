@@ -1,15 +1,12 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# Full updated file (improvements applied except earlier optimization points 3 and 8)
-# Key points:
-# - Updated scoring per provided table (GK goal=10, DEF=6, MID=5, FWD=4, etc.).
-# - DC never awarded to GK.
-# - Stats show counts for repeated events: G2, A3, YC2, OG2, PM2, PS2, S2 (each S unit = 3 saves). CS/DC/RC/B remain without counts.
-# - Silent replies for user commands (disable_notification=True); auto notifications (live events, deadline reminders) with sound.
-# - Price parser outputs categories with "Rises:" / "Falls:" labels; improved HTML + JSON parse.
-# - Month table alignment fixed for "Сыграно: ... Осталось: ..." (centered precisely).
-# - Squid stop fully resets state and history.
-# - DC heuristic uses base points incl. goals_conceded penalty and excludes GK; shows DC only for non-GK if thresholds or diff>=2 with no other events.
-# - Full live event processing restored.
+# Full updated file (adds: squid_status returns last GW-style report; stats counts incl. B; rank shows '#')
+# Key points (delta):
+# - /squid_status: теперь отдает последний "финальный" отчет как после завершения тура (берется из Redis).
+#   Фоновая обработка по завершению тура сохраняет отчет в Redis ключ fpl:squid:last_report.
+#   Если отчета нет — показывается старый статус (fallback).
+# - /players_pts: в Stats добавлен счетчик бонусов — "B{1..3}", а также сохранены счетчики: Gx, Ax, Sx, OGx, PMx, PSx.
+# - /rank: добавлена колонка '#' и нумерация строк, заголовок тоже обновлен.
+# - Сохранены: уведомления команд — без звука; автоуведомления — со звуком. DC не ставится вратарям. Scoring соответствует таблице.
 
 import os
 import json
@@ -936,7 +933,7 @@ async def help_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         lines.append("/prices — прогноз цен")
         lines.append("/squid_start <gw> — старт Squid")
         lines.append("/squid_stop — сброс Squid")
-    lines.append("/squid_status — статус Squid")
+    lines.append("/squid_status — последний отчёт Squid")
     lines.append("/squid_winners — победители Squid")
     lines.append("/squid_rules — правила Squid")
     lines.append("/tz <название|смещение> — таймзона")
@@ -980,15 +977,16 @@ async def rank_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not results: return
     league_name=LEAGUE_NAME or "League"
     rows=sorted(results,key=lambda r:r.get("rank",10**9))
-    num_w=max(len(str(r.get("rank"))) for r in rows)
+    # widths
     name_w=max(len("Manager"), max(len(r.get("player_name","")) for r in rows))
     pts_w=max(len("Pts"), max(len(str(r.get("total"))) for r in rows))
-    header=f"{' '.ljust(num_w)} {'Manager'.ljust(name_w)} {'Pts'.rjust(pts_w)}"
+    num_w=max(len("#"), len(str(len(rows))))
+    header=f"{'#'.rjust(num_w)} {'Manager'.ljust(name_w)} {'Pts'.rjust(pts_w)}"
     dt=await get_last_fpl_update_dt()
     upd=format_updated_line(update.effective_user.id, dt, len(header))
-    lines=[league_name.center(len(header)), upd, "```", header]
-    for r in rows:
-        lines.append(f"{str(r.get('rank')).rjust(num_w)} {r.get('player_name','').ljust(name_w)} {str(r.get('total')).rjust(pts_w)}")
+    lines=[(league_name or 'League').center(len(header)), upd, "```", header]
+    for i, r in enumerate(rows, start=1):
+        lines.append(f"{str(i).rjust(num_w)} {r.get('player_name','').ljust(name_w)} {str(r.get('total')).rjust(pts_w)}")
     lines.append("```")
     await reply_silent(update, "\n".join(lines), parse_mode="Markdown")
 
@@ -1013,6 +1011,7 @@ async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         g=int(s.get("goals_scored",0) or 0);        parts.append("G"+(str(g) if g>1 else "")) if g else None
         a=int(s.get("assists",0) or 0);             parts.append("A"+(str(a) if a>1 else "")) if a else None
         cs=int(s.get("clean_sheets",0) or 0);       parts.append("CS") if cs and pos!=4 else None
+        # DC only for non-GK
         dc_show=False
         if pos!=1 and (dc_threshold_met(s,pos) or has_any_dc(s)):
             dc_show=True
@@ -1031,7 +1030,7 @@ async def players_pts_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         og=int(s.get("own_goals",0) or 0);          parts.append("OG"+(str(og) if og>1 else "")) if og else None
         pm=int(s.get("penalties_missed",0) or 0);   parts.append("PM"+(str(pm) if pm>1 else "")) if pm else None
         ps=int(s.get("penalties_saved",0) or 0);    parts.append("PS"+(str(ps) if ps>1 else "")) if ps else None
-        b=int(s.get("bonus",0) or 0);               parts.append("B") if b else None
+        b=int(s.get("bonus",0) or 0);               parts.append("B"+(str(b) if b>1 else "1")) if b else None
         if not parts and total<=2:
             continue
         rows.append({"name":PLAYER_NAME_MAP.get(pid,f'P{pid}'),
@@ -1175,6 +1174,7 @@ async def month_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
 # ===== Squid Game =====
 SQUID_ACTIVE_KEY="fpl:squid:active"
 SQUID_WINNERS_KEY="fpl:squid:winners"
+SQUID_LAST_REPORT_KEY="fpl:squid:last_report"  # NEW: хранит последний финальный отчёт
 
 def load_squid_from_redis():
     global squid_active_state,squid_winner_history
@@ -1233,6 +1233,16 @@ async def squid_rules_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 @safe_command
 async def squid_status_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    # NEW: отдаем последний финальный отчёт (как после завершения тура)
+    if redis_client:
+        try:
+            rep=redis_client.get(SQUID_LAST_REPORT_KEY)
+            if rep:
+                await reply_silent(update, rep)
+                return
+        except Exception:
+            pass
+    # Fallback: старый статус
     if not squid_active_state:
         await reply_silent(update, "Цикл не активен."); return
     start_gw=squid_active_state["start_gw"]
@@ -1319,7 +1329,14 @@ async def process_squid_after_gw_finish(finished_gw:int):
         squid_active_state["players_eliminated"].extend(eliminated)
         squid_active_state["current_gw"]=finished_gw+1
     persist_squid()
-    await send_text_raw(ALLOWED_GROUP_ID, "\n".join(lines))
+    report_text="\n".join(lines)
+    # NEW: сохранить последний финальный отчёт
+    if redis_client:
+        try:
+            redis_client.set(SQUID_LAST_REPORT_KEY, report_text)
+        except Exception:
+            pass
+    await send_text_raw(ALLOWED_GROUP_ID, report_text)
 
 @safe_command
 async def prices_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
