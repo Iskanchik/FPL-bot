@@ -56,7 +56,7 @@ except ImportError:
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "Iskanchik")
 OWNER_USER_ID_ENV = os.environ.get("OWNER_USER_ID")
 OWNER_USER_ID: Optional[int] = int(OWNER_USER_ID_ENV) if OWNER_USER_ID_ENV and OWNER_USER_ID_ENV.isdigit() else None
-ALLOWED_GROUP_ID = int(os.environ.get("ALLOWED_GROUP_ID", "4973694653")
+ALLOWED_GROUP_ID = int(os.environ.get("ALLOWED_GROUP_ID", "4973694653"))
 
 def is_owner(update: Update) -> bool:
     u = update.effective_user
