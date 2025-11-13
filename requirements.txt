@@ -1,5 +1,7 @@
-python-telegram-bot==21.6
-Flask==3.0.3
-httpx==0.27.2
-upstash-redis==1.5.0
-h2==4.1.0
+httpx>=0.24.0
+python-telegram-bot>=20.0
+Flask>=2.2.0
+upstash-redis>=0.7.0
+beautifulsoup4>=4.12.0
+aiolimiter>=1.1.0
+pydantic>=2.5.0
