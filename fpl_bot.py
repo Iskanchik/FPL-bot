@@ -1,26 +1,31 @@
 # FPL Telegram Bot — live events, per-user timezone, Squid Game, price predictions
-# Variant 1: Полный код с Flask (ставите flask в requirements.txt) и JobQueue (python-telegram-bot[job-queue])
+# Variant 1 (JobQueue + Flask) with manual async startup (initialize/start/polling/idle/shutdown)
+# Avoids calling application.run_polling() inside asyncio.run() to prevent event loop conflicts (Python 3.13).
 #
-# Требования (requirements.txt):
+# Requirements (requirements.txt):
 #   python-telegram-bot[job-queue]==21.6
 #   httpx>=0.27
 #   upstash-redis>=1.0
 #   aiolimiter>=1.1
 #   beautifulsoup4>=4.12
-#   pydantic<2        (или убрать pydantic — есть fallback)
-#   h2>=4.1           (опционально, для HTTP/2)
+#   pydantic<2            (or remove pydantic — fallback provided)
+#   h2>=4.1               (optional, for HTTP/2)
 #   flask>=3.0
 #
-# Redis (Upstash):
+# Mandatory ENV:
+#   BOT_TOKEN
+# Redis (Upstash) ENV:
 #   UPSTASH_REDIS_REST_URL
 #   UPSTASH_REDIS_REST_TOKEN
 #
-# Обязательный ENV:
-#   BOT_TOKEN
+# Optional ENV (defaults in Settings):
+#   OWNER_USERNAME, OWNER_USER_ID, ALLOWED_GROUP_ID, LEAGUE_ID, PORT, TELEGRAM_CONCURRENCY, USE_WEBHOOK,
+#   FPL_PROXY_BASE, ENABLE_HTTP2, LIVE_POLL_INTERVAL, FPL_CACHE_TTL, FPL_STANDINGS_TTL, FPL_PICKS_TTL,
+#   FPL_PICKS_ALLOW_STALE, FPL_CONCURRENCY, PICKS_CONCURRENCY, FIXTURES_TTL, LEAGUE_PLAYERS_TTL,
+#   IDEMPOTENCY_TTL_SEC, BOT_LOCK_KEY, BOT_LOCK_TTL, DIAGNOSTIC_ALLOW_ON_AUTH_FAIL
 #
-# Остальные ENV имеют дефолты (LEAGUE_ID, ALLOWED_GROUP_ID и т.д.)
-#
-# Если позже захотите убрать Flask — можно обернуть импорт в try/except.
+# Health endpoints: / and /healthz (Flask)
+# Live events pushed to ALLOWED_GROUP_ID
 
 import os
 import json
@@ -83,7 +88,7 @@ except ImportError:
     class ValidationError(Exception):
         pass
 
-# ===== Helpers for ENV =====
+# -------- ENV helpers --------
 def _env_bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
     if val is None:
@@ -101,7 +106,7 @@ def _env_str(name: str, default: str = "") -> str:
     val = os.environ.get(name)
     return val if val is not None else default
 
-# ===== Settings =====
+# -------- Settings --------
 if BaseSettings is not None:
     class Settings(BaseSettings):
         BOT_TOKEN: str
@@ -165,7 +170,7 @@ else:
             self.DIAGNOSTIC_ALLOW_ON_AUTH_FAIL = _env_bool("DIAGNOSTIC_ALLOW_ON_AUTH_FAIL", True)
     settings = Settings()
 
-# ===== Global Config Vars =====
+# -------- Global configuration values --------
 OWNER_USERNAME = settings.OWNER_USERNAME
 OWNER_USER_ID: Optional[int] = settings.OWNER_USER_ID
 ALLOWED_GROUP_ID = settings.ALLOWED_GROUP_ID
@@ -239,7 +244,7 @@ fpl_semaphore = asyncio.Semaphore(FPL_CONCURRENCY)
 picks_semaphore = asyncio.Semaphore(PICKS_CONCURRENCY)
 tg_rate: Optional["AsyncLimiter"] = AsyncLimiter(25, 1) if AsyncLimiter else None
 
-# ===== Fetch JSON with backoff =====
+# -------- Fetch with backoff --------
 async def fetch_json(
     url: str,
     timeout: float = 15.0,
@@ -275,7 +280,7 @@ async def fetch_json(
                 continue
     return None
 
-# ===== Paths =====
+# -------- API paths --------
 bootstrap_path = "/api/bootstrap-static/"
 league_path_tpl = "/api/leagues-classic/{league_id}/standings/?page_standings={page}"
 entry_picks_path_tpl = "/api/entry/{entry_id}/event/{gw}/picks/"
@@ -283,7 +288,7 @@ event_live_path_tpl = "/api/event/{gw}/live/"
 fixtures_event_path_tpl = "/api/fixtures/?event={gw}"
 event_status_path = "/api/event-status/"
 
-# ===== Caches & Maps =====
+# -------- Caches and maps --------
 bootstrap_cache: Dict[str, Any] = {}
 bootstrap_cache_ts: Optional[float] = None
 _bootstrap_etag: Optional[str] = None
@@ -373,7 +378,7 @@ def cache_set_text(feature: str, sig: str, text: str, ttl: int):
             pass
     _text_cache_mem[feature] = rec
 
-# ===== Authorization =====
+# -------- Authorization --------
 def is_owner(update: Update) -> bool:
     u = update.effective_user
     if not u:
@@ -455,7 +460,7 @@ async def measure_redis_latency():
     except Exception:
         last_redis_latency_ms = None
 
-# ===== Timezone handling =====
+# -------- Timezone --------
 TZ_REDIS_KEY_PREFIX = "fpl:tz:user:"
 DEFAULT_TZ_NAME = "Астана"
 TZ_MAP = {
@@ -528,11 +533,7 @@ def resolve_tz_arg(arg: str) -> Optional[Tuple[str, str]]:
         return arg, arg
     return None
 
-# ===== Last FPL update =====
-_last_fpl_update_dt: Optional[datetime] = None
-_last_fpl_update_cache_ts: Optional[float] = None
-LAST_FPL_UPDATE_TTL = 60
-
+# -------- FPL update timestamp --------
 async def get_last_fpl_update_dt() -> datetime:
     global _last_fpl_update_dt, _last_fpl_update_cache_ts
     now = time.time()
@@ -576,7 +577,7 @@ def parse_deadline(dt_str: str) -> Optional[datetime]:
     except Exception:
         return None
 
-# ===== Bootstrap helpers =====
+# -------- Bootstrap mapping --------
 def refresh_bootstrap_maps():
     elements = bootstrap_cache.get("elements", [])
     teams = bootstrap_cache.get("teams", [])
@@ -772,7 +773,7 @@ def get_current_or_next_gw(bootstrap: Dict[str, Any]) -> Optional[int]:
         return nxt["id"]
     return None
 
-# ===== Live scoring helpers =====
+# -------- Live scoring helpers --------
 def get_active_fixture_ids(fixtures: List[Dict], now: Optional[datetime] = None) -> Set[int]:
     now = now or datetime.now(timezone.utc)
     active = set()
@@ -814,8 +815,7 @@ def event_points_for(pos: int, etype: str) -> int:
     return 0
 
 def dc_threshold_met(stats: Dict[str, Any], pos: int) -> bool:
-    if pos == 1:
-        return False
+    if pos == 1: return False
     dc = 0
     for k in ("defensive_contributions", "cbit", "cbits", "def_contributions"):
         v = stats.get(k)
@@ -910,7 +910,7 @@ async def send_once(text: str, season: str, gw: int):
         if application:
             await send_text_raw(ALLOWED_GROUP_ID, text)
 
-# ===== Price parsing =====
+# -------- Price parsing --------
 CATEGORY_ALIASES = {
     "already reached target": "Already reached target",
     "projected to reach today": "Projected to reach target",
@@ -1136,7 +1136,7 @@ def format_prices_mobile(parsed: Dict[str, Dict[str, List[Tuple[str, float]]]]) 
         lines.append(fmt(falls, "Falls"))
     return lines
 
-# ===== Inline Keyboards for TZ =====
+# -------- Inline TZ Keyboards --------
 def build_tz_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Астана (UTC+5)", callback_data="tz|Астана"),
@@ -1181,7 +1181,7 @@ async def tz_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer("Ок")
         await q.edit_message_text(f"Таймзона: {rus} ({zone})")
 
-# ===== Commands =====
+# -------- Commands --------
 @safe_command
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong (owner)" if is_owner(update) else "pong", disable_notification=True)
@@ -1460,7 +1460,7 @@ async def gw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join([title, upd, "```", header_line, *body_lines, "```"])
     await reply_silent(update, text, parse_mode="Markdown")
 
-# ===== Month rankings =====
+# -------- Month ranking --------
 RUS_MONTH = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
 SEASON_MONTH_ORDER = [8,9,10,11,12,1,2,3,4,5]
 
@@ -1535,7 +1535,7 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join([title, info_line, upd_line, "```", header_line, *body_lines, "```"])
     await reply_silent(update, text, parse_mode="Markdown")
 
-# ===== Squid Game storage =====
+# -------- Squid Game --------
 SQUID_ACTIVE_KEY = "fpl:squid:active"
 SQUID_WINNERS_KEY = "fpl:squid:winners"
 SQUID_LAST_REPORT_KEY = "fpl:squid:last_report"
@@ -1790,7 +1790,7 @@ async def prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = format_prices_mobile(parsed)
     await reply_silent(update, "\n".join(lines))
 
-# ===== Global lock =====
+# -------- Global lock --------
 LOCK_VALUE = str(uuid.uuid4())
 
 async def ensure_update_mode(bot, use_webhook: bool, webhook_url: Optional[str] = None):
@@ -1868,7 +1868,7 @@ def purge_fixture_state(gw: int, fid: int):
             if isinstance(k, str) and k.startswith(ns_prefix):
                 s.discard(k)
 
-# ===== Live monitor tick =====
+# -------- Live monitor tick --------
 async def live_monitor_tick(context: ContextTypes.DEFAULT_TYPE):
     global _current_gw, last_live_tick_time, last_active_fixtures_count
     try:
@@ -2180,7 +2180,7 @@ async def live_monitor_tick(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("live_monitor_tick error")
 
-# ===== Deadline notifier tick =====
+# -------- Deadline notifier tick --------
 _last_deadline_reminder_gw: Optional[int] = None
 _last_deadline_reminder_ts: Optional[float] = None
 
@@ -2211,14 +2211,14 @@ async def deadline_notifier_tick(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("deadline_notifier_tick error")
 
-# ===== Lock refresher tick =====
+# -------- Lock refresher tick --------
 async def lock_refresher_tick(context: ContextTypes.DEFAULT_TYPE):
     try:
         refresh_global_lock()
     except Exception:
         logger.debug("lock_refresher_tick error")
 
-# ===== Setup bot commands =====
+# -------- Commands setup --------
 async def setup_bot_commands(bot):
     cmds = [
         BotCommand("help", "Описание"),
@@ -2258,8 +2258,8 @@ async def setup_bot_commands(bot):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error", exc_info=context.error)
 
-# ===== Run bot =====
-async def run_bot():
+# -------- Manual async run sequence --------
+async def run_bot_async():
     global http_client, application
     init_redis()
     if not acquire_global_lock():
@@ -2273,10 +2273,13 @@ async def run_bot():
         except Exception:
             use_http2 = False
         http_client = httpx.AsyncClient(http2=use_http2, limits=limits, timeout=20.0)
+
         application = (Application.builder()
                        .token(BOT_TOKEN)
                        .concurrent_updates(TELEGRAM_CONCURRENCY)
                        .build())
+
+        # Register handlers
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("deadline", deadline_command))
         application.add_handler(CommandHandler("players", players_command))
@@ -2294,32 +2297,59 @@ async def run_bot():
         application.add_handler(CommandHandler("debug", debug_command))
         application.add_handler(CallbackQueryHandler(tz_inline_callback, pattern="^tz"))
         application.add_error_handler(error_handler)
+
+        # Initialize app
+        await application.initialize()
+
+        # Polling mode (no webhook)
         await ensure_update_mode(application.bot, use_webhook=False)
+
+        # Commands
         await setup_bot_commands(application.bot)
+
+        # Preload bootstrap & squid
         await get_bootstrap_cached()
         load_squid_from_redis()
-        application.job_queue.run_repeating(lock_refresher_tick, interval=max(10, BOT_LOCK_TTL // 3), first=5, name="lock_refresher")
-        application.job_queue.run_repeating(live_monitor_tick, interval=LIVE_POLL_INTERVAL, first=10, name="live_monitor")
-        application.job_queue.run_repeating(deadline_notifier_tick, interval=300, first=15, name="deadline_notifier")
-        logger.info("Starting run_polling()...")
-        await application.run_polling(stop_signals=(signal.SIGINT, signal.SIGTERM))
+
+        # Schedule jobs (start after application.start())
+        application.job_queue.run_repeating(lock_refresher_tick,
+                                            interval=max(10, BOT_LOCK_TTL // 3),
+                                            first=5,
+                                            name="lock_refresher")
+        application.job_queue.run_repeating(live_monitor_tick,
+                                            interval=LIVE_POLL_INTERVAL,
+                                            first=10,
+                                            name="live_monitor")
+        application.job_queue.run_repeating(deadline_notifier_tick,
+                                            interval=300,
+                                            first=15,
+                                            name="deadline_notifier")
+
+        # Start application
+        await application.start()
+
+        # Start polling
+        await application.updater.start_polling(drop_pending_updates=True)
+        logger.info("Bot started. Waiting for signals...")
+
+        # Idle until stop
+        await application.updater.idle()
+
+        logger.info("Shutdown initiated...")
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
     finally:
         release_global_lock()
-        try:
-            if http_client:
+        if http_client:
+            try:
                 await http_client.aclose()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
+# -------- Entry point --------
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
-    try:
-        asyncio.run(run_bot())
-    except RuntimeError as e:
-        # Fallback только для ситуации "уже есть активный цикл" (напр. Jupyter)
-        if "asyncio.run() cannot be called from a running event loop" in str(e):
-            loop = asyncio.get_running_loop()
-            loop.create_task(run_bot())
-        else:
-            raise
+    asyncio.run(run_bot_async())
