@@ -1,63 +1,69 @@
 # fpl_bot.py
-# Single-file Telegram bot — full implementation (senior-level)
+# Single-file Telegram bot — secure single-file implementation (senior-level)
 # Requirements: python 3.10+, python-telegram-bot v20+, httpx, beautifulsoup4
 # Persisted files: /mnt/data/...
-# ENV: BOT_TOKEN (required), ALERT_CHAT_ID (optional)
+# All sensitive IDs/tokens come from environment
 
 import os
 import asyncio
 import json
 from datetime import datetime, date, time, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Set, Any
 import logging
 
 import httpx
 from bs4 import BeautifulSoup
 
-from telegram import __version__ as PTB_VERSION  # for dev info
+from telegram import __version__ as PTB_VERSION
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # -------------------------
-# CONFIG
+# CONFIG FROM ENV
 # -------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # optional default target
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# Owner who always may use private chat (int)
+OWNER_ID = int(os.getenv("OWNER_ID", "469807230"))
+# Allowed group where bot is active and where notifications are sent (int)
+ALLOWED_GROUP_ID = int(os.getenv("ALLOWED_GROUP_ID", "4973694653"))
+# League ID used for league-based ordering
 LEAGUE_ID = int(os.getenv("LEAGUE_ID", "980121"))
+
 DATA_DIR = "/mnt/data"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# persistent files
+# persisted file paths
 USER_TZ_FILE = os.path.join(DATA_DIR, "user_timezones.json")
 LAST_SENT_FILE = os.path.join(DATA_DIR, "user_last_sent.json")
 PRICES_BASELINE_FILE = os.path.join(DATA_DIR, "prices_baseline.json")
 LEAGUE_CACHE_FILE = os.path.join(DATA_DIR, "league_player_set.json")
 NOTIF_FLAG_FILE = os.path.join(DATA_DIR, "notifications_enabled.json")
+ALLOWED_USERS_FILE = os.path.join(DATA_DIR, "allowed_users.json")
 
-# FPL API / LiveFPL URLs
+# FPL endpoints
 FPL_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
-FPL_ENTRY_URL = "https://fantasy.premierleague.com/api/entry/{entry_id}/event/0/picks/"
 LIVEFPL_PRICES = "https://www.livefpl.net/prices"
 
 # Scheduling constants
 PRICE_CHANGE_UTC_PLUS = 5  # prices change at 06:00 UTC+5
-PRICE_CHANGE_TIME_UTC5 = time(6, 0)
-PRECHANGE_HOUR_UTC5 = 4  # 2 hours before
-PRECHANGE_TIME_UTC5 = time(PRECHANGE_HOUR_UTC5, 0)
+PRICE_CHANGE_WINDOW_START = time(5, 45)  # UTC+5 05:45
+PRICE_CHANGE_WINDOW_END = time(8, 0)     # UTC+5 08:00
+PRICE_CHANGE_POLL_SECONDS = 5 * 60       # 5 minutes
 
-# morning update (detect actual changes) runs once after 06:00 UTC+5
-# daily summary at 23:00 local user time (or fallback)
-EVENING_HOUR = 23
-EVENING_MINUTE = 0
+EVENING_HOUR_UTC5 = 23
+EVENING_MINUTE_UTC5 = 0
+
+# GW disable target
+GW_DISABLE_TARGET = 38
 
 # logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fpl_bot")
 
 # -------------------------
-# Utilities: persistence
+# Persistence helpers
 # -------------------------
 def _load_json(path: str, default):
     try:
@@ -77,18 +83,19 @@ def _save_json(path: str, data):
     except Exception:
         logger.exception("Failed to save %s", path)
 
-# user tzs: chat_id -> tz_string
+# persisted runtime structures
 user_timezones: Dict[int, str] = {int(k): v for k, v in _load_json(USER_TZ_FILE, {}).items()}
-# last_sent: chat_id -> {"daily": "YYYY-MM-DD", "change": "YYYY-MM-DD"}
 user_last_sent: Dict[str, Dict[str, str]] = _load_json(LAST_SENT_FILE, {})
-
-# baseline prices snapshot: element_id -> now_cost (int)
 prices_baseline: Dict[str, int] = _load_json(PRICES_BASELINE_FILE, {})
-
-# league player set + gw saved
 league_cache: Dict[str, Any] = _load_json(LEAGUE_CACHE_FILE, {})
-# notifications enabled flag
 notif_flag_obj = _load_json(NOTIF_FLAG_FILE, {"enabled": True})
+_allowed_users: Set[int] = set(int(x) for x in _load_json(ALLOWED_USERS_FILE, []))
+
+def _save_allowed_users():
+    try:
+        _save_json(ALLOWED_USERS_FILE, sorted(list(_allowed_users)))
+    except Exception:
+        logger.exception("Failed to save allowed users")
 
 def notifications_enabled() -> bool:
     return bool(notif_flag_obj.get("enabled", True))
@@ -98,17 +105,16 @@ def set_notifications_enabled(enabled: bool):
     _save_json(NOTIF_FLAG_FILE, notif_flag_obj)
 
 # -------------------------
-# HTTP client (single global)
+# HTTP client
 # -------------------------
-_http_client = httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "FPL-Bot/1.0"})
+_http_client = httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "FPL-Bot/1.0"})
 
 async def fetch_json(url: str) -> Optional[dict]:
     try:
         r = await _http_client.get(url)
         if r.status_code == 200:
             return r.json()
-        else:
-            logger.warning("fetch_json %s -> status %s", url, r.status_code)
+        logger.warning("fetch_json %s -> status %s", url, r.status_code)
     except Exception:
         logger.exception("fetch_json failed %s", url)
     return None
@@ -124,6 +130,16 @@ async def fetch_text(url: str) -> Optional[str]:
     return None
 
 # -------------------------
+# FPL team mapping (team_code -> abbreviation)
+# -------------------------
+FPL_TEAM_ABBR = {
+    1:  "ARS", 2:  "AVL", 3:  "BOU", 4:  "BRE", 5:  "BHA",
+    6:  "BUR", 7:  "CHE", 8:  "CRY", 9:  "EVE", 10: "FUL",
+    11: "LIV", 12: "LUT", 13: "MCI", 14: "MUN", 15: "NEW",
+    16: "NFO", 17: "SHU", 18: "TOT", 19: "WHU", 20: "WOL",
+}
+
+# -------------------------
 # TZ helpers
 # -------------------------
 DEFAULT_TZ_STR = f"UTC+{PRICE_CHANGE_UTC_PLUS}"
@@ -132,7 +148,7 @@ def parse_tz_input(tz_input: str) -> Optional[str]:
     if not tz_input:
         return None
     s = tz_input.strip()
-    if (s.startswith("+") or s.startswith("-")) and s[1:].replace(".", "").isdigit():
+    if (s.startswith("+") or s.startswith("-")) and s[1:].replace(".", "", 1).isdigit():
         return f"UTC{s}"
     if s.upper().startswith("UTC") and (len(s) == 3 or (len(s) > 3 and s[3] in "+-")):
         return s.upper()
@@ -156,59 +172,41 @@ def local_now(tz_str: str) -> datetime:
     return datetime.now(timezone.utc).astimezone(zone)
 
 # -------------------------
-# TEAM EMOJI
+# Parsing LiveFPL helpers
 # -------------------------
-TEAM_EMOJI = {
-    "ARS": "🔴", "AVL": "🟣", "BRE": "🟥⬛", "BHA": "🟦", "BUR": "🟥",
-    "CHE": "🔵", "CRY": "🔷", "EVE": "🔵", "FUL": "⚫⚪", "LIV": "🔴",
-    "MCI": "🔵", "MUN": "🔴", "NEW": "⚫⚪", "NFO": "🔴", "SHU": "🔴⚪",
-    "TOT": "⚪", "WHU": "🟣🔵", "WOL": "🟧", "LUT": "🟧", "BOU": "🔴⚫"
-}
-
-# -------------------------
-# Parsing LiveFPL prices page -> extract 3 sections + keep original direction info
-# Note: LiveFPL HTML structure may change; this uses heuristics.
-# -------------------------
-def label_direction_from_section_name(section_name: str) -> str:
-    s = (section_name or "").lower()
-    if "fall" in s:
-        return "fall"
-    if "rise" in s:
-        return "rise"
-    return "neutral"
+def parse_percent(s: str) -> float:
+    try:
+        if s is None:
+            return 0.0
+        s2 = str(s).replace("%", "").strip()
+        return float(s2) if s2 != "" else 0.0
+    except Exception:
+        return 0.0
 
 def parse_row_cells(cells: List[str]) -> Dict[str, str]:
-    # heuristic mapping - depends on table columns on livefpl
-    # expected columns: Player | Pos | Team | Price | Target | Owned by | ...
     row = {}
-    # fill best-effort
     if len(cells) >= 1:
         row["Name"] = cells[0]
     if len(cells) >= 2:
         row["Pos"] = cells[1]
     if len(cells) >= 3:
         row["Team"] = cells[2]
-    # find price-like cell
     for c in cells[3:]:
         if "£" in c or c.replace(".", "", 1).isdigit():
             row["Price"] = c.replace("£", "").strip()
             break
-    # target and owned
     for c in reversed(cells):
         if "%" in c and "Target" not in row:
             row["Target"] = c.strip()
         elif "%" in c and "Owned by" not in row:
             row["Owned by"] = c.strip()
-    # normalize keys
     row.setdefault("Price", "")
     row.setdefault("Target", "")
     row.setdefault("Owned by", "")
     return row
 
 def extract_table(html_soup: BeautifulSoup, key_hint: str) -> List[Dict[str, Any]]:
-    # Find header that mentions key_hint; return list of row dicts
     rows: List[Dict[str, Any]] = []
-    # find possible headings
     possible = html_soup.find_all(["h3", "h4", "h2", "strong"])
     found = None
     for p in possible:
@@ -217,7 +215,6 @@ def extract_table(html_soup: BeautifulSoup, key_hint: str) -> List[Dict[str, Any
             found = p
             break
     if not found:
-        # try fuzzy
         for p in possible:
             txt = p.get_text(" ", strip=True).lower()
             if any(w in txt for w in key_hint.lower().split()):
@@ -225,10 +222,8 @@ def extract_table(html_soup: BeautifulSoup, key_hint: str) -> List[Dict[str, Any
                 break
     if not found:
         return rows
-    # next table
     tbl = found.find_next("table")
     if not tbl:
-        # maybe lists
         for li in found.find_next_siblings("li"):
             txt = li.get_text(" ", strip=True)
             cells = [txt]
@@ -243,102 +238,29 @@ def extract_table(html_soup: BeautifulSoup, key_hint: str) -> List[Dict[str, Any
     return rows
 
 # -------------------------
-# process categories per rules:
-# - Only three categories used (Already reached target, Projected to reach target, Others who will be close)
-# - Apply Owned >= 1% filter
-# - Keep original LiveFPL section membership unless target >=100 or <=-100 (goes to Already)
-# - Sort inside each category:
-#    1) direction partition: rising (target>0) first, then falling (target<=0)
-#    2) then target descending
-#    3) then league membership (1/0) descending
-#    4) then global owned descending
-# -------------------------
-def parse_percent(s: str) -> float:
-    try:
-        if s is None:
-            return 0.0
-        s2 = str(s).replace("%", "").strip()
-        return float(s2) if s2 != "" else 0.0
-    except Exception:
-        return 0.0
-
-def is_in_league_row(r: Dict[str, Any], league_set: Set[str]) -> int:
-    name = (r.get("Name") or "").strip().lower()
-    # league_set may contain 'id:123' entries or names
-    if not name:
-        return 0
-    if name in (n.lower() for n in league_set):
-        return 1
-    # try element id matching
-    eid = r.get("id") or r.get("Element") or r.get("element")
-    try:
-        if eid and f"id:{int(eid)}" in league_set:
-            return 1
-    except Exception:
-        pass
-    return 0
-
-def sort_and_filter_sections(sections: Dict[str, List[Dict[str, Any]]], league_set: Set[str]) -> Dict[str, List[Dict[str, Any]]]:
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    for title, rows in sections.items():
-        processed = []
-        for r in rows:
-            owned_val = parse_percent(r.get("Owned by", "0"))
-            if owned_val < 1.0:
-                continue  # filter < 1%
-            target_val = parse_percent(r.get("Target", "0"))
-            # direction: if original section indicates Predicted Falls/Rises we can set _direction
-            direction = r.get("_direction") or "neutral"
-            # override direction if table name indicated rise/fall - already attached in caller maybe
-            # league membership
-            in_league = is_in_league_row(r, league_set)
-            r["_target_val"] = target_val
-            r["_in_league"] = in_league
-            r["_owned_val"] = owned_val
-            # direction derived from r["_direction"] or sign of target for partitioning
-            if "_direction" not in r:
-                r["_direction"] = "rise" if target_val > 0 else "fall" if target_val < 0 else "neutral"
-            # determine dir priority: rise first (1), else 0
-            dir_pr = 1 if r["_direction"] != "fall" else 0
-            r["_dir_pr"] = dir_pr
-            processed.append(r)
-        # sort by (dir_pr desc, target desc, in_league desc, owned desc)
-        processed.sort(key=lambda x: (x["_dir_pr"], x["_target_val"], x["_in_league"], x["_owned_val"]), reverse=True)
-        # cleanup temps
-        for rr in processed:
-            for k in ("_target_val", "_in_league", "_owned_val", "_dir_pr"):
-                rr.pop(k, None)
-        # Only keep three categories in final output; name adjustments done in caller
-        out[title] = processed
-    return out
-
-# -------------------------
-# League players cache: fetch once per GW and persist
+# League cache and sorting/filtering
 # -------------------------
 async def get_current_gw() -> int:
     data = await fetch_json(FPL_BOOTSTRAP)
     if not data:
         return 0
-    for ev in data.get("events", []):
+    for ev in data.get("events", []) or []:
         if ev.get("is_current"):
             return int(ev.get("id", 0))
     return 0
 
 async def fetch_league_player_set_once(league_id: int, cap: int = 80) -> Set[str]:
-    # read standings -> entry ids -> fetch picks for top N entries -> collect 'id:element' strings
     out: Set[str] = set()
     url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
     data = await fetch_json(url)
     if not data:
         return out
-    # standings shape can vary; try common shapes
     results = data.get("standings", {}).get("results") or data.get("results") or data.get("entries") or []
     entry_ids = []
     for r in results:
         eid = r.get("entry") or r.get("id") or r.get("entry_id")
         if eid:
             entry_ids.append(int(eid))
-    # cap
     entry_ids = entry_ids[:cap]
     sem = asyncio.Semaphore(8)
     async def fetch_entry(eid: int):
@@ -361,7 +283,6 @@ async def fetch_league_player_set_once(league_id: int, cap: int = 80) -> Set[str
     return out
 
 async def get_league_player_set_cached(league_id: int) -> Set[str]:
-    # load from league_cache: {"gw": N, "set": [..]}
     gw = await get_current_gw()
     gw_saved = int(league_cache.get("gw", -1))
     if gw_saved == gw and league_cache.get("set"):
@@ -372,30 +293,62 @@ async def get_league_player_set_cached(league_id: int) -> Set[str]:
     _save_json(LEAGUE_CACHE_FILE, league_cache)
     return s
 
+def is_in_league_row(r: Dict[str, Any], league_set: Set[str]) -> int:
+    name = (r.get("Name") or "").strip().lower()
+    if not name:
+        return 0
+    if name in (n.lower() for n in league_set):
+        return 1
+    eid = r.get("id") or r.get("Element") or r.get("element")
+    try:
+        if eid and f"id:{int(eid)}" in league_set:
+            return 1
+    except Exception:
+        pass
+    return 0
+
+def sort_and_filter_sections(sections: Dict[str, List[Dict[str, Any]]], league_set: Set[str]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for title, rows in sections.items():
+        processed = []
+        for r in rows:
+            owned_val = parse_percent(r.get("Owned by", "0"))
+            if owned_val < 1.0:
+                continue
+            target_val = parse_percent(r.get("Target", "0"))
+            in_league = is_in_league_row(r, league_set)
+            r["_target_val"] = target_val
+            r["_in_league"] = in_league
+            r["_owned_val"] = owned_val
+            if "_direction" not in r:
+                r["_direction"] = "rise" if target_val > 0 else "fall" if target_val < 0 else "neutral"
+            dir_pr = 1 if r["_direction"] != "fall" else 0
+            r["_dir_pr"] = dir_pr
+            processed.append(r)
+        processed.sort(key=lambda x: (x["_dir_pr"], x["_target_val"], x["_in_league"], x["_owned_val"]), reverse=True)
+        for rr in processed:
+            for k in ("_target_val", "_in_league", "_owned_val", "_dir_pr"):
+                rr.pop(k, None)
+        out[title] = processed
+    return out
+
 # -------------------------
-# Formatting compact table (mono block) with center headers
+# Formatting compact table (ABBR + name)
 # -------------------------
 def center_text(s: str, width: int = 40) -> str:
     return s.center(width)
 
-def format_prices_compact(sections: Dict[str, List[Dict[str, Any]]]) -> str:
-    order = [
-        "Already reached target",
-        "Projected to reach target",
-        "Others who will be close",
-    ]
+def format_prices_compact(sections: Dict[str, List[Dict[str, Any]]], el_map: Dict[int, dict]) -> str:
+    order = ["Already reached target", "Projected to reach target", "Others who will be close"]
     blocks: List[str] = []
-    # build per section
     for title in order:
         rows = sections.get(title, []) or []
-        # compute columns widths
         names = [r.get("Name", "") for r in rows]
         prices = [f"£{r.get('Price')}".strip() for r in rows]
         targets = []
         for r in rows:
             t = r.get("Target", "")
             tval = int(parse_percent(t))
-            # negative sign only for fall direction
             if r.get("_direction", "neutral") == "fall":
                 targets.append(f"-{abs(int(tval))}%")
             else:
@@ -403,32 +356,113 @@ def format_prices_compact(sections: Dict[str, List[Dict[str, Any]]]) -> str:
         max_name = max((len(x) for x in names), default=0)
         max_price = max((len(x) for x in prices), default=0)
         max_target = max((len(x) for x in targets), default=0)
-        # header centered
         header = center_text(title, 40)
         block_lines = [header]
         for i, r in enumerate(rows):
-            emoji = TEAM_EMOJI.get((r.get("Team") or "").upper(), "⚪")
+            team_abbr = "UNK"
+            el_id = None
+            for k in ("element", "id", "Element"):
+                try:
+                    if k in r:
+                        el_id = int(r[k])
+                        break
+                except Exception:
+                    pass
+            if el_id and el_id in el_map:
+                tc = el_map[el_id].get("team_code") or el_map[el_id].get("team")
+                try:
+                    team_abbr = FPL_TEAM_ABBR.get(int(tc), "UNK")
+                except Exception:
+                    team_abbr = FPL_TEAM_ABBR.get(tc, "UNK")
+            else:
+                tcol = (r.get("Team") or "").strip()
+                if tcol:
+                    team_abbr = tcol.upper()
             name = (r.get("Name") or "").ljust(max_name)
             p = prices[i].ljust(max_price)
             tgt = targets[i].rjust(max_target)
-            block_lines.append(f"{emoji}  {name}  {p}  ({tgt})")
+            block_lines.append(f"{team_abbr}  {name}  {p}  ({tgt})")
         if not rows:
             block_lines.append("(none)")
-        # wrap in code block for monospaced alignment
         blocks.append("<code>" + "\n".join(block_lines) + "</code>")
     return "\n\n".join(blocks)
 
 # -------------------------
-# Price change detector: compare bootstrap now_cost -> baseline
-# sends silent notification with increased/decreased lists if changes detected
+# Bootstrap loading + smart match
 # -------------------------
-async def fetch_bootstrap_prices_map() -> Tuple[Dict[int, int], Dict[int, dict]]:
+async def load_bootstrap_elements() -> Tuple[List[dict], Dict[int, dict]]:
+    data = await fetch_json(FPL_BOOTSTRAP)
+    if not data:
+        return [], {}
+    elements = data.get("elements", []) or []
+    el_map = {}
+    for el in elements:
+        try:
+            el_map[int(el.get("id"))] = el
+        except Exception:
+            continue
+    return elements, el_map
+
+def _pos_code_to_str(code: int) -> str:
+    return {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}.get(int(code), "")
+
+def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_hint: float, elements: List[dict]) -> Optional[dict]:
+    name_low = (name or "").lower().strip()
+    candidates = [el for el in elements if str(el.get("web_name", "")).lower().strip() == name_low]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # step 2: filter by team_hint (abbr)
+    filtered = []
+    for el in candidates:
+        tc = el.get("team_code") or el.get("team")
+        try:
+            tc_int = int(tc)
+        except Exception:
+            tc_int = None
+        abbr = FPL_TEAM_ABBR.get(tc_int) if tc_int is not None else None
+        if abbr and abbr.upper() == (team_hint or "").upper():
+            filtered.append(el)
+    if filtered:
+        candidates = filtered
+        if len(candidates) == 1:
+            return candidates[0]
+    # step 3: filter by position
+    if pos_hint:
+        filtered = [el for el in candidates if _pos_code_to_str(el.get("element_type")) == pos_hint.upper()]
+        if filtered:
+            candidates = filtered
+            if len(candidates) == 1:
+                return candidates[0]
+    # step 4: filter by price
+    try:
+        filtered = []
+        for el in candidates:
+            now_cost = float(el.get("now_cost", 0)) / 10.0
+            if abs(now_cost - float(price_hint)) < 0.01:
+                filtered.append(el)
+        if filtered:
+            candidates = filtered
+            if len(candidates) == 1:
+                return candidates[0]
+    except Exception:
+        pass
+    logger.warning("Ambiguous player match for '%s' -> using first candidate id=%s", name, candidates[0].get("id"))
+    return candidates[0]
+
+# -------------------------
+# Price change detector helpers
+# -------------------------
+async def fetch_bootstrap_prices_map() -> Tuple[Dict[int, int], Dict[int, dict], List[dict]]:
     data = await fetch_json(FPL_BOOTSTRAP)
     out = {}
     el_map = {}
+    elements = []
     if not data:
-        return out, el_map
-    for el in data.get("elements", []) or []:
+        return out, el_map, elements
+    elements = data.get("elements", []) or []
+    for el in elements:
         try:
             eid = int(el.get("id"))
             now_cost = int(el.get("now_cost") or 0)
@@ -436,14 +470,13 @@ async def fetch_bootstrap_prices_map() -> Tuple[Dict[int, int], Dict[int, dict]]
             el_map[eid] = el
         except Exception:
             continue
-    return out, el_map
+    return out, el_map, elements
 
 def detect_price_changes(old: Dict[str, int], new: Dict[int, int]) -> List[Tuple[int, int, int]]:
     changes = []
     for eid, new_cost in new.items():
         old_cost = old.get(str(eid))
         if old_cost is None:
-            # first run: treat as baseline only
             continue
         if new_cost != old_cost:
             changes.append((eid, old_cost, new_cost))
@@ -452,16 +485,19 @@ def detect_price_changes(old: Dict[str, int], new: Dict[int, int]) -> List[Tuple
 def format_price_changes_message(changes: List[Tuple[int, int, int]], el_map: Dict[int, dict]) -> str:
     if not changes:
         return ""
-    # prepare lines
     inc = []
     dec = []
     for eid, old_c, new_c in changes:
         old_p = f"£{old_c/10:.1f}"
         new_p = f"£{new_c/10:.1f}"
         name = el_map.get(eid, {}).get("web_name", f"id:{eid}")
-        team_code = el_map.get(eid, {}).get("team_code") or el_map.get(eid, {}).get("team")
-        emoji = TEAM_EMOJI.get(team_code, "⚪")
-        line = f"{emoji}  {name.ljust(15)} {old_p} → {new_p}"
+        tc = el_map.get(eid, {}).get("team_code")
+        try:
+            tc_int = int(tc)
+        except Exception:
+            tc_int = None
+        team_abbr = FPL_TEAM_ABBR.get(tc_int, "UNK")
+        line = f"{team_abbr}  {name.ljust(15)} {old_p} → {new_p}"
         if new_c > old_c:
             inc.append(line)
         else:
@@ -479,23 +515,18 @@ def format_price_changes_message(changes: List[Tuple[int, int, int]], el_map: Di
     return "\n".join(lines)
 
 # -------------------------
-# /prices handler
+# /prices builder
 # -------------------------
 async def build_prices_sections_and_format() -> str:
-    # fetch livefpl html
     txt = await fetch_text(LIVEFPL_PRICES)
     if not txt:
         return "Could not fetch prices page."
     soup = BeautifulSoup(txt, "html.parser")
-    # extract three named tables (the extract_table func is heuristic)
     raw_sections = {
         "Already reached target": extract_table(soup, "Already reached target"),
         "Projected to reach target": extract_table(soup, "Projected to reach target"),
         "Others who will be close": extract_table(soup, "Others who will be close"),
     }
-    # attach direction tags where possible: try to detect source section in html by searching "Predicted Falls/Rises" tables and mapping players
-    # simpler: try to find predicted falls and rises lists and mark rows by name
-    # build name->direction map by reading "Predicted Rises" and "Predicted Falls" tables
     name_dir_map = {}
     for sec in ("Predicted Rises", "Predicted Falls"):
         rows = extract_table(soup, sec)
@@ -504,164 +535,216 @@ async def build_prices_sections_and_format() -> str:
             n = (r.get("Name") or "").strip()
             if n:
                 name_dir_map[n.lower()] = d
-    # apply directions to raw sections
     for title, rows in raw_sections.items():
         for r in rows:
             n = (r.get("Name") or "").strip().lower()
             if name_dir_map.get(n):
                 r["_direction"] = name_dir_map[n]
             else:
-                # fallback: infer from target sign
                 t = parse_percent(r.get("Target", "0"))
                 r["_direction"] = "rise" if t > 0 else ("fall" if t < 0 else "neutral")
-    # league set
+    # attach element ids using bootstrap smart matching
+    elements, el_map = await load_bootstrap_elements()
+    for title, rows in raw_sections.items():
+        for r in rows:
+            name = (r.get("Name") or "").strip()
+            team_hint = (r.get("Team") or "").strip()
+            pos_hint = (r.get("Pos") or "").strip()
+            try:
+                price_hint = float(str(r.get("Price") or "0").replace("£", "").strip())
+            except Exception:
+                price_hint = 0.0
+            found = find_element_by_name_smart(name, team_hint, pos_hint, price_hint, elements)
+            if found:
+                try:
+                    r["element"] = int(found.get("id"))
+                except Exception:
+                    pass
     league_set = await get_league_player_set_cached(LEAGUE_ID)
-    # sort & filter
     processed = sort_and_filter_sections(raw_sections, league_set)
-    # final formatting
-    msg = format_prices_compact(processed)
+    msg = format_prices_compact(processed, el_map)
     return msg
 
 # -------------------------
-# Background tasks: user scheduler with single notification per day (priority 23:00 local -> fallback prechange)
-# and morning price change detector after 06:00 UTC+5 (silent)
+# Security + sending
 # -------------------------
-_daily_task: Optional[asyncio.Task] = None
-_prechange_task: Optional[asyncio.Task] = None
+def is_authorized_update(update: Update) -> bool:
+    try:
+        chat = update.effective_chat
+        user = update.effective_user
+        if chat is None or user is None:
+            return False
+        uid = int(user.id)
+        # Owner always allowed in private
+        if uid == OWNER_ID and chat.type == "private":
+            return True
+        # If message is in allowed group -> allow and add to whitelist
+        if chat.id == ALLOWED_GROUP_ID:
+            if uid not in _allowed_users:
+                _allowed_users.add(uid)
+                _save_allowed_users()
+            return True
+        # Private chat: allow only if whitelisted or owner
+        if chat.type == "private":
+            return uid in _allowed_users or uid == OWNER_ID
+        # All other chats denied
+        return False
+    except Exception:
+        logger.exception("Authorization check failed")
+        return False
+
+async def send_message_secure(app: Application, text: str, *, silent: bool = True, parse_mode: str = "HTML"):
+    """
+    Secure send wrapper - only sends to ALLOWED_GROUP_ID.
+    Use this for all automated notifications and group-sent messages.
+    """
+    try:
+        if not notifications_enabled():
+            logger.debug("Notifications disabled - blocking secure send")
+            return
+        await app.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=text, parse_mode=parse_mode,
+                                   disable_web_page_preview=True, disable_notification=silent)
+    except Exception:
+        logger.exception("send_message_secure failed")
+
+# -------------------------
+# Background tasks:
+#  - utc5_daily_sender() -> 23:00 UTC+5 daily /prices (sound)
+#  - price_change_detector() -> 05:45-08:00 UTC+5 every 5 minutes until update or end (silent). If none -> send summary "No price changes today."
+# -------------------------
+_utc5_daily_task: Optional[asyncio.Task] = None
 _change_detector_task: Optional[asyncio.Task] = None
 
-def _ensure_user_entry(chat_id: int):
-    k = str(chat_id)
-    if k not in user_last_sent:
-        user_last_sent[k] = {"daily": "", "change": ""}
+def _next_utc5_23(now: Optional[datetime] = None) -> datetime:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
+    local_now_base = now.astimezone(tz_base)
+    today_target = datetime.combine(local_now_base.date(), time(EVENING_HOUR_UTC5, EVENING_MINUTE_UTC5), tzinfo=tz_base)
+    if local_now_base < today_target:
+        target_local = today_target
+    else:
+        target_local = today_target + timedelta(days=1)
+    return target_local.astimezone(timezone.utc)
 
-async def send_message(app: Application, chat_id: int, text: str, silent: bool):
+async def utc5_daily_sender(app: Application):
+    logger.info("UTC+5 daily sender started (23:00 UTC+5)")
     try:
-        if chat_id is None:
-            return
-        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
-                                   disable_web_page_preview=True, disable_notification=silent==True and True or False)
-    except Exception:
-        logger.exception("Failed to send message to %s", chat_id)
-
-async def per_user_daily_scheduler(app: Application):
-    logger.info("User daily scheduler started")
-    while True:
-        try:
-            if not notifications_enabled():
-                await asyncio.sleep(300)
-                continue
+        while True:
+            next_send_utc = _next_utc5_23()
             now_utc = datetime.now(timezone.utc)
-            # loop users
-            for chat_id, tz_str in list(user_timezones.items()):
-                try:
-                    zone = tz_to_zone(tz_str)
-                except Exception:
-                    zone = tz_to_zone(DEFAULT_TZ_STR)
-                now_local = now_utc.astimezone(zone)
-                _ensure_user_entry(chat_id)
-                k = str(chat_id)
-                today = now_local.date().isoformat()
-                # priority 1: 23:00 local
-                if now_local.hour == EVENING_HOUR and now_local.minute == EVENING_MINUTE:
-                    if user_last_sent[k].get("daily") != today:
-                        msg = await build_prices_sections_and_format()
-                        # send with sound
-                        await send_message(app, chat_id, msg, silent=False)
-                        user_last_sent[k]["daily"] = today
-                        _save_json(LAST_SENT_FILE, user_last_sent)
-                        continue
-                # fallback: time corresponding to 04:00 UTC+5
-                # compute 04:00 in UTC then convert to user's local
-                base_zone = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
-                base_dt_local = datetime.combine(now_utc.astimezone(base_zone).date(), PRECHANGE_TIME_UTC5, tzinfo=base_zone)
-                base_dt_utc = base_dt_local.astimezone(timezone.utc)
-                user_pre_dt_local = base_dt_utc.astimezone(zone)
-                # if now_local matches that minute
-                if user_pre_dt_local.date() == now_local.date() and now_local.hour == user_pre_dt_local.hour and now_local.minute == user_pre_dt_local.minute:
-                    if user_last_sent[k].get("daily") != today:
-                        msg = await build_prices_sections_and_format()
-                        await send_message(app, chat_id, msg, silent=False)
-                        user_last_sent[k]["daily"] = today
-                        _save_json(LAST_SENT_FILE, user_last_sent)
-                # small delay to avoid hot loop
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            logger.info("per_user_daily_scheduler cancelled")
-            break
-        except Exception:
-            logger.exception("Error in per_user_daily_scheduler")
+            wait_secs = (next_send_utc - now_utc).total_seconds()
+            if wait_secs > 0:
+                # sleep responsive chunks
+                while wait_secs > 0:
+                    chunk = min(wait_secs, 3600)
+                    await asyncio.sleep(chunk)
+                    now_utc = datetime.now(timezone.utc)
+                    wait_secs = (next_send_utc - now_utc).total_seconds()
+            # build & send
+            try:
+                if not notifications_enabled():
+                    logger.info("Notifications disabled - skipping utc5 daily send")
+                else:
+                    msg = await build_prices_sections_and_format()
+                    await send_message_secure(app, msg, silent=False)
+                    logger.info("Sent utc5 daily /prices to group %s", ALLOWED_GROUP_ID)
+            except Exception:
+                logger.exception("Failed to build/send utc5 daily message")
             await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        logger.info("utc5_daily_sender cancelled")
+    except Exception:
+        logger.exception("utc5_daily_sender crashed")
+
+def _utc5_window_today(now_utc: Optional[datetime] = None) -> Tuple[datetime, datetime]:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))  # UTC+5 zone
+    local = now_utc.astimezone(tz_base)
+    start_local = datetime.combine(local.date(), PRICE_CHANGE_WINDOW_START, tzinfo=tz_base)
+    end_local = datetime.combine(local.date(), PRICE_CHANGE_WINDOW_END, tzinfo=tz_base)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 async def price_change_detector(app: Application):
-    # runs frequently around 06:00 UTC+5 but safe to run periodic checks
-    logger.info("Price change detector started")
-    while True:
-        try:
-            if not notifications_enabled():
-                await asyncio.sleep(300)
-                continue
-            # determine current UTC time and check if it's past 06:00 UTC+5 for today
+    logger.info("Price change detector started (05:45-08:00 UTC+5 every 5 min)")
+    try:
+        while True:
+            # compute today's window in UTC
+            start_utc, end_utc = _utc5_window_today()
             now_utc = datetime.now(timezone.utc)
-            tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
-            now_in_base = now_utc.astimezone(tz_base)
-            # only attempt detection within some window after 06:00 base (e.g. 06:00-09:00)
-            if time(6,0) <= now_in_base.time() <= time(9,0):
-                # fetch current prices map
-                new_map, el_map = await fetch_bootstrap_prices_map()
-                # detect changes vs baseline
-                changes = detect_price_changes(prices_baseline, new_map)
-                if changes:
-                    # format and send to all users quietly (silent)
-                    msg = format_price_changes_message(changes, el_map)
-                    if msg:
-                        # send to configured alert chat (ALERT_CHAT_ID) and to individual users?
-                        # We send to ALERT_CHAT_ID if set; and to all users as well (silent)
-                        target = ALERT_CHAT_ID
-                        if target:
-                            try:
-                                await send_message(app, int(target), msg, silent=True)
-                            except Exception:
-                                logger.exception("Failed to send to ALERT_CHAT_ID")
-                        # send to all known users
-                        for chat_id in list(user_timezones.keys()):
-                            try:
-                                k = str(chat_id)
-                                today = now_in_base.date().isoformat()
-                                if user_last_sent.get(k, {}).get("change") == today:
-                                    continue
-                                await send_message(app, chat_id, msg, silent=True)
-                                _ensure_user_entry(chat_id)
-                                user_last_sent[k]["change"] = today
-                                _save_json(LAST_SENT_FILE, user_last_sent)
-                            except Exception:
-                                logger.exception("Failed to send price change to user %s", chat_id)
-                    # update baseline to new map
-                    # save new baseline
-                    pb = {str(k): v for k, v in new_map.items()}
-                    _save_json(PRICES_BASELINE_FILE, pb)
-                    global prices_baseline
-                    prices_baseline = pb
-                else:
-                    # if baseline empty, set it
-                    if not prices_baseline:
+            # if now before start -> sleep until start
+            if now_utc < start_utc:
+                sleep_secs = (start_utc - now_utc).total_seconds()
+                # sleep in chunks
+                while sleep_secs > 0:
+                    chunk = min(sleep_secs, 3600)
+                    await asyncio.sleep(chunk)
+                    now_utc = datetime.now(timezone.utc)
+                    sleep_secs = (start_utc - now_utc).total_seconds()
+            # now in or after start_utc
+            updates_found = False
+            # run polling loop until end_utc
+            while datetime.now(timezone.utc) <= end_utc:
+                if not notifications_enabled():
+                    logger.info("Notifications disabled - skipping today's change checks")
+                    break
+                # do check
+                try:
+                    new_map, el_map, elements = await fetch_bootstrap_prices_map()
+                    changes = detect_price_changes(prices_baseline, new_map)
+                    if changes:
+                        # format & send (silent)
+                        msg = format_price_changes_message(changes, el_map)
+                        if msg:
+                            await send_message_secure(app, msg, silent=True)
+                            logger.info("Sent price-change notification to group %s", ALLOWED_GROUP_ID)
+                        # update baseline on first detection
                         pb = {str(k): v for k, v in new_map.items()}
                         _save_json(PRICES_BASELINE_FILE, pb)
-                        prices_baseline.update(pb)
-            # sleep until next check; check often but this loop is cheap
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            logger.info("price_change_detector cancelled")
-            break
-        except Exception:
-            logger.exception("Error in price_change_detector")
-            await asyncio.sleep(30)
+                        global prices_baseline
+                        prices_baseline = pb
+                        updates_found = True
+                        break  # stop polling for today
+                    else:
+                        # if baseline empty, initialize
+                        if not prices_baseline:
+                            pb = {str(k): v for k, v in new_map.items()}
+                            _save_json(PRICES_BASELINE_FILE, pb)
+                            prices_baseline.update(pb)
+                except Exception:
+                    logger.exception("Error during price-change check")
+                # sleep 5 minutes before next attempt (but break early if time passed)
+                await asyncio.sleep(PRICE_CHANGE_POLL_SECONDS)
+            # after polling window
+            if not updates_found and notifications_enabled():
+                # send "no changes" summary
+                no_msg = "<code>\n" + center_text("Price changes summary", 40) + "\n" + "-------------------------------\n" + "No price changes today.\n" + "</code>"
+                try:
+                    await send_message_secure(app, no_msg, silent=True)
+                    logger.info("Sent no-update summary to group %s", ALLOWED_GROUP_ID)
+                except Exception:
+                    logger.exception("Failed to send no-update summary")
+            # sleep until next day's window (i.e., compute next day's start)
+            # compute next day's start_utc by adding 1 day to start_utc
+            start_utc_next = start_utc + timedelta(days=1)
+            now_utc = datetime.now(timezone.utc)
+            sleep_secs = (start_utc_next - now_utc).total_seconds()
+            if sleep_secs > 0:
+                # sleep in chunks
+                while sleep_secs > 0:
+                    chunk = min(sleep_secs, 3600)
+                    await asyncio.sleep(chunk)
+                    now_utc = datetime.now(timezone.utc)
+                    sleep_secs = (start_utc_next - now_utc).total_seconds()
+    except asyncio.CancelledError:
+        logger.info("price_change_detector cancelled")
+    except Exception:
+        logger.exception("price_change_detector crashed")
 
 # -------------------------
-# GW38 auto-disable check
+# GW38 auto-disable
 # -------------------------
-GW_DISABLE_TARGET = 38
-
 async def check_and_disable_after_gw38():
     try:
         data = await fetch_json(FPL_BOOTSTRAP)
@@ -684,71 +767,102 @@ async def check_and_disable_after_gw38():
 # Bot command handlers
 # -------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    if not is_authorized_update(update):
+        return
     text = (
         "FPL Prices Bot\n"
         "Commands:\n"
         "/prices - show current compact prices (3 sections)\n"
         "/settz <Zone> - set your timezone (IANA e.g. Asia/Almaty or +5)\n"
         "/mytz - show your timezone\n"
-        "/notify_status - show notification enabled/disabled and last sends\n"
+        "/notify_status - show notification enabled/disabled\n"
     )
-    await update.message.reply_text(text)
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(text)
+    else:
+        await send_message_secure(context.application, text, silent=False)
 
 async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized_update(update):
+        return
     msg = await build_prices_sections_and_format()
-    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+    else:
+        await send_message_secure(context.application, msg, silent=False)
 
 async def settz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    if not is_authorized_update(update):
+        return
     args = context.args or []
     if not args:
-        cur = user_timezones.get(chat_id, DEFAULT_TZ_STR)
-        await update.message.reply_text(f"Usage: /settz <IANA zone or +N>\nCurrent: {cur}")
+        cur = user_timezones.get(update.effective_user.id, DEFAULT_TZ_STR)
+        if update.effective_chat.type == "private":
+            await update.message.reply_text(f"Usage: /settz <IANA zone or +N>\nCurrent: {cur}")
+        else:
+            await send_message_secure(context.application, f"Usage: /settz <IANA zone or +N>\nCurrent: {cur}", silent=False)
         return
     parsed = parse_tz_input(args[0])
     if not parsed:
         await update.message.reply_text("Unknown timezone. Use IANA like Asia/Almaty or offset +5")
         return
-    # validate tz
     try:
         _ = tz_to_zone(parsed)
     except Exception:
-        await update.message.reply_text("Cannot resolve timezone; try IANA till you succeed.")
+        await update.message.reply_text("Cannot resolve timezone; try IANA.")
         return
-    user_timezones[chat_id] = parsed
+    user_timezones[update.effective_user.id] = parsed
     _save_json(USER_TZ_FILE, {str(k): v for k, v in user_timezones.items()})
-    await update.message.reply_text(f"Timezone set to {parsed}")
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(f"Timezone set to {parsed}")
+    else:
+        await send_message_secure(context.application, f"Timezone set to {parsed}", silent=False)
 
 async def mytz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    tz = user_timezones.get(chat_id, DEFAULT_TZ_STR)
-    await update.message.reply_text(f"Your timezone: {tz}")
+    if not is_authorized_update(update):
+        return
+    tz = user_timezones.get(update.effective_user.id, DEFAULT_TZ_STR)
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(f"Your timezone: {tz}")
+    else:
+        await send_message_secure(context.application, f"Your timezone: {tz}", silent=False)
 
 async def notify_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized_update(update):
+        return
     enabled = notifications_enabled()
-    await update.message.reply_text(f"Notifications enabled: {enabled}\nNotification flag file: {NOTIF_FLAG_FILE}")
+    text = f"Notifications enabled: {enabled}\nNotification flag file: {NOTIF_FLAG_FILE}"
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(text)
+    else:
+        await send_message_secure(context.application, text, silent=False)
+
+# group logger to populate whitelist when users post in group
+async def _group_message_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.effective_chat and update.effective_chat.id == ALLOWED_GROUP_ID:
+            is_authorized_update(update)  # adds author to whitelist
+    except Exception:
+        pass
 
 # -------------------------
-# Application lifecycle: start/stop tasks
+# Application lifecycle
 # -------------------------
 async def start_background_tasks(app: Application):
-    # check GW38 once at start
     await check_and_disable_after_gw38()
-    global _daily_task, _change_detector_task
-    if _daily_task is None or _daily_task.done():
-        _daily_task = asyncio.create_task(per_user_daily_scheduler(app))
+    global _utc5_daily_task, _change_detector_task
+    if _utc5_daily_task is None or _utc5_daily_task.done():
+        _utc5_daily_task = asyncio.create_task(utc5_daily_sender(app))
     if _change_detector_task is None or _change_detector_task.done():
         _change_detector_task = asyncio.create_task(price_change_detector(app))
     logger.info("Background tasks started")
 
 async def stop_background_tasks():
-    global _daily_task, _change_detector_task
-    tasks = [_daily_task, _change_detector_task]
+    global _utc5_daily_task, _change_detector_task
+    tasks = [_utc5_daily_task, _change_detector_task]
     for t in tasks:
         if t:
             t.cancel()
-    # gather to finish
     await asyncio.sleep(0.1)
 
 # -------------------------
@@ -756,7 +870,7 @@ async def stop_background_tasks():
 # -------------------------
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is required in env")
+        logger.error("BOT_TOKEN is required in environment")
         return
     app = Application.builder().token(BOT_TOKEN).build()
     # handlers
@@ -765,9 +879,11 @@ def main():
     app.add_handler(CommandHandler("settz", settz_cmd))
     app.add_handler(CommandHandler("mytz", mytz_cmd))
     app.add_handler(CommandHandler("notify_status", notify_status_cmd))
-    # start/stop hooks
+    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), _group_message_logger))
+    # lifecycle hooks
     async def _on_start(_app: Application):
         logger.info("Bot started (PTB %s)", PTB_VERSION)
+        # ensure allowed users loaded (already loaded at import)
         await start_background_tasks(_app)
     async def _on_stop(_app: Application):
         logger.info("Bot stopping")
@@ -775,7 +891,6 @@ def main():
         await _http_client.aclose()
     app.post_init = _on_start
     app.post_shutdown = _on_stop
-    # run
     logger.info("Starting bot...")
     app.run_polling()
 
