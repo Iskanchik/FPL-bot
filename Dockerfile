@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ------------------------------
 # Application
 # ------------------------------
-COPY fpl_bot_enterprise.py .
+COPY fpl_bot.py .
 
 # Pre-create non-root user
 RUN useradd -m botuser
