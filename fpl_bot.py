@@ -1,11 +1,19 @@
 # fpl_bot.py
 # Single-file enterprise-grade FPL Prices Bot (subset: /prices, /price_on, /help)
-# Variant B formatting chosen: show TEAM POS Name £price  EMOJI  target% (compact mobile-friendly)
+# Variant B formatting chosen: TEAM POS Name £price  EMOJI  target% (compact mobile-friendly)
+# Changes applied per request:
+# - Monospaced output, max width 40 (no artificial stretching; only truncate)
+# - Percent highlighted (bold)
+# - Names shortened when too long
+# - price_on uses bootstrap-static as baseline fallback (no LiveFPL fetch)
+# - Baseline snapshots still saved to Upstash; detect_changes uses bootstrap-static
+# - Price queries restricted to current season (Aug 1 .. Jul 31 next year)
+# Minimal comments kept.
 
 import os, sys, json, asyncio, logging, random, re, time as _time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone, time as dt_time
+from datetime import datetime, timedelta, timezone, time as dt_time, date
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -46,6 +54,12 @@ if not BOT_TOKEN or OWNER_ID <= 0 or ALLOWED_GROUP_ID == 0:
 if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
     print("UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be set", file=sys.stderr)
     sys.exit(1)
+
+# -------------------------
+# Formatting limits (user requested)
+# -------------------------
+TABLE_MAX_WIDTH = 40        # maximum characters per line (do not artificially stretch shorter lines)
+MAX_NAME_LEN = 18          # max chars for displayed player name (truncate/smart-shorten if longer)
 
 # -------------------------
 # Logging & metrics
@@ -467,7 +481,6 @@ def parse_percent(s: str) -> float:
         return 0.0
 
 def emoji_for_direction(direction: str) -> str:
-    # mapping: rise -> up, fall -> down, neutral -> square
     if not direction:
         return "▫"
     d = direction.lower()
@@ -477,19 +490,50 @@ def emoji_for_direction(direction: str) -> str:
         return "🔽"
     return "▫"
 
+def enforce_width(s: str) -> str:
+    # do not artificially pad; only truncate to TABLE_MAX_WIDTH
+    if s is None:
+        return ""
+    s2 = str(s)
+    if len(s2) <= TABLE_MAX_WIDTH:
+        return s2
+    # truncate gracefully with ellipsis fitting into TABLE_MAX_WIDTH
+    if TABLE_MAX_WIDTH <= 3:
+        return s2[:TABLE_MAX_WIDTH]
+    return s2[:TABLE_MAX_WIDTH-1] + "…"
+
+def shorten_name(name: str, max_len: int = MAX_NAME_LEN) -> str:
+    if not name:
+        return ""
+    n = name.strip()
+    if len(n) <= max_len:
+        return n
+    parts = n.split()
+    if len(parts) >= 2:
+        first = parts[0]
+        last = parts[-1]
+        short = f"{first[0]}. {last}"
+        if len(short) <= max_len:
+            return short
+        # try last name only truncated
+        if len(last) > max_len:
+            return last[:max_len-1] + "…"
+        return short[:max_len-1] + "…"
+    # single long token: truncate
+    return n[:max_len-1] + "…"
+
 def format_line_variant_b(r: Dict[str, Any], el_map: Dict[int, dict]) -> str:
-    # Compose: TEAM POS Name £price  EMOJI  target%
+    # Compose: TEAM POS Name £price  EMOJI  <b>target%</b>
     team = (r.get("Team") or "").upper() or "UNK"
     pos = (r.get("Pos") or "").upper() or ""
-    name = (r.get("Name") or "").strip()
+    name_raw = (r.get("Name") or "").strip()
+    name = shorten_name(name_raw, MAX_NAME_LEN)
     price_val = r.get("Price") or ""
-    # normalize price to one decimal if numeric
     try:
         pv = float(str(price_val))
         price = f"£{pv:.1f}"
     except Exception:
         price = f"£{price_val}".strip()
-    # prefer target percent then Owned by fallback
     tgt_raw = r.get("Target") or ""
     if not tgt_raw:
         tgt_raw = r.get("Owned by") or ""
@@ -498,11 +542,10 @@ def format_line_variant_b(r: Dict[str, Any], el_map: Dict[int, dict]) -> str:
         tnum = parse_percent(tgt_raw)
         tgt_pct = f"{int(round(tnum))}%"
     except Exception:
-        tgt_pct = tgt_raw or ""
+        tgt_pct = (tgt_raw or "").strip()
     direction = r.get("_direction", "neutral")
     em = emoji_for_direction(direction)
     pieces = []
-    # include team and pos
     if pos:
         pieces.append(f"{team} {pos}")
     else:
@@ -510,16 +553,19 @@ def format_line_variant_b(r: Dict[str, Any], el_map: Dict[int, dict]) -> str:
     pieces.append(price)
     pieces.append(name)
     pieces.append(em)
-    pieces.append(tgt_pct)
-    # join with two spaces for mobile readability
-    return "  ".join([p for p in pieces if p is not None and str(p) != ""])
+    if tgt_pct:
+        # percent highlighted in bold (HTML)
+        pieces.append(f"<b>{tgt_pct}</b>")
+    # join with two spaces for readability, then enforce width
+    line = "  ".join([p for p in pieces if p is not None and str(p) != ""])
+    return enforce_width(line)
 
 def format_prices_variant_b(sections: Dict[str, List[Dict[str, Any]]], el_map: Dict[int, dict]) -> str:
     order = ["Already reached target", "Projected to reach target", "Others who will be close"]
     out_blocks = []
     for title in order:
         rows = sections.get(title, []) or []
-        header = f"<b>{title}</b>"
+        header = title  # do not pad header artificially
         lines = [header]
         if not rows:
             lines.append("(none)")
@@ -532,8 +578,9 @@ def format_prices_variant_b(sections: Dict[str, List[Dict[str, Any]]], el_map: D
             except Exception:
                 continue
         out_blocks.append("\n".join(lines))
-    # join blocks with blank line and return as HTML pre/code friendly text
-    return "<pre>" + "\n\n".join(out_blocks) + "</pre>"
+    # join blocks and wrap in <pre> to force monospace in Telegram HTML mode
+    body = "\n\n".join(out_blocks)
+    return "<pre>" + body + "</pre>"
 
 # -------------------------
 # Persistence keys & helpers (new schema)
@@ -574,6 +621,25 @@ async def _load_daily_baseline_async(date_str: str) -> Optional[Dict[str,int]]:
         return None
 
 # -------------------------
+# Season helpers (restrict queries to current season)
+# -------------------------
+def current_season_range(now: Optional[date] = None) -> Tuple[date, date]:
+    # FPL season convention: season runs from Aug 1 to next year Jul 31
+    if now is None:
+        now = datetime.utcnow().date()
+    if now.month >= 8:
+        start = date(now.year, 8, 1)
+        end = date(now.year+1, 7, 31)
+    else:
+        start = date(now.year-1, 8, 1)
+        end = date(now.year, 7, 31)
+    return (start, end)
+
+def assert_within_current_season(d: date) -> bool:
+    s, e = current_season_range()
+    return s <= d <= e
+
+# -------------------------
 # Price detector service (uses hybrid parser + formatting Variant B)
 # -------------------------
 class PriceDetectorService:
@@ -593,7 +659,6 @@ class PriceDetectorService:
                 return "<code>No price projections parsed.</code>"
             await fetch_bootstrap_cached()  # ensure bootstrap data available
             el_map = _BOOTSTRAP_CACHE.get("el_map", {})
-            # Format using Variant B
             return format_prices_variant_b(sections, el_map)
         except Exception:
             logger.exception("Error building prices message")
@@ -616,6 +681,7 @@ class PriceDetectorService:
         return out
 
     async def detect_changes_and_update_baseline(self) -> Optional[List[Tuple[str,int,int]]]:
+        # baseline generation ONLY via bootstrap-static (requested)
         try:
             data = await fetch_bootstrap_cached()
             if not data:
@@ -828,15 +894,30 @@ async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
         return
+    # Restrict to current season
+    if not assert_within_current_season(d0):
+        s,e = current_season_range()
+        await update.message.reply_text(f"Date {date_str} is outside current season range {s.isoformat()}..{e.isoformat()}")
+        return
+    # load baseline for requested date; if absent, fallback to bootstrap-static snapshot for that date
     day1 = await _load_daily_baseline_async(date_str)
     if not day1:
-        await update.message.reply_text(f"No baseline for {date_str}")
-        return
+        # fallback: build baseline map from bootstrap (snapshot for that date)
+        b = await fetch_bootstrap_cached()
+        if not b:
+            await update.message.reply_text(f"No baseline for {date_str} and bootstrap fetch failed")
+            return
+        elements = b.get("elements", []) or []
+        day1 = {str(el["id"]): int(el.get("now_cost", 0)) for el in elements}
     next_day = (d0 + timedelta(days=1)).isoformat()
     day2 = await _load_daily_baseline_async(next_day)
     if not day2:
-        await update.message.reply_text(f"No baseline for {next_day} (need both days)")
-        return
+        b = await fetch_bootstrap_cached()
+        if not b:
+            await update.message.reply_text(f"No baseline for {next_day} and bootstrap fetch failed")
+            return
+        elements = b.get("elements", []) or []
+        day2 = {str(el["id"]): int(el.get("now_cost", 0)) for el in elements}
     changes = price_service.detect_between_maps(day1, day2)
     if not changes:
         await update.message.reply_text(f"<code>No changes between {date_str} and {next_day}</code>", parse_mode="HTML")
