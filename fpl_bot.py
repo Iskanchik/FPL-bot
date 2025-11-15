@@ -1,13 +1,33 @@
 # fpl_bot.py
-# Enterprise single-file FPL Prices Bot
-# Python 3.10+; deps: python-telegram-bot>=20, httpx, beautifulsoup4
-# All secrets/IDs via ENV. Data persisted under /mnt/data.
+# Enterprise single-file FPL Prices Bot (final)
+# - Single-file (no splitting) as requested
+# - Features: atomic file I/O, HMAC whitelist, bootstrap cache + name index,
+#   circuit breaker for LiveFPL, strict validation, health-state, DI-style init,
+#   retries/backoff, precise scheduler, safe sending only to ALLOWED_GROUP_ID.
+#
+# Requirements (install into image):
+# python-telegram-bot[ext]==20.6
+# httpx==0.25.2
+# beautifulsoup4==4.12.3
+# lxml==4.9.3
+# fastjsonschema==2.19.1
+# tzdata
+# loguru==0.7.2
+# tenacity==8.2.3
+#
+# ENV required:
+# BOT_TOKEN, OWNER_ID, ALLOWED_GROUP_ID, WHITELIST_HMAC_KEY (recommended), LEAGUE_ID (opt)
+# Optional tuning: BOOTSTRAP_TTL_SECS, PRICE_CHANGE_POLL_SECONDS, PRICE_CHANGE_UTC_PLUS
+#
+# Minimal comments: only for non-obvious rationale.
 
 import os
+import sys
 import asyncio
 import json
 import hmac
 import hashlib
+import time as _time
 from collections import defaultdict
 from datetime import datetime, date, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -16,13 +36,15 @@ import logging
 
 import httpx
 from bs4 import BeautifulSoup
+import fastjsonschema
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from telegram import __version__ as PTB_VERSION
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # -------------------------
-# CONFIG (ENV)
+# CONFIG FROM ENV
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -32,15 +54,13 @@ LEAGUE_ID = int(os.getenv("LEAGUE_ID", "980121"))
 DATA_DIR = os.getenv("DATA_DIR", "/mnt/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# HMAC key for whitelist file integrity (optional but recommended)
-WHITELIST_HMAC_KEY = os.getenv("WHITELIST_HMAC_KEY", "")
-
-# Tuning
+WHITELIST_HMAC_KEY = os.getenv("WHITELIST_HMAC_KEY", "")  # recommended
 BOOTSTRAP_TTL_SECS = int(os.getenv("BOOTSTRAP_TTL_SECS", "30"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
 PRICE_CHANGE_POLL_SECONDS = int(os.getenv("PRICE_CHANGE_POLL_SECONDS", str(5 * 60)))  # default 5 min
 PRICE_CHANGE_UTC_PLUS = int(os.getenv("PRICE_CHANGE_UTC_PLUS", "5"))
+GW_DISABLE_TARGET = int(os.getenv("GW_DISABLE_TARGET", "38"))
 
 # Files
 USER_TZ_FILE = os.path.join(DATA_DIR, "user_timezones.json")
@@ -52,46 +72,46 @@ ALLOWED_USERS_FILE = os.path.join(DATA_DIR, "allowed_users.json")
 PRICE_CHECK_STATE_FILE = os.path.join(DATA_DIR, "price_check_state.json")
 LAST_LIVEFPL_HTML = os.path.join(DATA_DIR, "last_livefpl_html.html")
 
-# Endpoints
 FPL_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
 LIVEFPL_PRICES = "https://www.livefpl.net/prices"
-
-# Scheduling constants
-PRICE_CHANGE_WINDOW_START = time(5, 45)  # UTC+5 05:45
-PRICE_CHANGE_WINDOW_END = time(8, 0)     # UTC+5 08:00
-EVENING_HOUR_UTC5 = 23
-EVENING_MINUTE_UTC5 = 0
-GW_DISABLE_TARGET = int(os.getenv("GW_DISABLE_TARGET", "38"))
 
 # -------------------------
 # Basic validation
 # -------------------------
 if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN is required in environment")
+    print("BOT_TOKEN is required in environment", file=sys.stderr)
+    sys.exit(1)
 if OWNER_ID <= 0:
-    raise SystemExit("OWNER_ID must be set in environment")
-if ALLOWED_GROUP_ID <= 0:
-    raise SystemExit("ALLOWED_GROUP_ID must be set in environment")
+    print("OWNER_ID must be set in environment", file=sys.stderr)
+    sys.exit(1)
+if ALLOWED_GROUP_ID == 0:
+    print("ALLOWED_GROUP_ID must be set in environment", file=sys.stderr)
+    sys.exit(1)
 
 # -------------------------
-# Logging / observability
+# Logger (text human-readable)
 # -------------------------
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger("fpl_bot")
-# small in-memory metrics for visibility
+logger.info("Logger initialized; PTB %s", PTB_VERSION)
+
+# Minimal in-memory metrics for observability
 metrics = defaultdict(int)
 
 # -------------------------
-# Atomic async file I/O + locks
+# Atomic async file I/O with locks
 # -------------------------
 _file_locks: Dict[str, asyncio.Lock] = {}
 
 def _get_lock(path: str) -> asyncio.Lock:
-    lock = _file_locks.get(path)
-    if lock is None:
-        lock = asyncio.Lock()
-        _file_locks[path] = lock
-    return lock
+    if path not in _file_locks:
+        _file_locks[path] = asyncio.Lock()
+    return _file_locks[path]
 
 def _load_json_sync(path: str, default):
     try:
@@ -118,15 +138,18 @@ async def _save_json_atomic(path: str, data):
             except Exception:
                 pass
 
-# Wrapper sync loads at import
+# -------------------------
+# Load persisted state at startup (sync)
+# -------------------------
 user_timezones: Dict[int, str] = {int(k): v for k, v in _load_json_sync(USER_TZ_FILE, {}).items()}
 user_last_sent: Dict[str, Dict[str, str]] = _load_json_sync(LAST_SENT_FILE, {})
 prices_baseline: Dict[str, int] = _load_json_sync(PRICES_BASELINE_FILE, {})
 league_cache: Dict[str, Any] = _load_json_sync(LEAGUE_CACHE_FILE, {})
 notif_flag_obj = _load_json_sync(NOTIF_FLAG_FILE, {"enabled": True})
+_price_check_state = _load_json_sync(PRICE_CHECK_STATE_FILE, {})
 
 # -------------------------
-# Whitelist secure load/save
+# Whitelist pack/unpack (HMAC)
 # -------------------------
 def _whitelist_pack(users: List[int]) -> dict:
     payload = {"users": sorted(list(users))}
@@ -146,10 +169,8 @@ def _whitelist_unpack(blob: dict) -> List[int]:
             return []
     return payload
 
-# load whitelist
-_allowed_users: Set[int] = set(int(x) for x in (_load_json_sync(ALLOWED_USERS_FILE, {}).get("payload", {}).get("users", []) if os.path.exists(ALLOWED_USERS_FILE) else []))
-
-# if file is present but signed differently, try to unpack properly
+# load allowed users (secure)
+_allowed_users: Set[int] = set()
 if os.path.exists(ALLOWED_USERS_FILE):
     try:
         blob = _load_json_sync(ALLOWED_USERS_FILE, {})
@@ -163,29 +184,21 @@ async def _save_allowed_users():
     await _save_json_atomic(ALLOWED_USERS_FILE, blob)
 
 # -------------------------
-# HTTP client with retries/backoff
+# HTTP client with retry/backoff
 # -------------------------
 class HttpClient:
     def __init__(self, timeout:int=HTTP_TIMEOUT, retries:int=HTTP_RETRIES):
         self._client = httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "FPL-Enterprise-Bot/1.0"})
         self._retries = retries
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10),
+           retry=retry_if_exception_type((httpx.TransportError, httpx.ReadTimeout)))
     async def get(self, url: str, **kwargs) -> Optional[httpx.Response]:
-        attempts = 0
-        backoff = 1.0
-        while attempts <= self._retries:
-            try:
-                resp = await self._client.get(url, **kwargs)
-                return resp
-            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-                attempts += 1
-                logger.warning("HTTP GET failed %s (attempt %d/%d): %s", url, attempts, self._retries, exc)
-                await asyncio.sleep(backoff)
-                backoff *= 2
-            except Exception:
-                logger.exception("Unexpected error fetching %s", url)
-                return None
-        return None
+        resp = await self._client.get(url, **kwargs)
+        if resp.status_code >= 500:
+            # raise to trigger retry
+            raise httpx.HTTPStatusError("server error", request=resp.request, response=resp)
+        return resp
 
     async def close(self):
         await self._client.aclose()
@@ -193,26 +206,30 @@ class HttpClient:
 _http = HttpClient(timeout=HTTP_TIMEOUT, retries=HTTP_RETRIES)
 
 async def fetch_json(url: str) -> Optional[dict]:
-    resp = await _http.get(url)
-    if not resp:
-        return None
-    if resp.status_code != 200:
-        logger.warning("fetch_json %s -> status %s", url, resp.status_code)
-        return None
     try:
+        resp = await _http.get(url)
+        if resp is None:
+            return None
+        if resp.status_code != 200:
+            logger.warning("fetch_json %s -> status %s", url, resp.status_code)
+            return None
         return resp.json()
     except Exception:
-        logger.exception("Failed to decode json from %s", url)
+        logger.exception("fetch_json failed %s", url)
         return None
 
 async def fetch_text(url: str) -> Optional[str]:
-    resp = await _http.get(url)
-    if not resp:
-        return None
-    if resp.status_code != 200:
-        logger.warning("fetch_text %s -> status %s", url, resp.status_code)
-        return None
-    return resp.text
+    try:
+        resp = await _http.get(url)
+        if resp is None:
+            return None
+        if resp.status_code != 200:
+            logger.warning("fetch_text %s -> status %s", url, resp.status_code)
+            return None
+        return resp.text
+    except Exception:
+        logger.exception("fetch_text failed %s", url)
+    return None
 
 # -------------------------
 # Bootstrap cache + name index
@@ -240,22 +257,40 @@ async def fetch_bootstrap_cached(force: bool = False) -> Optional[dict]:
         except Exception:
             continue
     _BOOTSTRAP_CACHE.update({"ts": now, "data": data, "elements": elements, "el_map": el_map, "name_index": name_index})
+    metrics["bootstrap_refresh"] += 1
     return data
 
 # -------------------------
-# Helpers: tz, formatting, parse html
+# Validation schema for LiveFPL row (STRICT) using fastjsonschema
 # -------------------------
-DEFAULT_TZ_STR = f"UTC+{PRICE_CHANGE_UTC_PLUS}"
+LIVEFPL_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "Name": {"type": "string"},
+        "Pos": {"type": "string"},
+        "Team": {"type": "string"},
+        "Price": {"type": "string"},
+        "Target": {"type": "string"},
+        "Owned by": {"type": "string"},
+    },
+    "required": ["Name", "Price", "Target", "Owned by"],
+    "additionalProperties": True
+}
+validate_live_row = fastjsonschema.compile(LIVEFPL_ROW_SCHEMA)
 
-def tz_to_zone(tz_str: str):
-    s = tz_str
-    if s.upper().startswith("UTC") and (len(s) == 3 or (len(s) > 3 and s[3] in "+-")):
-        if len(s) == 3:
-            return timezone.utc
-        offset = int(s[3:])
-        return timezone(timedelta(hours=offset))
-    return ZoneInfo(s)
+def validate_row_strict(row: Dict[str, Any]) -> bool:
+    try:
+        # will raise error if invalid
+        validate_live_row(row)
+        return True
+    except Exception as e:
+        logger.warning("LiveFPL row failed validation (strict): %s | row=%s", e, row.get("Name"))
+        metrics["validation_failures"] += 1
+        return False
 
+# -------------------------
+# Parse helpers
+# -------------------------
 def parse_percent(s: str) -> float:
     try:
         if s is None:
@@ -324,14 +359,19 @@ def safe_extract_tables(soup: BeautifulSoup, hints: List[str]) -> Dict[str, List
     for h in hints:
         rows = extract_table(soup, h)
         if rows:
-            res[h] = rows
+            # strict validate each row
+            valid_rows = []
+            for r in rows:
+                if validate_row_strict(r):
+                    valid_rows.append(r)
+            res[h] = valid_rows
         else:
             logger.warning("Failed to parse '%s' table; falling back to empty", h)
             res[h] = []
     return res
 
 # -------------------------
-# FPL team mapping
+# FPL team mapping (team_code -> ABBR)
 # -------------------------
 FPL_TEAM_ABBR = {
     1:  "ARS", 2:  "AVL", 3:  "BOU", 4:  "BRE", 5:  "BHA",
@@ -341,7 +381,7 @@ FPL_TEAM_ABBR = {
 }
 
 # -------------------------
-# Smart matching using name_index -> filters: team -> pos -> price -> fallback
+# Smart matching using name_index -> team -> pos -> price -> fallback
 # -------------------------
 def _pos_code_to_str(code: int) -> str:
     return {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}.get(int(code), "")
@@ -350,14 +390,12 @@ def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_h
     name_low = (name or "").lower().strip()
     candidates = name_index.get(name_low, [])
     if not candidates:
-        # fall back to linear scan if index missing
         candidates = [el for el in elements if str(el.get("web_name", "")).lower().strip() == name_low]
     if not candidates:
         return None
     if len(candidates) == 1:
         return candidates[0]
-
-    # filter by team (team_hint may be abbr or full)
+    # filter by team
     if team_hint:
         filtered = []
         for el in candidates:
@@ -373,15 +411,13 @@ def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_h
             candidates = filtered
             if len(candidates) == 1:
                 return candidates[0]
-
-    # filter by position
+    # filter by pos
     if pos_hint:
         filtered = [el for el in candidates if _pos_code_to_str(el.get("element_type")) == pos_hint.upper()]
         if filtered:
             candidates = filtered
             if len(candidates) == 1:
                 return candidates[0]
-
     # filter by price
     try:
         filtered = []
@@ -395,12 +431,68 @@ def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_h
                 return candidates[0]
     except Exception:
         pass
-
     logger.warning("Ambiguous player match for '%s' -> using first candidate id=%s", name, candidates[0].get("id"))
+    metrics["ambiguous_matches"] += 1
     return candidates[0]
 
 # -------------------------
-# Sorting/filtering sections
+# League cache
+# -------------------------
+async def get_current_gw() -> int:
+    data = await fetch_bootstrap_cached()
+    if not data:
+        return 0
+    for ev in data.get("events", []) or []:
+        if ev.get("is_current"):
+            return int(ev.get("id", 0))
+    return 0
+
+async def fetch_league_player_set_once(league_id: int, cap: int = 80) -> Set[str]:
+    out: Set[str] = set()
+    url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
+    data = await fetch_json(url)
+    if not data:
+        return out
+    results = data.get("standings", {}).get("results") or data.get("results") or data.get("entries") or []
+    entry_ids = []
+    for r in results:
+        eid = r.get("entry") or r.get("id") or r.get("entry_id")
+        if eid:
+            entry_ids.append(int(eid))
+    entry_ids = entry_ids[:cap]
+    sem = asyncio.Semaphore(8)
+    async def fetch_entry(eid: int):
+        async with sem:
+            try:
+                url_e = f"https://fantasy.premierleague.com/api/entry/{eid}/event/0/picks/"
+                j = await fetch_json(url_e)
+                if not j:
+                    return
+                picks = j.get("picks", []) or []
+                for p in picks:
+                    el = p.get("element")
+                    if el:
+                        out.add(f"id:{int(el)}")
+            except Exception:
+                pass
+    tasks = [asyncio.create_task(fetch_entry(e)) for e in entry_ids]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return out
+
+async def get_league_player_set_cached(league_id: int) -> Set[str]:
+    gw = await get_current_gw()
+    gw_saved = int(league_cache.get("gw", -1))
+    if gw_saved == gw and league_cache.get("set"):
+        return set(league_cache.get("set", []))
+    s = await fetch_league_player_set_once(league_id)
+    league_cache["gw"] = gw
+    league_cache["set"] = list(s)
+    await _save_json_atomic(LEAGUE_CACHE_FILE, league_cache)
+    return s
+
+# -------------------------
+# Sorting/filtering sections (apply owned >=1% filter)
 # -------------------------
 def is_in_league_row(r: Dict[str, Any], league_set: Set[str]) -> int:
     name = (r.get("Name") or "").strip().lower()
@@ -442,7 +534,7 @@ def sort_and_filter_sections(sections: Dict[str, List[Dict[str, Any]]], league_s
     return out
 
 # -------------------------
-# Format output (ABBR + name) - monospaced
+# Formatting compact table
 # -------------------------
 def center_text(s: str, width: int = 40) -> str:
     return s.center(width)
@@ -497,7 +589,7 @@ def format_prices_compact(sections: Dict[str, List[Dict[str, Any]]], el_map: Dic
     return "\n\n".join(blocks)
 
 # -------------------------
-# Price change helpers
+# Price change detector & bootstraps
 # -------------------------
 async def fetch_bootstrap_prices_map() -> Tuple[Dict[int, int], Dict[int, dict], List[dict]]:
     data = await fetch_bootstrap_cached()
@@ -560,16 +652,56 @@ def format_price_changes_message(changes: List[Tuple[int, int, int]], el_map: Di
     return "\n".join(lines)
 
 # -------------------------
-# Build /prices
+# Circuit Breaker for LiveFPL
+# -------------------------
+class CircuitBreaker:
+    def __init__(self, fail_threshold:int=3, cooldown_seconds:int=600):
+        self.fail_threshold = fail_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.fail_count = 0
+        self.open_until = 0  # epoch
+
+    def record_success(self):
+        self.fail_count = 0
+        self.open_until = 0
+
+    def record_failure(self):
+        self.fail_count += 1
+        if self.fail_count >= self.fail_threshold:
+            self.open_until = int(_time.time()) + self.cooldown_seconds
+            logger.warning("Circuit breaker opened for %ds after %d failures", self.cooldown_seconds, self.fail_count)
+            metrics["circuit_opened"] += 1
+
+    def is_open(self) -> bool:
+        if self.open_until == 0:
+            return False
+        if _time.time() >= self.open_until:
+            # auto-half-open: allow trial
+            logger.info("Circuit breaker cooldown expired; allowing trial")
+            self.fail_count = 0
+            self.open_until = 0
+            return False
+        return True
+
+livefpl_cb = CircuitBreaker(fail_threshold=3, cooldown_seconds=600)
+
+# -------------------------
+# /prices builder with CB
 # -------------------------
 async def build_prices_sections_and_format() -> str:
+    # check circuit breaker
+    if livefpl_cb.is_open():
+        logger.warning("LiveFPL circuit open — returning fallback message")
+        return "<code>\n       Price changes summary\n-------------------------------\nLiveFPL temporarily unavailable — try later.\n</code>"
+
     txt = await fetch_text(LIVEFPL_PRICES)
     if not txt:
-        logger.error("Could not fetch LiveFPL prices")
-        return "Could not fetch prices page."
+        livefpl_cb.record_failure()
+        return "<code>\n       Price changes summary\n-------------------------------\nCould not fetch LiveFPL prices.\n</code>"
+    # success
+    livefpl_cb.record_success()
     try:
         with open(LAST_LIVEFPL_HTML, "w", encoding="utf-8") as f:
-            # keep a sample for debugging, truncated
             f.write(txt[:200000])
     except Exception:
         logger.exception("Failed to save last LiveFPL HTML")
@@ -633,17 +765,19 @@ def is_authorized_update(update: Update) -> bool:
         if chat.id == ALLOWED_GROUP_ID:
             if uid not in _allowed_users:
                 _allowed_users.add(uid)
-                # save async, fire-and-forget
                 asyncio.create_task(_save_allowed_users())
             return True
         # private: owner or whitelisted only
         if chat.type == "private":
             return uid in _allowed_users or uid == OWNER_ID
-        # other chats: deny silently
+        # other chats denied silently
         return False
     except Exception:
         logger.exception("Authorization check failed")
         return False
+
+def notifications_enabled() -> bool:
+    return bool(notif_flag_obj.get("enabled", True))
 
 async def send_message_secure(app: Application, text: str, *, silent: bool = True, parse_mode: str = "HTML"):
     if not notifications_enabled():
@@ -652,6 +786,7 @@ async def send_message_secure(app: Application, text: str, *, silent: bool = Tru
     try:
         await app.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=text, parse_mode=parse_mode,
                                    disable_web_page_preview=True, disable_notification=silent)
+        metrics["messages_sent"] += 1
     except Exception:
         logger.exception("send_message_secure failed")
         metrics["send_errors"] += 1
@@ -677,63 +812,48 @@ def next_daily_utc5(hour:int, minute:int, now: Optional[datetime]=None) -> datet
         target_local = target_local + timedelta(days=1)
     return target_local.astimezone(timezone.utc)
 
-# -------------------------
-# Price check persistent state
-# -------------------------
-_price_check_state = _load_json_sync(PRICE_CHECK_STATE_FILE, {})
-
-def was_price_check_done_today(today_iso: str) -> bool:
-    return _price_check_state.get("last_checked_date") == today_iso
-
-async def mark_price_check_state(today_iso: str, updates_sent: bool):
-    _price_check_state["last_checked_date"] = today_iso
-    if updates_sent:
-        _price_check_state["updates_sent_date"] = today_iso
-    await _save_json_atomic(PRICE_CHECK_STATE_FILE, _price_check_state)
-
-# -------------------------
-# Background tasks
-# -------------------------
-_utc5_daily_task: Optional[asyncio.Task] = None
-_change_detector_task: Optional[asyncio.Task] = None
-
-async def utc5_daily_sender(app: Application):
-    logger.info("UTC+5 daily sender started")
-    try:
-        while True:
-            next_send = next_daily_utc5(EVENING_HOUR_UTC5, EVENING_MINUTE_UTC5)
-            await sleep_until(next_send)
-            if not notifications_enabled():
-                logger.info("Notifications disabled - skipping daily send")
-            else:
-                msg = await build_prices_sections_and_format()
-                await send_message_secure(app, msg, silent=False)
-                logger.info("Sent daily /prices to group")
-            # loop continues
-    except asyncio.CancelledError:
-        logger.info("utc5_daily_sender cancelled")
-    except Exception:
-        logger.exception("utc5_daily_sender crashed")
-
 def _utc5_window_utc_for_today(now_utc: Optional[datetime] = None) -> Tuple[datetime, datetime]:
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
     local = now_utc.astimezone(tz_base)
-    start_local = datetime.combine(local.date(), PRICE_CHANGE_WINDOW_START, tzinfo=tz_base)
-    end_local = datetime.combine(local.date(), PRICE_CHANGE_WINDOW_END, tzinfo=tz_base)
+    start_local = datetime.combine(local.date(), time(5,45), tzinfo=tz_base)
+    end_local = datetime.combine(local.date(), time(8,0), tzinfo=tz_base)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
+# -------------------------
+# Price change detector + daily sender
+# -------------------------
+_utc5_daily_task: Optional[asyncio.Task] = None
+_change_detector_task: Optional[asyncio.Task] = None
+
+async def utc5_daily_sender(app: Application):
+    logger.info("UTC+5 daily sender started (23:00 UTC+5)")
+    try:
+        while True:
+            next_send_utc = next_daily_utc5(23, 0)
+            await sleep_until(next_send_utc)
+            if not notifications_enabled():
+                logger.info("Notifications disabled - skipping utc5 daily send")
+            else:
+                msg = await build_prices_sections_and_format()
+                await send_message_secure(app, msg, silent=False)
+                logger.info("Sent utc5 daily /prices to group %s", ALLOWED_GROUP_ID)
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        logger.info("utc5_daily_sender cancelled")
+    except Exception:
+        logger.exception("utc5_daily_sender crashed")
+
 async def price_change_detector(app: Application):
-    logger.info("Price change detector started (05:45-08:00 UTC+5 window)")
+    logger.info("Price change detector started (05:45-08:00 UTC+5 every 5 min)")
     try:
         while True:
             start_utc, end_utc = _utc5_window_utc_for_today()
             await sleep_until(start_utc)
             today_iso = start_utc.astimezone(timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))).date().isoformat()
-            if was_price_check_done_today(today_iso):
+            if _price_check_state.get("last_checked_date") == today_iso:
                 logger.info("Price check already done today - skipping window")
-                # sleep until next day's start
                 next_start = start_utc + timedelta(days=1)
                 await sleep_until(next_start)
                 continue
@@ -749,22 +869,27 @@ async def price_change_detector(app: Application):
                         msg = format_price_changes_message(changes, el_map)
                         if msg:
                             await send_message_secure(app, msg, silent=True)
-                            logger.info("Sent price changes to group")
+                            logger.info("Sent price-change notification to group %s", ALLOWED_GROUP_ID)
                         pb = {str(k): v for k, v in new_map.items()}
                         await _save_json_atomic(PRICES_BASELINE_FILE, pb)
                         global prices_baseline
                         prices_baseline = pb
                         updates_found = True
                         break
+                    else:
+                        if not prices_baseline:
+                            pb = {str(k): v for k, v in new_map.items()}
+                            await _save_json_atomic(PRICES_BASELINE_FILE, pb)
+                            prices_baseline.update(pb)
                 except Exception:
-                    logger.exception("Error during price change check")
+                    logger.exception("Error during price-change check")
                 await asyncio.sleep(PRICE_CHANGE_POLL_SECONDS)
             if not updates_found and notifications_enabled():
                 no_msg = "<code>\n" + center_text("Price changes summary", 40) + "\n" + "-------------------------------\n" + "No price changes today.\n" + "</code>"
                 await send_message_secure(app, no_msg, silent=True)
-                logger.info("Sent no-changes summary")
-            await mark_price_check_state(today_iso, updates_found)
-            # then sleep until next day's start
+                logger.info("Sent no-update summary to group %s", ALLOWED_GROUP_ID)
+            _price_check_state["last_checked_date"] = today_iso
+            await _save_json_atomic(PRICE_CHECK_STATE_FILE, _price_check_state)
             next_start = start_utc + timedelta(days=1)
             await sleep_until(next_start)
     except asyncio.CancelledError:
@@ -773,7 +898,7 @@ async def price_change_detector(app: Application):
         logger.exception("price_change_detector crashed")
 
 # -------------------------
-# GW38 auto-disable
+# GW38 disable
 # -------------------------
 async def check_and_disable_after_gw38():
     try:
@@ -785,7 +910,8 @@ async def check_and_disable_after_gw38():
                 if int(ev.get("id", -1)) == GW_DISABLE_TARGET:
                     finished = bool(ev.get("finished") or ev.get("is_finished") or False)
                     if finished:
-                        set_notifications_enabled(False)
+                        notif_flag_obj["enabled"] = False
+                        await _save_json_atomic(NOTIF_FLAG_FILE, notif_flag_obj)
                         logger.info("GW38 finished -> notifications disabled")
                     return
             except Exception:
@@ -794,7 +920,7 @@ async def check_and_disable_after_gw38():
         logger.exception("check_and_disable_after_gw38 failed")
 
 # -------------------------
-# Bot command handlers
+# Handlers
 # -------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized_update(update):
@@ -833,17 +959,25 @@ async def settz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_message_secure(context.application, f"Usage: /settz <IANA zone or +N>\nCurrent: {cur}", silent=False)
         return
     parsed = args[0].strip()
-    # parse using existing helper (accept +N or IANA)
-    from_zone = parse_tz_input(parsed) if 'parse_tz_input' in globals() else parsed
-    if not from_zone:
+    parsed_tz = None
+    # accept +N or IANA
+    if (parsed.startswith("+") or parsed.startswith("-")) and parsed[1:].replace(".", "", 1).isdigit():
+        parsed_tz = f"UTC{parsed}"
+    else:
+        try:
+            ZoneInfo(parsed)
+            parsed_tz = parsed
+        except Exception:
+            parsed_tz = None
+    if not parsed_tz:
         await update.message.reply_text("Unknown timezone. Use IANA like Asia/Almaty or offset +5")
         return
-    user_timezones[update.effective_user.id] = from_zone
+    user_timezones[update.effective_user.id] = parsed_tz
     await _save_json_atomic(USER_TZ_FILE, {str(k): v for k, v in user_timezones.items()})
     if update.effective_chat.type == "private":
-        await update.message.reply_text(f"Timezone set to {from_zone}")
+        await update.message.reply_text(f"Timezone set to {parsed_tz}")
     else:
-        await send_message_secure(context.application, f"Timezone set to {from_zone}", silent=False)
+        await send_message_secure(context.application, f"Timezone set to {parsed_tz}", silent=False)
 
 async def mytz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized_update(update):
@@ -857,8 +991,8 @@ async def mytz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def notify_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized_update(update):
         return
-    enabled = notifications_enabled()
-    text = f"Notifications enabled: {enabled}\nNotification flag file: {NOTIF_FLAG_FILE}"
+    enabled = bool(notif_flag_obj.get("enabled", True))
+    text = f"Notifications enabled: {enabled}\nMetrics: sent={metrics.get('messages_sent',0)}, errors={metrics.get('send_errors',0)}"
     if update.effective_chat.type == "private":
         await update.message.reply_text(text)
     else:
@@ -872,7 +1006,22 @@ async def _group_message_logger(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
 # -------------------------
-# Application lifecycle
+# Health state
+# -------------------------
+HEALTH = {
+    "start_time": datetime.now(timezone.utc).isoformat(),
+    "last_livefpl_success": None,
+    "last_bootstrap_success": None,
+    "last_scheduler_tick": None,
+    "last_price_check": None,
+    "uptime_seconds": 0
+}
+
+def update_health(key: str, value: Any):
+    HEALTH[key] = value
+
+# -------------------------
+# Lifecycle: start background tasks
 # -------------------------
 async def start_background_tasks(app: Application):
     try:
@@ -899,7 +1048,7 @@ async def stop_background_tasks():
         pass
 
 # -------------------------
-# Main
+# Application entry
 # -------------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -912,12 +1061,11 @@ def main():
 
     async def _on_start(_app: Application):
         logger.info("Bot started (PTB %s)", PTB_VERSION)
+        update_health("last_scheduler_tick", datetime.now(timezone.utc).isoformat())
         await start_background_tasks(_app)
-
     async def _on_stop(_app: Application):
         logger.info("Bot stopping")
         await stop_background_tasks()
-
     app.post_init = _on_start
     app.post_shutdown = _on_stop
 
