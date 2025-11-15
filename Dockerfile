@@ -38,4 +38,4 @@ EXPOSE 8080
 # ------------------------------
 # Final command
 # ------------------------------
-CMD ["python", "fpl_bot_enterprise.py"]
+CMD ["python", "fpl_bot.py"]
