@@ -1,24 +1,7 @@
-# ============================================================
-# fpl_bot.py — ENTERPRISE SINGLE-FILE VERSION (FINAL)
-# ============================================================
-# Все улучшения внесены:
-# - canonical HMAC
-# - async atomic storage (aiofiles)
-# - thread-safe global state (per-resource locks)
-# - thread-offloaded HTML parsing (lxml)
-# - improved HTTP retry (429/5xx)
-# - extended circuit breaker (with jitter)
-# - structured logging + correlation_id
-# - improved services layering
-# - deterministic bootstrap cache
-# - price detector v2
-# - league service concurrency safe
-# - safe timezone parsing
-# - clean general architecture
-#
-# Полностью заменяет предыдущий код.
-#
-# ============================================================
+# fpl_bot.py — ENTERPRISE SINGLE-FILE VERSION (with /price_on)
+# All improvements: async atomic I/O, canonical HMAC, state locks,
+# offloaded parsing, improved retry, circuit breaker, structured logging.
+# Added: /price_on YYYY-MM-DD command and command descriptions via set_my_commands.
 
 import os
 import sys
@@ -54,13 +37,8 @@ from telegram.ext import (
     filters,
 )
 
-# ============================================================
-# SETTINGS
-# ============================================================
-
+# -------------------- SETTINGS --------------------
 class Settings:
-    """Enterprise config (env-driven)."""
-
     def __init__(self):
         self.BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
         self.OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -104,10 +82,7 @@ class Settings:
 
 settings = Settings()
 
-# ============================================================
-# LOGGER (JSON + correlation id)
-# ============================================================
-
+# -------------------- LOGGER --------------------
 class JsonFormatter(logging.Formatter):
     def format(self, record):
         sk = {
@@ -120,32 +95,22 @@ class JsonFormatter(logging.Formatter):
             sk["cid"] = record.cid
         return json.dumps(sk, ensure_ascii=False)
 
-
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(JsonFormatter())
-
 logger = logging.getLogger("fpl_bot")
 logger.setLevel(settings.LOG_LEVEL)
 logger.addHandler(handler)
 
-# ============================================================
-# UTILS
-# ============================================================
+# -------------------- UTILS --------------------
 
 def correlation_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-# canonical JSON
-
 def canonical_bytes(obj: Any) -> bytes:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
 
-
-# ============================================================
-# ATOMIC ASYNC JSON STORAGE
-# ============================================================
-
+# -------------------- ASYNC JSON STORE --------------------
 class AsyncJsonStore:
     def __init__(self, path: str):
         self.path = path
@@ -156,7 +121,7 @@ class AsyncJsonStore:
             if os.path.exists(self.path):
                 with open(self.path, "r", encoding="utf-8") as f:
                     return json.load(f)
-        except:
+        except Exception:
             logger.exception("Load failed: %s", self.path)
         return default
 
@@ -172,7 +137,7 @@ class AsyncJsonStore:
                 try:
                     if os.path.exists(tmp):
                         await asyncio.to_thread(os.remove, tmp)
-                except:
+                except Exception:
                     pass
 
 
@@ -183,7 +148,7 @@ store_league = AsyncJsonStore(settings.FILE_LEAGUE)
 store_notif = AsyncJsonStore(settings.FILE_NOTIF)
 store_state = AsyncJsonStore(settings.FILE_PRICE_STATE)
 
-# Load initial states (sync)
+# initial sync loads
 user_timezones: Dict[int, str] = store_user_tz.load_sync({})
 allowed_users: Set[int] = set()
 baseline = store_baseline.load_sync({})
@@ -191,9 +156,7 @@ league_cache = store_league.load_sync({})
 notif_flag = store_notif.load_sync({"enabled": True})
 price_state = store_state.load_sync({})
 
-# ============================================================
-# HMAC WHITELIST (FIXED)
-# ============================================================
+# -------------------- WHITELIST HMAC --------------------
 
 def whitelist_pack(users: List[int]) -> dict:
     users_sorted = sorted(int(u) for u in users)
@@ -202,11 +165,8 @@ def whitelist_pack(users: List[int]) -> dict:
         return {"payload": payload, "sig": "", "schema": 1}
 
     sig = hmac.new(
-        settings.WHITELIST_HMAC_KEY.encode(),
-        canonical_bytes(users_sorted),
-        hashlib.sha256,
+        settings.WHITELIST_HMAC_KEY.encode(), canonical_bytes(users_sorted), hashlib.sha256
     ).hexdigest()
-
     return {"payload": payload, "sig": sig, "schema": 1}
 
 
@@ -215,13 +175,9 @@ def whitelist_unpack(blob: dict) -> List[int]:
     sig = blob.get("sig", "")
     if not settings.WHITELIST_HMAC_KEY:
         return raw
-
     expected = hmac.new(
-        settings.WHITELIST_HMAC_KEY.encode(),
-        canonical_bytes(raw),
-        hashlib.sha256,
+        settings.WHITELIST_HMAC_KEY.encode(), canonical_bytes(raw), hashlib.sha256
     ).hexdigest()
-
     if not sig or not hmac.compare_digest(sig, expected):
         logger.warning("Whitelist signature mismatch")
         return []
@@ -232,10 +188,7 @@ if os.path.exists(settings.FILE_ALLOWED):
     blob = store_allowed.load_sync({})
     allowed_users = set(whitelist_unpack(blob))
 
-# ============================================================
-# GLOBAL STATE LOCKS
-# ============================================================
-
+# -------------------- STATE LOCKS --------------------
 lock_allowed = asyncio.Lock()
 lock_tz = asyncio.Lock()
 lock_baseline = asyncio.Lock()
@@ -243,22 +196,15 @@ lock_league = asyncio.Lock()
 lock_notif = asyncio.Lock()
 lock_state = asyncio.Lock()
 
-# ============================================================
-# HTTP CLIENT (improved retry)
-# ============================================================
-
+# -------------------- HTTP CLIENT --------------------
 class HttpClient:
     def __init__(self):
-        self.client = httpx.AsyncClient(
-            timeout=settings.HTTP_TIMEOUT,
-            headers={"User-Agent": "FPLBot/Enterprise"},
-        )
+        self.client = httpx.AsyncClient(timeout=settings.HTTP_TIMEOUT, headers={"User-Agent": "FPLBot/Enterprise"})
 
     @retry(
         retry=(
             retry_if_exception_type(httpx.TransportError)
-            |
-            retry_if_exception(lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (429, 502, 503, 504))
+            | retry_if_exception(lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (429, 502, 503, 504))
         ),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         stop=stop_after_attempt(4),
@@ -273,31 +219,28 @@ class HttpClient:
         try:
             resp = await self.get(url)
             return resp.json()
-        except:
-            logger.exception("get_json fail")
+        except Exception:
+            logger.exception("get_json fail %s", url)
             return None
 
     async def get_text(self, url: str) -> Optional[str]:
         try:
             resp = await self.get(url)
             return resp.text
-        except:
-            logger.exception("get_text fail")
+        except Exception:
+            logger.exception("get_text fail %s", url)
             return None
 
     async def close(self):
         try:
             await self.client.aclose()
-        except:
+        except Exception:
             pass
 
 
 http = HttpClient()
 
-# ============================================================
-# CIRCUIT BREAKER v2 (cooldown + jitter)
-# ============================================================
-
+# -------------------- CIRCUIT BREAKER --------------------
 class CircuitBreaker:
     def __init__(self, threshold=3, cooldown=600):
         self.threshold = threshold
@@ -326,73 +269,42 @@ class CircuitBreaker:
             self.open_until = datetime.now().timestamp() + self.cooldown + jitter
             logger.warning("Circuit breaker opened")
 
-
-# ============================================================
-# BOOTSTRAP SERVICE
-# ============================================================
-
+# -------------------- BOOTSTRAP SERVICE --------------------
 class BootstrapService:
     def __init__(self):
-        self.cache = {
-            "ts": 0.0,
-            "data": None,
-            "elements": [],
-            "el_map": {},
-            "name_index": {},
-        }
+        self.cache = {"ts": 0.0, "data": None, "elements": [], "el_map": {}, "name_index": {}}
 
     async def get(self, force=False):
         now = asyncio.get_event_loop().time()
-
-        if (
-            not force
-            and self.cache["data"]
-            and now - self.cache["ts"] < settings.BOOTSTRAP_TTL
-        ):
+        if not force and self.cache["data"] and now - self.cache["ts"] < settings.BOOTSTRAP_TTL:
             return self.cache["data"]
-
         data = await http.get_json(settings.URL_BOOTSTRAP)
         if not data:
             return None
-
         elements = data.get("elements", [])
         name_index = defaultdict(list)
         el_map = {}
-
         for el in elements:
             try:
                 eid = int(el["id"])
                 el_map[eid] = el
                 key = el.get("web_name", "").lower()
                 name_index[key].append(el)
-            except:
+            except Exception:
                 pass
-
-        self.cache.update(
-            {"ts": now, "data": data, "elements": elements, "el_map": el_map, "name_index": name_index}
-        )
-
+        self.cache.update({"ts": now, "data": data, "elements": elements, "el_map": el_map, "name_index": name_index})
         return data
 
 
 bootstrap_service = BootstrapService()
 
-# ============================================================
-# LIVEFPL PARSER + CB
-# ============================================================
-
+# -------------------- LIVEFPL SERVICE --------------------
 LIVEFPL_SCHEMA = {
     "type": "object",
-    "properties": {
-        "Name": {"type": "string"},
-        "Price": {"type": "string"},
-        "Target": {"type": "string"},
-    },
+    "properties": {"Name": {"type": "string"}, "Price": {"type": "string"}, "Target": {"type": "string"}},
     "required": ["Name", "Price", "Target"],
 }
-
 validate_livefpl = fastjsonschema.compile(LIVEFPL_SCHEMA)
-
 
 class LiveFPLService:
     def __init__(self):
@@ -401,34 +313,25 @@ class LiveFPLService:
     async def fetch_sections(self):
         if self.cb.is_open():
             return None
-
         html = await http.get_text(settings.URL_LIVEFPL)
         if not html:
             self.cb.record_failure()
             return None
-
         self.cb.record_success()
-
         sections = await asyncio.to_thread(self._parse_html_sync, html)
         return sections
 
     @staticmethod
     def _parse_html_sync(html: str):
         soup = BeautifulSoup(html, "lxml")
-
         def parse_table(key: str):
             out = []
-            hdr = soup.find(
-                lambda t: t.name in ("h3", "h2", "strong")
-                and key.lower() in t.get_text(" ", strip=True).lower()
-            )
+            hdr = soup.find(lambda t: t.name in ("h3", "h2", "strong") and key.lower() in t.get_text(" ", strip=True).lower())
             if not hdr:
                 return out
-
             table = hdr.find_next("table")
             if not table:
                 return out
-
             for tr in table.find_all("tr"):
                 tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
                 if len(tds) >= 3:
@@ -436,23 +339,15 @@ class LiveFPLService:
                     try:
                         validate_livefpl(row)
                         out.append(row)
-                    except:
+                    except Exception:
                         pass
             return out
-
-        return {
-            "Already reached target": parse_table("Already reached"),
-            "Projected to reach target": parse_table("Projected"),
-            "Others who will be close": parse_table("Others"),
-        }
+        return {"Already reached target": parse_table("Already reached"), "Projected to reach target": parse_table("Projected"), "Others who will be close": parse_table("Others")}
 
 
 livefpl_service = LiveFPLService()
 
-# ============================================================
-# LEAGUE SERVICE
-# ============================================================
-
+# -------------------- LEAGUE SERVICE --------------------
 class LeagueService:
     async def get_current_gw(self):
         data = await bootstrap_service.get()
@@ -460,7 +355,7 @@ class LeagueService:
             return 0
         for ev in data.get("events", []):
             if ev.get("is_current"):
-                return int(ev["id"])
+                return int(ev["id"]) or 0
         return 0
 
     async def get_league_players(self):
@@ -469,7 +364,6 @@ class LeagueService:
             cached = league_cache.get("gw")
             if cached == now_gw and league_cache.get("players"):
                 return set(league_cache["players"])
-
             players = await self._fetch_league(settings.LEAGUE_ID)
             league_cache["gw"] = now_gw
             league_cache["players"] = list(players)
@@ -482,14 +376,8 @@ class LeagueService:
         result = set()
         if not data:
             return result
-
-        entries = [
-            r.get("entry")
-            for r in data.get("standings", {}).get("results", []) or []
-            if r.get("entry")
-        ]
+        entries = [r.get("entry") for r in (data.get("standings", {}).get("results", []) or []) if r.get("entry")]
         sem = asyncio.Semaphore(8)
-
         async def fetch_entry(eid: int):
             async with sem:
                 j = await http.get_json(f"https://fantasy.premierleague.com/api/entry/{eid}/event/0/picks/")
@@ -499,7 +387,6 @@ class LeagueService:
                     el = p.get("element")
                     if el:
                         result.add(f"id:{el}")
-
         tasks = [asyncio.create_task(fetch_entry(e)) for e in entries[:80]]
         await asyncio.gather(*tasks, return_exceptions=True)
         return result
@@ -507,16 +394,12 @@ class LeagueService:
 
 league_service = LeagueService()
 
-# ============================================================
-# PRICE DETECTOR SERVICE
-# ============================================================
-
+# -------------------- PRICE DETECTOR SERVICE --------------------
 class PriceDetectorService:
     async def build_prices_msg(self):
         sections = await livefpl_service.fetch_sections()
         if not sections:
             return "<code>LiveFPL unavailable</code>"
-
         text = []
         for title, rows in sections.items():
             text.append(f"<b>{title}</b>")
@@ -531,27 +414,31 @@ class PriceDetectorService:
         data = await bootstrap_service.get()
         if not data:
             return None
-
         elements = data.get("elements", [])
         new_map = {str(el["id"]): el["now_cost"] for el in elements}
-
         async with lock_baseline:
             changes = []
             for eid, new_cost in new_map.items():
                 old = baseline.get(eid)
                 if old is not None and old != new_cost:
                     changes.append((eid, old, new_cost))
-
             if changes:
+                # save baseline and also daily snapshot
                 await store_baseline.save_atomic(new_map)
                 baseline.clear()
                 baseline.update(new_map)
-                return self._format_changes(changes, bootstrap_service.cache["el_map"])
-
+                # save daily snapshot
+                today_str = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=settings.PRICE_UTC_PLUS))).date().isoformat()
+                daily_path = os.path.join(settings.DATA_DIR, f"prices_baseline_{today_str}.json")
+                try:
+                    async with aiofiles.open(daily_path, "w", encoding="utf-8") as f:
+                        await f.write(json.dumps(new_map, ensure_ascii=False, indent=2))
+                except Exception:
+                    logger.exception("Failed saving daily baseline %s", daily_path)
+                return self._format_changes(changes, bootstrap_service.cache.get("el_map", {}))
             if not baseline:
                 baseline.update(new_map)
                 await store_baseline.save_atomic(baseline)
-
         return None
 
     def _format_changes(self, changes, el_map):
@@ -562,25 +449,28 @@ class PriceDetectorService:
             lines.append(f"<code>{nm.ljust(15)} {o/10:.1f} → {n/10:.1f}</code>")
         return "\n".join(lines)
 
+    # helper for historical compare
+    def detect_between_maps(self, m1: Dict[str, int], m2: Dict[str, int]) -> List[Tuple[str, int, int]]:
+        changes = []
+        for eid, new_cost in m2.items():
+            old = m1.get(eid)
+            if old is not None and old != new_cost:
+                changes.append((eid, old, new_cost))
+        return changes
+
 
 price_service = PriceDetectorService()
 
-# ============================================================
-# AUTH
-# ============================================================
-
+# -------------------- AUTH --------------------
 class AuthService:
     async def is_authorized(self, update: Update) -> bool:
         chat = update.effective_chat
         user = update.effective_user
         if not chat or not user:
             return False
-
         uid = user.id
-
         if uid == settings.OWNER_ID and chat.type == "private":
             return True
-
         if chat.id == settings.ALLOWED_GROUP_ID:
             async with lock_allowed:
                 if uid not in allowed_users:
@@ -588,27 +478,37 @@ class AuthService:
                     blob = whitelist_pack(list(allowed_users))
                     await store_allowed.save_atomic(blob)
             return True
-
         if chat.type == "private":
             async with lock_allowed:
                 return uid == settings.OWNER_ID or uid in allowed_users
-
         return False
 
 
 auth = AuthService()
 
-# ============================================================
-# TELEGRAM HANDLERS
-# ============================================================
+# -------------------- HELPERS: daily baseline load --------------------
+def load_daily_baseline(date_str: str) -> Optional[Dict[str, int]]:
+    path = os.path.join(settings.DATA_DIR, f"prices_baseline_{date_str}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        # ensure values ints
+        return {str(k): int(v) for k, v in j.items()}
+    except Exception:
+        logger.exception("Failed to load daily baseline %s", path)
+        return None
 
+# -------------------- TELEGRAM HANDLERS --------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await auth.is_authorized(update):
         return
     msg = (
         "FPL Enterprise Bot\n"
-        "/prices — show prices\n"
-        "/settz <zone> — set timezone\n"
+        "/prices — show today\'s LiveFPL prices\n"
+        "/price_on YYYY-MM-DD — show price changes between that date and next day\n"
+        "/settz <zone> — set timezone (IANA or +N)\n"
         "/mytz — view timezone\n"
         "/notify_status — notification state\n"
     )
@@ -622,36 +522,68 @@ async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
+async def cmd_price_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await auth.is_authorized(update):
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text("Usage: /price_on YYYY-MM-DD")
+        return
+    date_str = args[0].strip()
+    try:
+        dt = datetime.fromisoformat(date_str)
+    except Exception:
+        await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
+        return
+    day1 = load_daily_baseline(date_str)
+    if not day1:
+        await update.message.reply_text(f"No baseline file for {date_str}")
+        return
+    next_day = (dt.date() + timedelta(days=1)).isoformat()
+    day2 = load_daily_baseline(next_day)
+    if not day2:
+        await update.message.reply_text(f"No baseline for next day ({next_day}). Need both days to compare.")
+        return
+    changes = price_service.detect_between_maps(day1, day2)
+    el_map = bootstrap_service.cache.get("el_map", {})
+    if not changes:
+        await update.message.reply_text(f"<code>No changes between {date_str} and {next_day}</code>", parse_mode="HTML")
+        return
+    # format
+    lines = [f"<b>Price changes {date_str} → {next_day}</b>"]
+    for eid, o, n in changes:
+        el = el_map.get(int(eid), {})
+        nm = el.get("web_name", f"id:{eid}")
+        lines.append(f"<code>{nm.ljust(15)} {o/10:.1f} → {n/10:.1f}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_settz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await auth.is_authorized(update):
         return
-
     args = ctx.args or []
     if not args:
         async with lock_tz:
-            tz = user_timezones.get(update.effective_user.id, "UTC+5")
+            tz = user_timezones.get(update.effective_user.id, f"UTC+{settings.PRICE_UTC_PLUS}")
         await update.message.reply_text(f"Usage: /settz <zone>\nCurrent={tz}")
         return
-
     raw = args[0]
     parsed = None
     if (raw.startswith("+") or raw.startswith("-")) and raw[1:].isdigit():
         parsed = f"UTC{raw}"
     else:
         try:
+            from zoneinfo import ZoneInfo
             ZoneInfo(raw)
             parsed = raw
-        except:
+        except Exception:
             parsed = None
-
     if not parsed:
         await update.message.reply_text("Invalid timezone")
         return
-
     async with lock_tz:
         user_timezones[update.effective_user.id] = parsed
         await store_user_tz.save_atomic({str(k): v for k, v in user_timezones.items()})
-
     await update.message.reply_text(f"Timezone set to {parsed}")
 
 
@@ -659,7 +591,7 @@ async def cmd_mytz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await auth.is_authorized(update):
         return
     async with lock_tz:
-        tz = user_timezones.get(update.effective_user.id, "UTC+5")
+        tz = user_timezones.get(update.effective_user.id, f"UTC+{settings.PRICE_UTC_PLUS}")
     await update.message.reply_text(f"Timezone: {tz}")
 
 
@@ -675,11 +607,7 @@ async def _noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat and update.effective_chat.id == settings.ALLOWED_GROUP_ID:
         await auth.is_authorized(update)
 
-
-# ============================================================
-# SCHEDULER
-# ============================================================
-
+# -------------------- SCHEDULER --------------------
 class Scheduler:
     async def run_daily(self, app: Application):
         while True:
@@ -693,18 +621,14 @@ class Scheduler:
         while True:
             start, end = self._price_window()
             now = datetime.now(timezone.utc)
-
             if now < start:
                 await self._sleep_until(start)
-
             async with lock_state:
                 done_today = price_state.get("last_checked_date") == now.date().isoformat()
-
             if done_today:
                 next_day = start + timedelta(days=1)
                 await self._sleep_until(next_day)
                 continue
-
             found = False
             while datetime.now(timezone.utc) <= end:
                 msg = await price_service.detect_changes()
@@ -713,18 +637,11 @@ class Scheduler:
                     found = True
                     break
                 await asyncio.sleep(settings.PRICE_POLL)
-
             if not found:
-                await app.bot.send_message(
-                    settings.ALLOWED_GROUP_ID,
-                    "<code>No price changes</code>",
-                    parse_mode="HTML",
-                )
-
+                await app.bot.send_message(settings.ALLOWED_GROUP_ID, "<code>No price changes</code>", parse_mode="HTML")
             async with lock_state:
                 price_state["last_checked_date"] = now.date().isoformat()
                 await store_state.save_atomic(price_state)
-
             next_day = start + timedelta(days=1)
             await self._sleep_until(next_day)
 
@@ -754,22 +671,31 @@ class Scheduler:
 
 scheduler = Scheduler()
 
-# ============================================================
-# BOT APPLICATION
-# ============================================================
-
+# -------------------- BOT APP --------------------
 class BotApp:
     def __init__(self):
         self.app = Application.builder().token(settings.BOT_TOKEN).build()
-
         self.app.add_handler(CommandHandler("start", cmd_start))
         self.app.add_handler(CommandHandler("prices", cmd_prices))
+        self.app.add_handler(CommandHandler("price_on", cmd_price_on))
         self.app.add_handler(CommandHandler("settz", cmd_settz))
         self.app.add_handler(CommandHandler("mytz", cmd_mytz))
         self.app.add_handler(CommandHandler("notify_status", cmd_notify_status))
         self.app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), _noop))
 
         async def on_start(app):
+            # register command descriptions (visible in Telegram UI)
+            try:
+                await app.bot.set_my_commands([
+                    ("start", "Show help and available commands"),
+                    ("prices", "Show today's LiveFPL price projections"),
+                    ("price_on", "Show price changes for a given date (YYYY-MM-DD)"),
+                    ("settz", "Set your timezone (IANA or +N)"),
+                    ("mytz", "Show your timezone"),
+                    ("notify_status", "Show notification enabled state"),
+                ])
+            except Exception:
+                logger.exception("Failed to set bot commands")
             asyncio.create_task(scheduler.run_daily(app))
             asyncio.create_task(scheduler.run_price_detector(app))
 
@@ -783,9 +709,7 @@ class BotApp:
         self.app.run_polling()
 
 
-# ============================================================
-# ENTRYPOINT
-# ============================================================
+# -------------------- ENTRYPOINT --------------------
 
 def main():
     BotApp().run()
