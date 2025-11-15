@@ -1,10 +1,6 @@
 python-telegram-bot[ext]==20.6
 httpx==0.25.2
 beautifulsoup4==4.12.3
-lxml==4.9.3
 fastjsonschema==2.19.1
 tenacity==8.2.3
-aiohttp==3.8.5
-pydantic==1.10.9
 prometheus-client==0.17.0
-pytest==7.4.0
