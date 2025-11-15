@@ -1,38 +1,20 @@
-
-# fpl_bot_enterprise_full.py
-# Enterprise-ready FPL Prices Bot (Upstash Redis HASH storage, full A+B features)
-# Features added:
-# - Upstash Redis (HASH) storage (A2)
-# - Structured JSON logging (ELK-ready)
-# - /health endpoint (async HTTP on port 8080)
-# - /metrics Prometheus endpoint (minimal)
-# - Rate limiting (Redis-based token bucket)
-# - Redis retry/backoff for Upstash operations
-# - Admin mode + audit logs
-# - Graceful shutdown (SIGTERM/SIGHUP)
-# - Critical error audit log (Redis list)
-# - LiveFPL parser v2 (more fault tolerant)
-# - Unified exception middleware for handlers
-# - Pydantic models if available (optional)
-# - Redis key TTL auto-rotate for snapshots
-#
-# Requirements (update your requirements.txt accordingly):
+# fpl_bot_full_enterprise.py
+# Enterprise single-file FPL Prices Bot (complete A–F)
+# Requirements (pin in requirements.txt):
 # python-telegram-bot[ext]==20.6
 # httpx==0.25.2
 # beautifulsoup4==4.12.3
 # lxml==4.9.3
 # fastjsonschema==2.19.1
-# tzdata
-# loguru==0.7.2
 # tenacity==8.2.3
 # aiohttp==3.8.5
-# pydantic==1.10.9  # optional but recommended
+# pydantic==1.10.9 (optional)
+# prometheus-client==0.17.0
 #
 # ENV required:
 # BOT_TOKEN, OWNER_ID, ALLOWED_GROUP_ID, WHITELIST_HMAC_KEY,
 # UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
-#
-# Note: This file is large â download and run in Northflank as described earlier.
+# Optional tuning envs: METRICS_PORT, PRICE_CHANGE_POLL_SECONDS, etc.
 
 import os
 import sys
@@ -43,46 +25,52 @@ import asyncio
 import logging
 import uuid
 import random
+import re
 import signal
-from datetime import datetime, timedelta, timezone, time
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 from collections import defaultdict
+from datetime import datetime, timezone, timedelta, time
 from urllib.parse import quote_plus
-import traceback
 
 import httpx
 from bs4 import BeautifulSoup
 import fastjsonschema
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from aiohttp import web
 
-# optional pydantic
+# optional pydantic (if available)
 try:
     from pydantic import BaseModel
     PYDANTIC_AVAILABLE = True
 except Exception:
     PYDANTIC_AVAILABLE = False
 
-from telegram import Update
+from telegram import Update, __version__ as PTB_VERSION
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# -------------------- CONFIG --------------------
+# -------------------------
+# CONFIG FROM ENV
+# -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 ALLOWED_GROUP_ID = int(os.getenv("ALLOWED_GROUP_ID", "0"))
 LEAGUE_ID = int(os.getenv("LEAGUE_ID", "980121"))
-WHITELIST_HMAC_KEY = os.getenv("WHITELIST_HMAC_KEY", "")
+
 UPSTASH_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
 UPSTASH_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+WHITELIST_HMAC_KEY = os.getenv("WHITELIST_HMAC_KEY", "")
+
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-PRICE_CHANGE_POLL_SECONDS = int(os.getenv("PRICE_CHANGE_POLL_SECONDS", "300"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
+BOOTSTRAP_TTL_SECS = int(os.getenv("BOOTSTRAP_TTL_SECS", "30"))
+PRICE_CHANGE_POLL_SECONDS = int(os.getenv("PRICE_CHANGE_POLL_SECONDS", str(5 * 60)))
 PRICE_CHANGE_UTC_PLUS = int(os.getenv("PRICE_CHANGE_UTC_PLUS", "5"))
-BOOTSTRAP_TTL = int(os.getenv("BOOTSTRAP_TTL_SECS", "30"))
 GW_DISABLE_TARGET = int(os.getenv("GW_DISABLE_TARGET", "38"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8080"))
-RATE_LIMIT_TOKENS = int(os.getenv("RATE_LIMIT_TOKENS", "20"))  # tokens per window
-RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # seconds
-SNAPSHOT_TTL_DAYS = int(os.getenv("SNAPSHOT_TTL_DAYS", "30"))  # expire snapshots
+RATE_LIMIT_TOKENS = int(os.getenv("RATE_LIMIT_TOKENS", "20"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+SNAPSHOT_TTL_DAYS = int(os.getenv("SNAPSHOT_TTL_DAYS", "30"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 if not BOT_TOKEN or OWNER_ID <= 0 or ALLOWED_GROUP_ID == 0:
     print("BOT_TOKEN, OWNER_ID, ALLOWED_GROUP_ID must be set", file=sys.stderr)
@@ -90,10 +78,14 @@ if not BOT_TOKEN or OWNER_ID <= 0 or ALLOWED_GROUP_ID == 0:
 if not UPSTASH_REST_URL or not UPSTASH_REST_TOKEN:
     print("UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be set", file=sys.stderr)
     sys.exit(1)
-if not WHITELIST_HMAC_KEY:
-    print("WARNING: WHITELIST_HMAC_KEY is not set â whitelist HMAC disabled", file=sys.stderr)
 
-# -------------------- LOGGING (structured JSON) --------------------
+# Constants
+FPL_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
+LIVEFPL_PRICES = "https://www.livefpl.net/prices"
+
+# -------------------------
+# Logging JSON
+# -------------------------
 class JsonFormatter(logging.Formatter):
     def format(self, record):
         payload = {
@@ -105,29 +97,35 @@ class JsonFormatter(logging.Formatter):
         if hasattr(record, "extra_ctx"):
             payload.update(record.extra_ctx)
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(JsonFormatter())
 logger = logging.getLogger("fpl_bot")
 logger.setLevel(LOG_LEVEL)
-logger.addHandler(handler)
+if not logger.handlers:
+    logger.addHandler(handler)
+else:
+    # ensure our handler present
+    logger.handlers = [handler]
 
-def log_extra(msg, **ctx):
+def log_extra(msg: str, **ctx):
     logger.info(msg, extra={"extra_ctx": ctx})
 
-# -------------------- UTILS --------------------
-def correlation_id() -> str:
-    return uuid.uuid4().hex[:12]
+# -------------------------
+# LIGHT METRICS
+# -------------------------
+METRICS = defaultdict(int)
+def inc_metric(name: str, v: int = 1):
+    METRICS[name] += v
 
-def canonical_bytes(obj: Any) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
-
-# -------------------- UPSTASH CLIENT (REST) with retry --------------------
+# -------------------------
+# Upstash REST client with retries
+# -------------------------
 class UpstashClient:
-    def __init__(self, base_url: str, token: str, timeout: int = HTTP_TIMEOUT):
-        self.base = base_url.rstrip("/")
+    def __init__(self, base: str, token: str, timeout: int = HTTP_TIMEOUT):
+        self.base = base.rstrip("/")
         self.token = token
         self.client = httpx.AsyncClient(timeout=timeout, headers={"Authorization": f"Bearer {self.token}"})
 
@@ -137,15 +135,17 @@ class UpstashClient:
         except Exception:
             pass
 
-    async def _req(self, path: str):
+    async def _req(self, path: str) -> Optional[dict]:
         url = f"{self.base}/{path}"
         try:
             resp = await self.client.get(url)
         except Exception as e:
-            logger.warning("Upstash request transport error %s", e)
+            inc_metric("upstash_transport_errors")
+            logger.warning("Upstash transport error %s", e)
             return None
         if resp.status_code != 200:
-            logger.warning("Upstash request failed %s -> %s", url, resp.status_code)
+            inc_metric("upstash_status_errors")
+            logger.warning("Upstash status %s for %s", resp.status_code, path)
             return None
         try:
             return resp.json()
@@ -159,8 +159,10 @@ class UpstashClient:
         j = await self._req(path)
         if not j:
             return {}
+        # Upstash returns {"result": {...}} sometimes
         if isinstance(j, dict) and "result" in j and isinstance(j["result"], dict):
             return {k: str(v) for k, v in j["result"].items()}
+        # fallback
         return {k: str(v) for k, v in (j or {}).items()}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
@@ -171,12 +173,6 @@ class UpstashClient:
             parts.append(quote_plus(str(k)))
             parts.append(quote_plus(str(v)))
         path = "/".join(parts)
-        await self._req(path)
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
-           retry=retry_if_exception_type(httpx.TransportError))
-    async def hdel(self, key: str, field: str):
-        path = f"hdel/{quote_plus(key)}/{quote_plus(str(field))}"
         await self._req(path)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
@@ -204,7 +200,10 @@ class UpstashClient:
         if not j:
             return None
         if isinstance(j, dict) and "result" in j:
-            return int(j["result"])
+            try:
+                return int(j["result"])
+            except Exception:
+                return None
         return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
@@ -213,47 +212,49 @@ class UpstashClient:
         path = f"expire/{quote_plus(key)}/{seconds}"
         await self._req(path)
 
-upstash = UpstashClient(UPSTASH_REST_URL, UPSTASH_REST_TOKEN)
+_upstash = UpstashClient(UPSTASH_REST_URL, UPSTASH_REST_TOKEN)
 
-# -------------------- SIMPLE HTTP CLIENT (for external APIs) --------------------
+# -------------------------
+# HTTP client for external APIs
+# -------------------------
 class HttpClient:
-    def __init__(self, timeout:int=HTTP_TIMEOUT):
-        self.client = httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"FPL-Enterprise-Bot/1.0"})
+    def __init__(self, timeout=HTTP_TIMEOUT):
+        self._client = httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"FPL-Enterprise-Bot/1.0"})
 
-    async def get(self, url: str) -> Optional[httpx.Response]:
-        try:
-            resp = await self.client.get(url)
-            if resp.status_code >= 500 or resp.status_code in (429, 502, 503, 504):
-                raise httpx.HTTPStatusError("server error", request=resp.request, response=resp)
-            return resp
-        except Exception:
-            logger.exception("HTTP get failed %s", url)
-            return None
-
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=6),
+           retry=retry_if_exception_type((httpx.TransportError, httpx.ReadTimeout)))
     async def get_json(self, url: str) -> Optional[dict]:
-        r = await self.get(url)
-        return r.json() if r and r.status_code == 200 else None
+        resp = await self._client.get(url)
+        if resp.status_code != 200:
+            raise httpx.HTTPStatusError("status", request=resp.request, response=resp)
+        return resp.json()
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=6),
+           retry=retry_if_exception_type((httpx.TransportError, httpx.ReadTimeout)))
     async def get_text(self, url: str) -> Optional[str]:
-        r = await self.get(url)
-        return r.text if r and r.status_code == 200 else None
+        resp = await self._client.get(url)
+        if resp.status_code != 200:
+            raise httpx.HTTPStatusError("status", request=resp.request, response=resp)
+        return resp.text
 
     async def close(self):
         try:
-            await self.client.aclose()
+            await self._client.aclose()
         except Exception:
             pass
 
-http = HttpClient()
+_http = HttpClient()
 
-# -------------------- BOOTSTRAP CACHE --------------------
-_BOOTSTRAP_CACHE = {"ts": 0.0, "data": None, "elements": [], "el_map": {}, "name_index": {}}
+# -------------------------
+# Bootstrap cache + smart match
+# -------------------------
+_BOOTSTRAP_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None, "elements": [], "el_map": {}, "name_index": {}}
 
 async def fetch_bootstrap_cached(force: bool=False) -> Optional[dict]:
     now = asyncio.get_event_loop().time()
-    if _BOOTSTRAP_CACHE["data"] and not force and (now - _BOOTSTRAP_CACHE["ts"] < BOOTSTRAP_TTL):
+    if _BOOTSTRAP_CACHE["data"] and not force and (now - _BOOTSTRAP_CACHE["ts"] < BOOTSTRAP_TTL_SECS):
         return _BOOTSTRAP_CACHE["data"]
-    data = await http.get_json("https://fantasy.premierleague.com/api/bootstrap-static/")
+    data = await _http.get_json(FPL_BOOTSTRAP)
     if not data:
         return None
     elements = data.get("elements", []) or []
@@ -269,17 +270,634 @@ async def fetch_bootstrap_cached(force: bool=False) -> Optional[dict]:
         except Exception:
             continue
     _BOOTSTRAP_CACHE.update({"ts": now, "data": data, "elements": elements, "el_map": el_map, "name_index": name_index})
+    inc_metric("bootstrap_refresh")
     return data
 
-# -------------------- Validation schema --------------------
+def _pos_code_to_str(code: int) -> str:
+    return {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}.get(int(code), "")
+
+FPL_TEAM_ABBR = {
+    1:  "ARS", 2:  "AVL", 3:  "BOU", 4:  "BRE", 5:  "BHA",
+    6:  "BUR", 7:  "CHE", 8:  "CRY", 9:  "EVE", 10: "FUL",
+    11: "LIV", 12: "LUT", 13: "MCI", 14: "MUN", 15: "NEW",
+    16: "NFO", 17: "SHU", 18: "TOT", 19: "WHU", 20: "WOL",
+}
+
+def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_hint: float, name_index: dict, elements: List[dict]) -> Optional[dict]:
+    name_low = (name or "").lower().strip()
+    candidates = name_index.get(name_low, []) if name_index else [el for el in elements if str(el.get("web_name","")).lower().strip()==name_low]
+    if not candidates:
+        candidates = [el for el in elements if str(el.get("web_name","")).lower().strip() == name_low]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # filter by team
+    if team_hint:
+        filtered = []
+        for el in candidates:
+            tc = el.get("team_code") or el.get("team")
+            try:
+                tc_int = int(tc)
+            except Exception:
+                tc_int = None
+            abbr = FPL_TEAM_ABBR.get(tc_int) if tc_int is not None else None
+            if abbr and abbr.upper() == team_hint.upper():
+                filtered.append(el)
+        if filtered:
+            candidates = filtered
+            if len(candidates) == 1:
+                return candidates[0]
+    # filter by pos
+    if pos_hint:
+        filtered = [el for el in candidates if _pos_code_to_str(el.get("element_type")) == pos_hint.upper()]
+        if filtered:
+            candidates = filtered
+            if len(candidates) == 1:
+                return candidates[0]
+    # filter by price
+    try:
+        filtered = []
+        for el in candidates:
+            now_cost = float(el.get("now_cost", 0)) / 10.0
+            if abs(now_cost - float(price_hint)) < 0.01:
+                filtered.append(el)
+        if filtered:
+            candidates = filtered
+            if len(candidates) == 1:
+                return candidates[0]
+    except Exception:
+        pass
+    inc_metric("ambiguous_matches")
+    logger.warning("Ambiguous player match for '%s' -> using first candidate id=%s", name, candidates[0].get("id"))
+    return candidates[0]
+
+# -------------------------
+# Validation schema for LiveFPL row
+# -------------------------
 LIVEFPL_ROW_SCHEMA = {
-    "type":"object",
-    "properties": {"Name":{"type":"string"},"Price":{"type":"string"},"Target":{"type":"string"}},
-    "required":["Name","Price","Target"]
+    "type": "object",
+    "properties": {
+        "Name": {"type": "string"},
+        "Pos": {"type": "string"},
+        "Team": {"type": "string"},
+        "Price": {"type": "string"},
+        "Target": {"type": "string"},
+        "Owned by": {"type": "string"},
+    },
+    "required": ["Name"],
+    "additionalProperties": True
 }
 validate_live_row = fastjsonschema.compile(LIVEFPL_ROW_SCHEMA)
 
-# -------------------- Circuit breaker --------------------
+# -------------------------
+# Sanitization (zero-trust)
+# -------------------------
+def sanitize_name(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s2 = re.sub(r"[\x00-\x1f\x7f]+", " ", str(s))
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    s2 = s2.strip(" -–—_,.;:")
+    return s2
+
+def sanitize_price_val(s: Optional[str]) -> Optional[float]:
+    try:
+        if not s:
+            return None
+        t = str(s).replace("£","").replace(",",".").strip()
+        return float(t)
+    except Exception:
+        return None
+
+# -------------------------
+# Hybrid tolerant parser (Variant C)
+# -------------------------
+def _parse_row_tolerant(cells: List[str]) -> Dict[str, str]:
+    out = {"Name": "", "Pos": "", "Team": "", "Price": "", "Target": "", "Owned by": ""}
+    tokens = [c.strip() for c in cells if c and c.strip() != ""]
+    if not tokens:
+        return out
+    percents = [t for t in tokens if "%" in t]
+    if percents:
+        out["Owned by"] = percents[-1]
+        if len(percents) >= 2:
+            out["Target"] = percents[-2]
+    # find price token
+    price_tok = ""
+    for t in tokens:
+        if "£" in t or re.match(r"^\d+(\.\d+)?$", t):
+            price_tok = t
+            break
+    if price_tok:
+        out["Price"] = price_tok.replace("£", "").strip()
+    role_tokens = set(["GKP","DEF","MID","FWD","GK","DF","MF","FW"])
+    candidate_names = []
+    for t in tokens:
+        if t == price_tok or "%" in t:
+            continue
+        if any(x in t for x in ["£","DEF","MID","FWD","GKP"]):
+            parts = t.split()
+            for p in parts:
+                if p.upper() in role_tokens and out["Pos"] == "":
+                    out["Pos"] = p.upper()
+                elif "£" in p or re.match(r"^\d+(\.\d+)?$", p):
+                    if out["Price"] == "":
+                        out["Price"] = p.replace("£","")
+                else:
+                    candidate_names.append(p)
+            continue
+        candidate_names.append(t)
+    if candidate_names:
+        out["Name"] = sanitize_name(" ".join(candidate_names))
+    else:
+        for t in tokens:
+            if t == price_tok or "%" in t:
+                break
+            out["Name"] = sanitize_name(t)
+            break
+    if len(cells) >= 2 and out["Pos"] == "":
+        c1 = cells[1].strip()
+        if c1.upper() in role_tokens:
+            out["Pos"] = c1.upper()
+        elif len(c1) <= 4 and c1.isalpha():
+            out["Team"] = c1.upper()
+    if len(cells) >= 3 and out["Team"] == "":
+        c2 = cells[2].strip()
+        if c2 and len(c2) <= 4 and c2.isalpha():
+            out["Team"] = c2.upper()
+        else:
+            parts = c2.split()
+            for p in parts:
+                if len(p) <= 4 and p.isalpha():
+                    out["Team"] = p.upper()
+                    break
+    return out
+
+def _find_section_nodes(soup: BeautifulSoup, hints: List[str]):
+    found = {}
+    candidates = soup.find_all(["h2","h3","h4","strong","caption","p","div"])
+    for hint in hints:
+        hint_low = hint.lower()
+        node = None
+        for c in candidates:
+            try:
+                txt = c.get_text(" ", strip=True).lower()
+            except Exception:
+                txt = ""
+            if hint_low in txt:
+                node = c
+                break
+        found[hint] = node
+    return found
+
+async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None) -> Dict[str, List[Dict[str, Any]]]:
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+    except Exception:
+        return {}
+    if hints is None:
+        hints = ["Already reached target", "Projected to reach target", "Others who will be close", "Predicted Rises", "Predicted Falls"]
+    nodes = _find_section_nodes(soup, hints)
+    sections: Dict[str, List[Dict[str, Any]]] = {}
+    for hint in hints:
+        node = nodes.get(hint)
+        rows = []
+        tbl = None
+        if node:
+            tbl = node.find_next("table")
+            if not tbl and node.name == "table":
+                tbl = node
+        if tbl:
+            for tr in tbl.find_all("tr"):
+                tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                if not tds:
+                    continue
+                parsed = _parse_row_tolerant(tds)
+                rows.append(parsed)
+        else:
+            if node:
+                for li in node.find_next_siblings("li"):
+                    txt = li.get_text(" ", strip=True)
+                    parsed = _parse_row_tolerant([txt])
+                    rows.append(parsed)
+        final_rows = []
+        for r in rows:
+            if (r.get("Name") and r.get("Price")) or r.get("Owned by") or r.get("Target"):
+                final_rows.append(r)
+        sections[hint] = final_rows
+    # direction from predicted sections
+    name_dir_map = {}
+    for r in sections.get("Predicted Rises", []) or []:
+        n = (r.get("Name") or "").strip()
+        if n:
+            name_dir_map[n.lower()] = "rise"
+    for r in sections.get("Predicted Falls", []) or []:
+        n = (r.get("Name") or "").strip()
+        if n:
+            name_dir_map[n.lower()] = "fall"
+    # enrich with bootstrap
+    try:
+        data = await fetch_bootstrap_cached()
+        elements = data.get("elements", []) if data else []
+        name_index = _BOOTSTRAP_CACHE.get("name_index", {})
+    except Exception:
+        elements = []
+        name_index = {}
+    for title, rows in list(sections.items()):
+        enriched = []
+        for r in rows:
+            name = (r.get("Name") or "").strip()
+            team_hint = (r.get("Team") or "").strip()
+            pos_hint = (r.get("Pos") or "").strip()
+            price_hint = sanitize_price_val(r.get("Price"))
+            found = None
+            try:
+                found = find_element_by_name_smart(name, team_hint, pos_hint, price_hint or 0.0, name_index, elements)
+            except Exception:
+                found = None
+            if found:
+                try:
+                    r["element"] = int(found.get("id"))
+                except Exception:
+                    r["element"] = found.get("id")
+                try:
+                    tc = found.get("team_code") or found.get("team")
+                    if tc is not None:
+                        try:
+                            tc_int = int(tc)
+                            r["Team"] = FPL_TEAM_ABBR.get(tc_int, r.get("Team") or "UNK")
+                        except Exception:
+                            if isinstance(tc, str) and tc.strip():
+                                r["Team"] = tc.strip()
+                except Exception:
+                    pass
+            else:
+                if not r.get("Team"):
+                    m = re.search(r"\b([A-Z]{2,4})\b", name)
+                    if m:
+                        r["Team"] = m.group(1)
+            nlow = (name or "").lower()
+            if name_dir_map.get(nlow):
+                r["_direction"] = name_dir_map[nlow]
+            else:
+                tperc = r.get("Target", "")
+                try:
+                    tv = float(str(tperc).replace("%","").strip()) if tperc else 0.0
+                    r["_direction"] = "rise" if tv > 0 else ("fall" if tv < 0 else "neutral")
+                except Exception:
+                    r["_direction"] = "neutral"
+            enriched.append(r)
+        sections[title] = enriched
+    return sections
+
+# -------------------------
+# Price detection helpers + formatting (reuse previous helpers)
+# -------------------------
+def parse_percent(s: str) -> float:
+    try:
+        if s is None:
+            return 0.0
+        s2 = str(s).replace("%","").strip()
+        return float(s2) if s2 != "" else 0.0
+    except Exception:
+        return 0.0
+
+def center_text(s: str, width: int = 40) -> str:
+    return s.center(width)
+
+def format_prices_compact(sections: Dict[str, List[Dict[str, Any]]], el_map: Dict[int, dict]) -> str:
+    order = ["Already reached target", "Projected to reach target", "Others who will be close"]
+    blocks: List[str] = []
+    for title in order:
+        rows = sections.get(title, []) or []
+        names = [r.get("Name", "") for r in rows]
+        prices = [f"£{r.get('Price')}".strip() for r in rows]
+        targets = []
+        for r in rows:
+            t = r.get("Target", "")
+            tval = int(parse_percent(t))
+            if r.get("_direction", "neutral") == "fall":
+                targets.append(f"-{abs(int(tval))}%")
+            else:
+                targets.append(f"{int(tval)}%")
+        max_name = max((len(x) for x in names), default=0)
+        max_price = max((len(x) for x in prices), default=0)
+        max_target = max((len(x) for x in targets), default=0)
+        header = center_text(title, 40)
+        block_lines = [header]
+        for i, r in enumerate(rows):
+            team_abbr = "UNK"
+            el_id = None
+            for k in ("element", "id", "Element"):
+                try:
+                    if k in r:
+                        el_id = int(r[k])
+                        break
+                except Exception:
+                    pass
+            if el_id and el_map:
+                try:
+                    tc = el_map[el_id].get("team_code")
+                    team_abbr = FPL_TEAM_ABBR.get(int(tc), "UNK")
+                except Exception:
+                    pass
+            else:
+                tcol = (r.get("Team") or "").strip()
+                if tcol:
+                    team_abbr = tcol.upper()
+            name = (r.get("Name") or "").ljust(max_name)
+            p = prices[i].ljust(max_price)
+            tgt = targets[i].rjust(max_target)
+            block_lines.append(f"{team_abbr}  {name}  {p}  ({tgt})")
+        if not rows:
+            block_lines.append("(none)")
+        blocks.append("<code>" + "\n".join(block_lines) + "</code>")
+    return "\n\n".join(blocks)
+
+# -------------------------
+# Persistence wrappers (Upstash-backed)
+# -------------------------
+async def load_all_state():
+    global user_timezones, allowed_users, baseline_map, league_cache, notif_flag, price_check_state
+    try:
+        ut = await _upstash.hgetall("user_timezones")
+        user_timezones = {int(k): v for k, v in ut.items()} if ut else {}
+    except Exception:
+        user_timezones = {}
+    try:
+        au = await _upstash.hgetall("allowed_users")
+        # Upstash hgetall returns {uid: "1"} mapping - use keys
+        users = []
+        if au:
+            users = [int(k) for k in au.keys() if str(k).isdigit()]
+        sig = await _upstash.get("allowed_users_sig")
+        if WHITELIST_HMAC_KEY and sig:
+            expected = hmac.new(WHITELIST_HMAC_KEY.encode(), json.dumps(sorted(users)).encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, sig):
+                logger.warning("allowed_users signature mismatch; ignoring")
+                allowed_users = set()
+            else:
+                allowed_users = set(users)
+        else:
+            allowed_users = set(users)
+    except Exception:
+        allowed_users = set()
+    try:
+        pb = await _upstash.hgetall("prices_baseline_current")
+        baseline_map = {str(k): int(v) for k, v in pb.items()} if pb else {}
+    except Exception:
+        baseline_map = {}
+    try:
+        lp = await _upstash.hgetall("league_players")
+        league_cache = {"players": list(lp.keys())} if lp else {}
+    except Exception:
+        league_cache = {}
+    try:
+        ne = await _upstash.get("notifications_enabled")
+        notif_flag = {"enabled": (ne == "true")} if ne is not None else {"enabled": True}
+    except Exception:
+        notif_flag = {"enabled": True}
+    try:
+        ps = await _upstash.hgetall("price_check_state")
+        price_check_state = ps or {}
+    except Exception:
+        price_check_state = {}
+
+async def save_allowed_users():
+    try:
+        mapping = {str(u): "1" for u in sorted(list(allowed_users))}
+        await _upstash.hset_map("allowed_users", mapping)
+        if WHITELIST_HMAC_KEY:
+            sig = hmac.new(WHITELIST_HMAC_KEY.encode(), json.dumps(sorted(list(allowed_users))).encode(), hashlib.sha256).hexdigest()
+            await _upstash.set("allowed_users_sig", sig)
+        await _upstash.hset_map("audit_allowed_users", {str(int(datetime.utcnow().timestamp())): ",".join(map(str, sorted(list(allowed_users))))})
+    except Exception:
+        logger.exception("save_allowed_users failed")
+
+async def save_user_timezones():
+    try:
+        mapping = {str(k): v for k, v in user_timezones.items()}
+        if mapping:
+            await _upstash.hset_map("user_timezones", mapping)
+    except Exception:
+        logger.exception("save_user_timezones failed")
+
+async def save_baseline_map(new_map: Dict[str,int]):
+    try:
+        mapping = {str(k): str(v) for k, v in new_map.items()}
+        if mapping:
+            await _upstash.hset_map("prices_baseline_current", mapping)
+        # daily snapshot
+        today_str = datetime.utcnow().astimezone(timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))).date().isoformat()
+        snap_key = f"prices_baseline:{today_str}"
+        await _upstash.hset_map(snap_key, mapping)
+        await _upstash.expire(snap_key, SNAPSHOT_TTL_DAYS * 24 * 3600)
+    except Exception:
+        logger.exception("save_baseline_map failed")
+
+async def save_price_state():
+    try:
+        mapping = {str(k): str(v) for k, v in price_check_state.items()}
+        if mapping:
+            await _upstash.hset_map("price_check_state", mapping)
+    except Exception:
+        logger.exception("save_price_state failed")
+
+# -------------------------
+# League helpers
+# -------------------------
+class LeagueService:
+    async def get_current_gw(self) -> int:
+        data = await fetch_bootstrap_cached()
+        if not data:
+            return 0
+        for ev in data.get("events", []) or []:
+            if ev.get("is_current"):
+                return int(ev.get("id",0))
+        return 0
+
+    async def fetch_league_player_set_once(self, league_id: int, cap: int = 80) -> Set[str]:
+        out: Set[str] = set()
+        url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
+        data = await _http.get_json(url)
+        if not data:
+            return out
+        results = data.get("standings", {}).get("results") or data.get("results") or data.get("entries") or []
+        entry_ids = []
+        for r in results:
+            eid = r.get("entry") or r.get("id") or r.get("entry_id")
+            if eid:
+                entry_ids.append(int(eid))
+        entry_ids = entry_ids[:cap]
+        sem = asyncio.Semaphore(8)
+        async def fetch_entry(eid: int):
+            async with sem:
+                try:
+                    url_e = f"https://fantasy.premierleague.com/api/entry/{eid}/event/0/picks/"
+                    j = await _http.get_json(url_e)
+                    if not j:
+                        return
+                    picks = j.get("picks", []) or []
+                    for p in picks:
+                        el = p.get("element")
+                        if el:
+                            out.add(f"id:{int(el)}")
+                except Exception:
+                    pass
+        tasks = [asyncio.create_task(fetch_entry(e)) for e in entry_ids]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return out
+
+    async def get_league_player_set_cached(self) -> Set[str]:
+        try:
+            lp = await _upstash.hgetall("league_players")
+            if lp:
+                return set(lp.keys())
+        except Exception:
+            pass
+        s = await self.fetch_league_player_set_once(LEAGUE_ID)
+        try:
+            mapping = {str(x): "1" for x in s}
+            if mapping:
+                await _upstash.hset_map("league_players", mapping)
+        except Exception:
+            pass
+        return s
+
+league_service = LeagueService()
+
+# -------------------------
+# Price detector service
+# -------------------------
+class PriceDetectorService:
+    async def build_prices_msg_from_html(self, html_text: str) -> str:
+        if livefpl_cb.is_open():
+            return "<code>LiveFPL temporarily unavailable</code>"
+        if not html_text:
+            livefpl_cb.record_failure()
+            return "<code>Could not fetch LiveFPL prices.</code>"
+        try:
+            sections = await hybrid_parse_livefpl(html_text)
+            if not sections:
+                livefpl_cb.record_failure()
+                return "<code>No price projections parsed.</code>"
+            inc_metric("livefpl_parse_success")
+            # enrich/sort/filter
+            league_set = await league_service.get_league_player_set_cached()
+            processed = sort_and_filter_sections(sections, league_set)
+            el_map = _BOOTSTRAP_CACHE.get("el_map", {})
+            return format_prices_compact(processed, el_map)
+        except Exception:
+            livefpl_cb.record_failure()
+            logger.exception("build_prices_msg_from_html failed")
+            return "<code>Could not build prices message.</code>"
+
+    async def build_prices_msg(self) -> str:
+        # fetch HTML and pass to builder
+        try:
+            txt = await _http.get_text(LIVEFPL_PRICES)
+            if not txt:
+                return "<code>Could not fetch LiveFPL page.</code>"
+            livefpl_cb.record_success()
+            return await self.build_prices_msg_from_html(txt)
+        except Exception:
+            livefpl_cb.record_failure()
+            logger.exception("build_prices_msg main failed")
+            return "<code>Could not fetch LiveFPL page.</code>"
+
+    async def detect_changes(self) -> Optional[str]:
+        # create new baseline map from bootstrap
+        data = await fetch_bootstrap_cached()
+        if not data:
+            return None
+        elements = data.get("elements", []) or []
+        new_map = {str(el["id"]): int(el.get("now_cost",0)) for el in elements}
+        changes = []
+        # compare with baseline_map (in-memory)
+        for eid, new_cost in new_map.items():
+            old = baseline_map.get(eid)
+            if old is not None and old != new_cost:
+                changes.append((eid, old, new_cost))
+        if changes:
+            await save_baseline_map(new_map)
+            baseline_map.clear()
+            baseline_map.update({str(k): int(v) for k, v in new_map.items()})
+            # formatting
+            el_map = _BOOTSTRAP_CACHE.get("el_map", {})
+            lines = ["<b>Price changes detected</b>"]
+            for eid, o, n in changes:
+                nm = el_map.get(int(eid), {}).get("web_name", f"id:{eid}")
+                lines.append(f"<code>{nm.ljust(15)} {o/10:.1f} → {n/10:.1f}</code>")
+            # audit
+            try:
+                await _upstash.hset_map("audit_price_changes", {str(int(datetime.utcnow().timestamp())): ",".join([f"{e}:{o}->{n}" for e,o,n in changes])})
+            except Exception:
+                pass
+            return "\n".join(lines)
+        # if baseline empty -> bootstrap fill
+        if not baseline_map:
+            baseline_map.update({str(k): int(v) for k, v in new_map.items()})
+            await save_baseline_map(new_map)
+        return None
+
+    def detect_between_maps(self, m1: Dict[str,int], m2: Dict[str,int]) -> List[Tuple[str,int,int]]:
+        out = []
+        for eid, v2 in m2.items():
+            v1 = m1.get(eid)
+            if v1 is not None and v1 != v2:
+                out.append((eid, v1, v2))
+        return out
+
+price_service = PriceDetectorService()
+
+# -------------------------
+# Sorting/filtering
+# -------------------------
+def is_in_league_row(r: Dict[str, Any], league_set: Set[str]) -> int:
+    # supports "id:123" entries
+    name = (r.get("Name") or "").strip().lower()
+    if not name:
+        return 0
+    if name in (n.lower() for n in league_set):
+        return 1
+    eid = r.get("element") or r.get("Element") or r.get("id") or r.get("element")
+    try:
+        if eid and f"id:{int(eid)}" in league_set:
+            return 1
+    except Exception:
+        pass
+    return 0
+
+def sort_and_filter_sections(sections: Dict[str, List[Dict[str, Any]]], league_set: Set[str]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for title, rows in sections.items():
+        processed = []
+        for r in rows:
+            owned_val = parse_percent(r.get("Owned by", "0"))
+            if owned_val < 1.0:
+                continue
+            target_val = parse_percent(r.get("Target", "0"))
+            in_league = is_in_league_row(r, league_set)
+            r["_target_val"] = target_val
+            r["_in_league"] = in_league
+            r["_owned_val"] = owned_val
+            if "_direction" not in r:
+                r["_direction"] = "rise" if target_val > 0 else "fall" if target_val < 0 else "neutral"
+            dir_pr = 1 if r["_direction"] != "fall" else 0
+            r["_dir_pr"] = dir_pr
+            processed.append(r)
+        processed.sort(key=lambda x: (x["_dir_pr"], x["_target_val"], x["_in_league"], x["_owned_val"]), reverse=True)
+        for rr in processed:
+            for k in ("_target_val", "_in_league", "_owned_val", "_dir_pr"):
+                rr.pop(k, None)
+        out[title] = processed
+    return out
+
+# -------------------------
+# Circuit breaker
+# -------------------------
 class CircuitBreaker:
     def __init__(self, fail_threshold:int=3, cooldown_seconds:int=600):
         self.fail_threshold = fail_threshold
@@ -296,6 +914,7 @@ class CircuitBreaker:
         if self.fail_count >= self.fail_threshold:
             self.open_until = int(datetime.now().timestamp()) + self.cooldown_seconds + random.randint(0,30)
             logger.warning("Circuit opened until %s", self.open_until)
+            inc_metric("circuit_opened")
 
     def is_open(self) -> bool:
         if self.open_until == 0:
@@ -308,422 +927,22 @@ class CircuitBreaker:
 
 livefpl_cb = CircuitBreaker()
 
-# -------------------- LiveFPL parser v2 (more fault tolerant) --------------------
-def parse_row_cells_v2(cells: List[str]) -> Dict[str,str]:
-    row = {}
-    joined = " ".join(cells)
-    # Try to extract name until position marker (pos are 3-letter codes) or price marker
-    if len(cells) >= 1:
-        row["Name"] = cells[0]
-    if len(cells) >= 2:
-        row["Pos"] = cells[1]
-    if len(cells) >= 3:
-        row["Team"] = cells[2]
-    # price detection: first token containing Â£ or digits with dot
-    for c in cells[3:]:
-        if "Â£" in c or c.replace(".", "", 1).isdigit():
-            row["Price"] = c.replace("Â£", "").strip()
-            break
-    # owned/target detection: percentages anywhere
-    percents = [c for c in cells if "%" in c]
-    if percents:
-        row["Owned by"] = percents[-1]
-        if len(percents) >= 2:
-            row["Target"] = percents[-2]
-    row.setdefault("Price","")
-    row.setdefault("Target","")
-    row.setdefault("Owned by","")
-    return row
-
-def extract_table_v2(html_soup: BeautifulSoup, key_hint: str) -> List[Dict[str,Any]]:
-    rows = []
-    # look for headings and also for tables with captions
-    headers = html_soup.find_all(["h2","h3","h4","strong","caption"])
-    found = None
-    for h in headers:
-        txt = h.get_text(" ", strip=True).lower()
-        if key_hint.lower() in txt:
-            found = h
-            break
-    if not found:
-        tables = html_soup.find_all("table")
-        for t in tables:
-            cap = t.find("caption")
-            if cap and key_hint.lower() in cap.get_text(" ", strip=True).lower():
-                found = t
-                break
-    if not found:
-        return rows
-    tbl = found.find_next("table") if not isinstance(found, type(html_soup)) else found
-    if not tbl:
-        return rows
-    for tr in tbl.find_all("tr"):
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if not tds:
-            continue
-        row = parse_row_cells_v2(tds)
-        rows.append(row)
-    return rows
-
-def safe_extract_tables_v2(soup: BeautifulSoup, hints: List[str]) -> Dict[str, List[Dict[str,Any]]]:
-    res = {}
-    for h in hints:
-        rows = extract_table_v2(soup, h)
-        if rows:
-            valid_rows = []
-            for r in rows:
-                try:
-                    validate_live_row(r)
-                    valid_rows.append(r)
-                except Exception:
-                    logger.warning("row failed validation %s", r.get("Name"))
-            res[h] = valid_rows
-        else:
-            res[h] = []
-    return res
-
-# -------------------- Matching helpers --------------------
-FPL_TEAM_ABBR = {1:"ARS",2:"AVL",3:"BOU",4:"BRE",5:"BHA",6:"BUR",7:"CHE",8:"CRY",9:"EVE",10:"FUL",11:"LIV",12:"LUT",13:"MCI",14:"MUN",15:"NEW",16:"NFO",17:"SHU",18:"TOT",19:"WHU",20:"WOL"}
-def _pos_code_to_str(code: int) -> str:
-    return {1:"GKP",2:"DEF",3:"MID",4:"FWD"}.get(int(code), "")
-
-def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_hint: float, name_index: dict, elements: List[dict]) -> Optional[dict]:
-    name_low = (name or "").lower().strip()
-    candidates = name_index.get(name_low, [])
-    if not candidates:
-        candidates = [el for el in elements if str(el.get("web_name","")).lower().strip() == name_low]
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-    if team_hint:
-        filtered = []
-        for el in candidates:
-            tc = el.get("team_code") or el.get("team")
-            try:
-                tc_int = int(tc)
-            except Exception:
-                tc_int = None
-            abbr = FPL_TEAM_ABBR.get(tc_int) if tc_int is not None else None
-            if abbr and abbr.upper() == team_hint.upper():
-                filtered.append(el)
-        if filtered:
-            candidates = filtered
-            if len(candidates) == 1:
-                return candidates[0]
-    if pos_hint:
-        filtered = [el for el in candidates if _pos_code_to_str(el.get("element_type")) == pos_hint.upper()]
-        if filtered:
-            candidates = filtered
-            if len(candidates) == 1:
-                return candidates[0]
-    try:
-        filtered = []
-        for el in candidates:
-            now_cost = float(el.get("now_cost",0))/10.0
-            if abs(now_cost - float(price_hint)) < 0.01:
-                filtered.append(el)
-        if filtered:
-            candidates = filtered
-            if len(candidates) == 1:
-                return candidates[0]
-    except Exception:
-        pass
-    logger.warning("Ambiguous match for %s -> id=%s", name, candidates[0].get("id"))
-    return candidates[0]
-
-# -------------------- Upstash-backed state helpers (with TTL rotate & audit) --------------------
-async def load_state_from_upstash():
-    global user_timezones, allowed_users, baseline, league_cache, notif_flag, price_state
-    try:
-        ut = await upstash.hgetall("user_timezones")
-        user_timezones = {int(k): v for k, v in ut.items()} if ut else {}
-    except Exception:
-        user_timezones = {}
-    try:
-        au = await upstash.hgetall("allowed_users")
-        sig = await upstash.get("allowed_users_sig")
-        packed = sorted([int(k) for k in au.keys()]) if au else []
-        if WHITELIST_HMAC_KEY and sig:
-            expected = hmac.new(WHITELIST_HMAC_KEY.encode(), canonical_bytes(packed), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected, sig):
-                logger.warning("allowed_users sig mismatch -> ignoring allowed_users")
-                allowed_users = set()
-            else:
-                allowed_users = set(packed)
-        else:
-            allowed_users = set(packed)
-    except Exception:
-        allowed_users = set()
-    try:
-        pb = await upstash.hgetall("prices_baseline")
-        baseline = {str(k): int(v) for k, v in pb.items()} if pb else {}
-    except Exception:
-        baseline = {}
-    try:
-        lp = await upstash.hgetall("league_players")
-        league_cache = {"players": list(lp.keys())} if lp else {}
-    except Exception:
-        league_cache = {}
-    try:
-        ne = await upstash.get("notifications_enabled")
-        notif_flag = {"enabled": (ne == "true")} if ne is not None else {"enabled": True}
-    except Exception:
-        notif_flag = {"enabled": True}
-    try:
-        ps = await upstash.hgetall("price_check_state")
-        price_state = ps or {}
-    except Exception:
-        price_state = {}
-
-async def save_allowed_users_to_upstash():
-    try:
-        mapping = {str(u): "1" for u in sorted(list(allowed_users))}
-        await upstash.hset_map("allowed_users", mapping)
-        if WHITELIST_HMAC_KEY:
-            sig = hmac.new(WHITELIST_HMAC_KEY.encode(), canonical_bytes(sorted(list(allowed_users))), hashlib.sha256).hexdigest()
-            await upstash.set("allowed_users_sig", sig)
-        # audit
-        await upstash.hset_map("audit_allowed_users", {str(int(datetime.utcnow().timestamp())): ",".join(map(str, sorted(list(allowed_users))))})
-    except Exception:
-        logger.exception("Failed to save allowed_users to upstash")
-
-async def save_user_timezones():
-    try:
-        mapping = {str(k): v for k, v in user_timezones.items()}
-        if mapping:
-            await upstash.hset_map("user_timezones", mapping)
-    except Exception:
-        logger.exception("Failed to save user_timezones")
-
-async def save_baseline_map(new_map: Dict[str,int]):
-    try:
-        mapping = {str(k): str(v) for k, v in new_map.items()}
-        if mapping:
-            await upstash.hset_map("prices_baseline", mapping)
-        # snapshot with TTL rotate (expire)
-        today_str = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))).date().isoformat()
-        snap_key = f"prices_baseline:{today_str}"
-        await upstash.hset_map(snap_key, mapping)
-        # set expire in seconds for snapshot
-        await upstash.expire(snap_key, SNAPSHOT_TTL_DAYS * 24 * 3600)
-    except Exception:
-        logger.exception("Failed to save baseline map")
-
-async def save_price_state():
-    try:
-        mapping = {str(k): str(v) for k, v in price_state.items()}
-        if mapping:
-            await upstash.hset_map("price_check_state", mapping)
-    except Exception:
-        logger.exception("Failed to save price_state")
-
-# -------------------- League service (uses upstash cache) --------------------
-class LeagueService:
-    async def get_current_gw(self) -> int:
-        data = await fetch_bootstrap_cached()
-        if not data:
-            return 0
-        for ev in data.get("events", []) or []:
-            if ev.get("is_current"):
-                return int(ev.get("id",0))
-        return 0
-
-    async def get_league_players_cached(self) -> Set[str]:
-        try:
-            lp = await upstash.hgetall("league_players")
-            if lp:
-                return set(lp.keys())
-        except Exception:
-            pass
-        s = await self.fetch_league_player_set_once(LEAGUE_ID)
-        try:
-            mapping = {str(x): "1" for x in s}
-            if mapping:
-                await upstash.hset_map("league_players", mapping)
-        except Exception:
-            pass
-        return s
-
-    async def fetch_league_player_set_once(self, league_id: int, cap: int = 80) -> Set[str]:
-        out: Set[str] = set()
-        url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
-        data = await http.get_json(url)
-        if not data:
-            return out
-        results = data.get("standings", {}).get("results") or data.get("results") or data.get("entries") or []
-        entry_ids = []
-        for r in results:
-            eid = r.get("entry") or r.get("id") or r.get("entry_id")
-            if eid:
-                entry_ids.append(int(eid))
-        entry_ids = entry_ids[:cap]
-        sem = asyncio.Semaphore(8)
-        async def fetch_entry(eid:int):
-            async with sem:
-                try:
-                    url_e = f"https://fantasy.premierleague.com/api/entry/{eid}/event/0/picks/"
-                    j = await http.get_json(url_e)
-                    if not j:
-                        return
-                    picks = j.get("picks", []) or []
-                    for p in picks:
-                        el = p.get("element")
-                        if el:
-                            out.add(f"id:{int(el)}")
-                except Exception:
-                    pass
-        tasks = [asyncio.create_task(fetch_entry(e)) for e in entry_ids]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        return out
-
-league_service = LeagueService()
-
-# -------------------- Price detector (uses v2 parser) --------------------
-class PriceDetectorService:
-    async def build_prices_msg(self) -> str:
-        if livefpl_cb.is_open():
-            return "<code>LiveFPL temporarily unavailable</code>"
-        txt = await http.get_text("https://www.livefpl.net/prices")
-        if not txt:
-            livefpl_cb.record_failure()
-            return "<code>Could not fetch LiveFPL prices.</code>"
-        livefpl_cb.record_success()
-        soup = BeautifulSoup(txt, "html.parser")
-        raw_sections = safe_extract_tables_v2(soup, ["Already reached target","Projected to reach target","Others who will be close"])
-        data = await fetch_bootstrap_cached()
-        elements = data.get("elements", []) if data else []
-        el_map = _BOOTSTRAP_CACHE.get("el_map", {})
-        name_index = _BOOTSTRAP_CACHE.get("name_index", {})
-        for title, rows in raw_sections.items():
-            for r in rows:
-                name = (r.get("Name") or "").strip()
-                team_hint = (r.get("Team") or "").strip()
-                pos_hint = (r.get("Pos") or "").strip()
-                try:
-                    price_hint = float(str(r.get("Price") or "0").replace("Â£","").strip())
-                except Exception:
-                    price_hint = 0.0
-                found = find_element_by_name_smart(name, team_hint, pos_hint, price_hint, name_index, elements)
-                if found:
-                    try:
-                        r["element"] = int(found.get("id"))
-                    except Exception:
-                        pass
-        processed = {}
-        for title, rows in raw_sections.items():
-            processed_rows = []
-            for r in rows:
-                try:
-                    owned = float((r.get("Owned by") or "0").replace("%","").strip())
-                except Exception:
-                    owned = 0.0
-                if owned < 1.0:
-                    continue
-                processed_rows.append(r)
-            processed[title] = processed_rows
-        blocks = []
-        order = ["Already reached target","Projected to reach target","Others who will be close"]
-        for title in order:
-            rows = processed.get(title, []) or []
-            lines = [title]
-            for r in rows:
-                eid = r.get("element")
-                team_abbr = "UNK"
-                if eid and el_map and int(eid) in el_map:
-                    try:
-                        tc = el_map[int(eid)].get("team_code")
-                        team_abbr = FPL_TEAM_ABBR.get(int(tc), "UNK")
-                    except Exception:
-                        pass
-                name = (r.get("Name") or "")
-                price = f"Â£{r.get('Price')}"
-                tgt = r.get("Target","")
-                lines.append(f"{team_abbr} {name} {price} ({tgt})")
-            if not rows:
-                lines.append("(none)")
-            blocks.append("<code>" + "\n".join(lines) + "</code>")
-        return "\n\n".join(blocks)
-
-    async def detect_changes(self) -> Optional[str]:
-        data = await fetch_bootstrap_cached()
-        if not data:
-            return None
-        elements = data.get("elements", []) or []
-        new_map = {str(el["id"]): int(el.get("now_cost",0)) for el in elements}
-        changes = []
-        async with asyncio.Lock():
-            for eid, new_cost in new_map.items():
-                old = baseline.get(eid)
-                if old is not None and old != new_cost:
-                    changes.append((eid, old, new_cost))
-            if changes:
-                await save_baseline_map(new_map)
-                baseline.clear()
-                baseline.update({str(k): int(v) for k, v in new_map.items()})
-                el_map = _BOOTSTRAP_CACHE.get("el_map", {})
-                lines = ["<b>Price changes detected</b>"]
-                for eid, o, n in changes:
-                    nm = el_map.get(int(eid), {}).get("web_name", f"id:{eid}")
-                    lines.append(f"<code>{nm.ljust(15)} {o/10:.1f} â {n/10:.1f}</code>")
-                # audit
-                try:
-                    await upstash.hset_map("audit_price_changes", {str(int(datetime.utcnow().timestamp())): ",".join([f"{e}:{o}->{n}" for e,o,n in changes])})
-                except Exception:
-                    pass
-                return "\n".join(lines)
-            if not baseline:
-                baseline.update({str(k): int(v) for k, v in new_map.items()})
-                await save_baseline_map(new_map)
-        return None
-
-    def detect_between_maps(self, m1: Dict[str,int], m2: Dict[str,int]) -> List[Tuple[str,int,int]]:
-        out = []
-        for eid, v2 in m2.items():
-            v1 = m1.get(eid)
-            if v1 is not None and v1 != v2:
-                out.append((eid, v1, v2))
-        return out
-
-price_service = PriceDetectorService()
-
-# -------------------- AUTH, rate-limit, admin audit --------------------
-async def is_authorized_update(update: Update) -> bool:
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat is None or user is None:
-            return False
-        uid = int(user.id)
-        if uid == OWNER_ID and chat.type == "private":
-            return True
-        if chat.id == ALLOWED_GROUP_ID:
-            if uid not in allowed_users:
-                allowed_users.add(uid)
-                await save_allowed_users_to_upstash()
-            return True
-        if chat.type == "private":
-            return uid in allowed_users or uid == OWNER_ID
-        return False
-    except Exception:
-        logger.exception("auth check failed")
-        return False
-
+# -------------------------
+# Rate limiting (Upstash + memory)
+# -------------------------
+in_memory_rl: Dict[int, List[int]] = {}
 async def rate_limit_check(user_id: int) -> bool:
-    # Redis-based token bucket: incr key and set expire, compare to tokens
     try:
         key = f"rl:{user_id}"
-        val = await upstash.incr(key)
+        val = await _upstash.incr(key)
         if val is None:
-            return True
+            raise RuntimeError("upstash incr failed")
         if val == 1:
-            await upstash.expire(key, RATE_LIMIT_WINDOW)
+            await _upstash.expire(key, RATE_LIMIT_WINDOW)
         if val > RATE_LIMIT_TOKENS:
             return False
         return True
     except Exception:
-        # fallback to in-memory naive rate-limit
         window = RATE_LIMIT_WINDOW
         now = int(datetime.utcnow().timestamp())
         bucket = in_memory_rl.get(user_id, [])
@@ -734,29 +953,77 @@ async def rate_limit_check(user_id: int) -> bool:
         in_memory_rl[user_id] = bucket
         return True
 
-async def admin_audit(action: str, actor: int, details: str = ""):
+# -------------------------
+# Authorization
+# -------------------------
+_allowed_users: Set[int] = set()
+async def is_authorized_update(update: Update) -> bool:
     try:
-        ts = int(datetime.utcnow().timestamp())
-        await upstash.hset_map("audit_admin", {str(ts): f"{actor}:{action}:{details}"})
+        chat = update.effective_chat
+        user = update.effective_user
+        if chat is None or user is None:
+            return False
+        uid = int(user.id)
+        if uid == OWNER_ID and chat.type == "private":
+            return True
+        if chat.id == ALLOWED_GROUP_ID:
+            if uid not in _allowed_users:
+                _allowed_users.add(uid)
+                # async save
+                asyncio.create_task(save_allowed_users())
+            return True
+        if chat.type == "private":
+            return uid in _allowed_users or uid == OWNER_ID
+        return False
     except Exception:
-        logger.exception("admin audit failed")
+        logger.exception("is_authorized_update failed")
+        return False
 
-# -------------------- Helpers for daily snapshot load --------------------
+def notifications_enabled() -> bool:
+    return bool(notif_flag.get("enabled", True))
+
+async def send_message_secure(app, text: str, *, silent: bool = True, parse_mode: str = "HTML"):
+    if not notifications_enabled():
+        logger.debug("Notifications disabled - blocking secure send")
+        return
+    try:
+        await app.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=text, parse_mode=parse_mode,
+                                   disable_web_page_preview=True, disable_notification=silent)
+        inc_metric("messages_sent")
+    except Exception:
+        logger.exception("send_message_secure failed")
+        inc_metric("send_errors")
+
+# -------------------------
+# Price on (date diff) helper
+# -------------------------
 async def _load_daily_baseline_async(date_str: str) -> Optional[Dict[str,int]]:
     key = f"prices_baseline:{date_str}"
-    d = await upstash.hgetall(key)
-    if not d:
+    try:
+        d = await _upstash.hgetall(key)
+        if not d:
+            return None
+        clean = {}
+        for k, v in d.items():
+            try:
+                clean[str(k)] = int(v)
+            except Exception:
+                # skip corrupted values
+                continue
+        return clean
+    except Exception:
+        logger.exception("load daily baseline failed")
         return None
-    return {str(k): int(v) for k, v in d.items()}
 
-# -------------------- Unified exception decorator --------------------
+# -------------------------
+# Unified handler guard (rate limit + auth + error capture)
+# -------------------------
 def handler_guard(fn):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
-            # rate limit per-user (if private or member)
             user = update.effective_user
-            uid = user.id if user else None
-            if uid and not await rate_limit_check(int(uid)):
+            uid = int(user.id) if user else None
+            if uid and not await rate_limit_check(uid):
                 try:
                     await update.message.reply_text("Rate limit exceeded. Try later.")
                 except Exception:
@@ -765,37 +1032,46 @@ def handler_guard(fn):
             await fn(update, context)
         except Exception as e:
             logger.exception("Handler error: %s", e)
-            # critical audit
             try:
-                await upstash.hset_map("audit_errors", {str(int(datetime.utcnow().timestamp())): str(e)})
+                await _upstash.hset_map("audit_errors", {str(int(datetime.utcnow().timestamp())): str(e)})
             except Exception:
                 pass
             try:
-                # inform owner privately
                 if OWNER_ID:
                     await context.application.bot.send_message(chat_id=OWNER_ID, text=f"Handler error: {e}")
             except Exception:
                 pass
     return wrapper
 
-# -------------------- HANDLERS --------------------
+# -------------------------
+# Handlers
+# -------------------------
 @handler_guard
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized_update(update):
         return
-    text = "FPL Prices Bot (enterprise)\n/price_on YYYY-MM-DD - show price changes for specified date\n/prices - show current compact prices\n/settz <Zone> - set timezone\n/mytz - show your timezone\n/notify_status - show notification enabled/disabled\n/admin_info - owner only\n"
+    text = (
+        "FPL Prices Bot (Enterprise)\n"
+        "/prices - show current compact prices\n"
+        "/price_on YYYY-MM-DD - show price changes for that date\n"
+        "/settz <zone> - set timezone\n"
+        "/mytz - show timezone\n"
+        "/notify_status - notifications state\n"
+    )
     if update.effective_chat.type == "private":
         await update.message.reply_text(text)
     else:
-        if notifications_enabled():
-            await context.application.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=text)
+        await send_message_secure(context.application, text, silent=False)
 
 @handler_guard
 async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized_update(update):
         return
     msg = await price_service.build_prices_msg()
-    await update.message.reply_text(msg, parse_mode="HTML")
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(msg, parse_mode="HTML")
+    else:
+        await send_message_secure(context.application, msg, silent=False)
 
 @handler_guard
 async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -807,7 +1083,8 @@ async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     date_str = args[0].strip()
     try:
-        dt = datetime.fromisoformat(date_str)
+        # validate format
+        _ = datetime.fromisoformat(date_str)
     except Exception:
         await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
         return
@@ -815,7 +1092,7 @@ async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not day1:
         await update.message.reply_text(f"No baseline for {date_str}")
         return
-    next_day = (dt.date() + timedelta(days=1)).isoformat()
+    next_day = (datetime.fromisoformat(date_str).date() + timedelta(days=1)).isoformat()
     day2 = await _load_daily_baseline_async(next_day)
     if not day2:
         await update.message.reply_text(f"No baseline for {next_day} (need both days)")
@@ -825,10 +1102,10 @@ async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"<code>No changes between {date_str} and {next_day}</code>", parse_mode="HTML")
         return
     el_map = _BOOTSTRAP_CACHE.get("el_map", {})
-    lines = [f"<b>Price changes {date_str} â {next_day}</b>"]
+    lines = [f"<b>Price changes {date_str} → {next_day}</b>"]
     for eid, o, n in changes:
         nm = el_map.get(int(eid), {}).get("web_name", f"id:{eid}")
-        lines.append(f"<code>{nm.ljust(15)} {o/10:.1f} â {n/10:.1f}</code>")
+        lines.append(f"<code>{nm.ljust(15)} {o/10:.1f} → {n/10:.1f}</code>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 @handler_guard
@@ -870,22 +1147,25 @@ async def notify_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized_update(update):
         return
     enabled = bool(notif_flag.get("enabled", True))
-    await update.message.reply_text(f"Notifications enabled: {enabled}")
+    await update.message.reply_text(f"Notifications enabled: {enabled}\nMetrics: sent={METRICS.get('messages_sent',0)}, errors={METRICS.get('errors',0)}")
 
 @handler_guard
 async def admin_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or int(user.id) != OWNER_ID:
         return
-    # show internal health
     info = {
         "bootstrap_cached": bool(_BOOTSTRAP_CACHE.get("data")),
-        "baseline_count": len(baseline),
-        "allowed_users": len(allowed_users),
+        "baseline_count": len(baseline_map),
+        "allowed_users": len(_allowed_users),
         "notif_enabled": notif_flag.get("enabled", True),
+        "metrics": dict(METRICS),
     }
     await update.message.reply_text(f"<code>{json.dumps(info, indent=2)}</code>", parse_mode="HTML")
-    await admin_audit("admin_info", int(user.id), json.dumps(info))
+    try:
+        await _upstash.hset_map("audit_admin", {str(int(datetime.utcnow().timestamp())): f"admin_info:{user.id}"})
+    except Exception:
+        pass
 
 async def _group_message_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -894,17 +1174,20 @@ async def _group_message_logger(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         pass
 
-# -------------------- SCHEDULERS + graceful shutdown --------------------
+# -------------------------
+# Scheduler helpers + tasks
+# -------------------------
 _utc5_daily_task: Optional[asyncio.Task] = None
 _change_detector_task: Optional[asyncio.Task] = None
-_http_server_task: Optional[asyncio.Task] = None
+_supervisor_task: Optional[asyncio.Task] = None
 _shutdown = False
+APP_INSTANCE = None
 
-async def next_daily_utc5(hour:int, minute:int, now: Optional[datetime]=None) -> datetime:
-    if now is None:
-        now = datetime.now(timezone.utc)
+def next_daily_utc5_dt(hour:int, minute:int, now_utc: Optional[datetime]=None) -> datetime:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
     tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
-    local_now = now.astimezone(tz_base)
+    local_now = now_utc.astimezone(tz_base)
     target_local = datetime.combine(local_now.date(), time(hour, minute), tzinfo=tz_base)
     if local_now >= target_local:
         target_local = target_local + timedelta(days=1)
@@ -921,13 +1204,13 @@ async def sleep_until(target_dt_utc: datetime):
 async def utc5_daily_sender(app: Application):
     try:
         while not _shutdown:
-            next_send_utc = await next_daily_utc5(23, 0)
-            await sleep_until(next_send_utc)
+            next_send = next_daily_utc5_dt(23, 0)
+            await sleep_until(next_send)
             if _shutdown:
                 break
             if notifications_enabled():
                 msg = await price_service.build_prices_msg()
-                await app.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=msg, parse_mode="HTML")
+                await send_message_secure(app, msg, silent=False)
             await asyncio.sleep(1)
     except asyncio.CancelledError:
         logger.info("utc5_daily_sender cancelled")
@@ -951,7 +1234,7 @@ async def price_change_detector(app: Application):
             if _shutdown:
                 break
             today_iso = start_utc.astimezone(timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))).date().isoformat()
-            if price_state.get("last_checked_date") == today_iso:
+            if price_check_state.get("last_checked_date") == today_iso:
                 next_start = start_utc + timedelta(days=1)
                 await sleep_until(next_start)
                 continue
@@ -962,16 +1245,16 @@ async def price_change_detector(app: Application):
                 try:
                     msg = await price_service.detect_changes()
                     if msg:
-                        await app.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=msg, parse_mode="HTML")
+                        await send_message_secure(app, msg, silent=True)
                         updates_found = True
                         break
                 except Exception:
                     logger.exception("Error during price-change check")
                 await asyncio.sleep(PRICE_CHANGE_POLL_SECONDS)
             if not updates_found and notifications_enabled():
-                no_msg = "<code>\n" + "Price changes summary\n" + "-------------------------------\nNo price changes today.\n" + "</code>"
-                await app.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=no_msg, parse_mode="HTML")
-            price_state["last_checked_date"] = today_iso
+                no_msg = "<code>\n" + center_text("Price changes summary", 40) + "\n" + "-------------------------------\n" + "No price changes today.\n" + "</code>"
+                await send_message_secure(app, no_msg, silent=True)
+            price_check_state["last_checked_date"] = today_iso
             await save_price_state()
             next_start = start_utc + timedelta(days=1)
             await sleep_until(next_start)
@@ -980,78 +1263,62 @@ async def price_change_detector(app: Application):
     except Exception:
         logger.exception("price_change_detector crashed")
 
-async def check_and_disable_after_gw38():
-    try:
-        data = await fetch_bootstrap_cached()
-        if not data:
-            return
-        for ev in data.get("events", []) or []:
+# -------------------------
+# Supervisor auto-heal
+# -------------------------
+def start_supervisor(loop, tasks_map_getter, restart_fn, interval=30):
+    async def _supervisor_loop():
+        while not _shutdown:
             try:
-                if int(ev.get("id", -1)) == GW_DISABLE_TARGET:
-                    finished = bool(ev.get("finished") or ev.get("is_finished") or False)
-                    if finished:
-                        notif_flag["enabled"] = False
-                        await upstash.set("notifications_enabled", "false")
-                    return
+                tasks = tasks_map_getter()
+                for name, t in tasks.items():
+                    if t is None or t.done():
+                        logger.warning("Supervisor: task %s is not running, attempting restart", name)
+                        try:
+                            await restart_fn(name)
+                            inc_metric("supervisor_restarts")
+                        except Exception:
+                            logger.exception("Supervisor failed to restart %s", name)
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                logger.info("Supervisor cancelled")
+                break
             except Exception:
-                continue
-    except Exception:
-        logger.exception("check_and_disable_after_gw38 failed")
+                logger.exception("Supervisor crashed loop")
+                await asyncio.sleep(interval)
+    return loop.create_task(_supervisor_loop())
 
-async def start_background_tasks(app: Application):
-    try:
-        await load_state_from_upstash()
-        await check_and_disable_after_gw38()
-        global _utc5_daily_task, _change_detector_task, _http_server_task
-        if _utc5_daily_task is None or _utc5_daily_task.done():
-            _utc5_daily_task = asyncio.create_task(utc5_daily_sender(app))
-        if _change_detector_task is None or _change_detector_task.done():
-            _change_detector_task = asyncio.create_task(price_change_detector(app))
-        # start small HTTP server for health + metrics
-        if _http_server_task is None or _http_server_task.done():
-            _http_server_task = asyncio.create_task(start_http_server())
-        logger.info("Background tasks started")
-    except Exception:
-        logger.exception("Failed to start background tasks")
+async def restart_background_task(name: str):
+    global _utc5_daily_task, _change_detector_task
+    if name == "utc5_daily":
+        if _utc5_daily_task and not _utc5_daily_task.done():
+            _utc5_daily_task.cancel()
+        _utc5_daily_task = asyncio.create_task(utc5_daily_sender(APP_INSTANCE))
+    elif name == "price_detector":
+        if _change_detector_task and not _change_detector_task.done():
+            _change_detector_task.cancel()
+        _change_detector_task = asyncio.create_task(price_change_detector(APP_INSTANCE))
 
-async def stop_background_tasks():
-    global _utc5_daily_task, _change_detector_task, _http_server_task, _shutdown
-    _shutdown = True
-    tasks = [_utc5_daily_task, _change_detector_task, _http_server_task]
-    for t in tasks:
-        if t:
-            t.cancel()
-    await asyncio.sleep(0.2)
-    try:
-        await http.close()
-        await upstash.close()
-    except Exception:
-        pass
-
-# -------------------- Minimal async HTTP server for /health and /metrics --------------------
-from aiohttp import web
-
-METRICS = defaultdict(int)
-def inc_metric(name: str, v: int = 1):
-    METRICS[name] += v
-
+# -------------------------
+# HTTP server for health/metrics
+# -------------------------
 async def handle_health(request):
     data = {
-        "start_time": START_TIME,
-        "bootstrap_cached": bool(_BOOTSTRAP_CACHE.get("data")),
-        "allowed_users": len(allowed_users),
-        "baseline_size": len(baseline),
-        "notifications_enabled": notif_flag.get("enabled", True),
         "uptime_seconds": int((datetime.utcnow() - START_TIME_DT).total_seconds()),
+        "bootstrap_cached": bool(_BOOTSTRAP_CACHE.get("data")),
+        "baseline_count": len(baseline_map),
+        "allowed_users": len(_allowed_users),
+        "notifications_enabled": notif_flag.get("enabled", True),
     }
     return web.json_response(data)
 
 async def handle_metrics(request):
     lines = []
     for k, v in METRICS.items():
-        lines.append(f"# HELP {k} autogenerated\n# TYPE {k} gauge\n{k} {v}")
-    body = "\n".join(lines) + "\n"
-    return web.Response(text=body, content_type="text/plain; version=0.0.4")
+        lines.append(f"# HELP {k} autogenerated")
+        lines.append(f"# TYPE {k} gauge")
+        lines.append(f"{k} {v}")
+    return web.Response(text="\n".join(lines), content_type="text/plain; version=0.0.4")
 
 async def start_http_server():
     app = web.Application()
@@ -1065,8 +1332,79 @@ async def start_http_server():
     while not _shutdown:
         await asyncio.sleep(1)
 
-# -------------------- Application entry --------------------
-def main():
+# -------------------------
+# Lifecycle & start
+# -------------------------
+async def start_background_tasks(app: Application):
+    try:
+        await load_all_state()
+        await check_and_disable_after_gw38()
+        global _utc5_daily_task, _change_detector_task, _supervisor_task
+        loop = asyncio.get_event_loop()
+        if _utc5_daily_task is None or _utc5_daily_task.done():
+            _utc5_daily_task = asyncio.create_task(utc5_daily_sender(app))
+        if _change_detector_task is None or _change_detector_task.done():
+            _change_detector_task = asyncio.create_task(price_change_detector(app))
+        # supervisor watches our named tasks
+        def tasks_getter():
+            return {"utc5_daily": _utc5_daily_task, "price_detector": _change_detector_task}
+        _supervisor_task = start_supervisor(loop, tasks_getter, restart_background_task, interval=30)
+        # http server
+        loop.create_task(start_http_server())
+        logger.info("Background tasks started")
+    except Exception:
+        logger.exception("start_background_tasks failed")
+
+async def stop_background_tasks():
+    global _utc5_daily_task, _change_detector_task, _supervisor_task, _shutdown
+    _shutdown = True
+    tasks = [_utc5_daily_task, _change_detector_task, _supervisor_task]
+    for t in tasks:
+        if t:
+            t.cancel()
+    await asyncio.sleep(0.2)
+    try:
+        await _http.close()
+        await _upstash.close()
+    except Exception:
+        pass
+
+async def check_and_disable_after_gw38():
+    try:
+        data = await fetch_bootstrap_cached()
+        if not data:
+            return
+        for ev in data.get("events", []) or []:
+            try:
+                if int(ev.get("id", -1)) == GW_DISABLE_TARGET:
+                    finished = bool(ev.get("finished") or ev.get("is_finished") or False)
+                    if finished:
+                        notif_flag["enabled"] = False
+                        await _upstash.set("notifications_enabled", "false")
+                    return
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("check_and_disable_after_gw38 failed")
+
+# -------------------------
+# Health and in-memory defaults
+# -------------------------
+START_TIME_DT = datetime.utcnow()
+user_timezones: Dict[int,str] = {}
+_allowed_users = set()
+allowed_users = set()
+baseline_map: Dict[str,int] = {}
+league_cache: Dict[str,Any] = {}
+notif_flag: Dict[str,Any] = {"enabled": True}
+price_check_state: Dict[str,str] = {}
+_user_lock = asyncio.Lock()
+_price_lock = asyncio.Lock()
+
+# -------------------------
+# Application entry
+# -------------------------
+def build_app():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("prices", prices_cmd))
@@ -1078,6 +1416,10 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), _group_message_logger))
 
     async def _on_start(_app: Application):
+        global APP_INSTANCE
+        APP_INSTANCE = _app
+        logger.info("Bot started; PTB %s", PTB_VERSION)
+        # register commands descriptions for clients
         try:
             await _app.bot.set_my_commands([
                 ("start", "Show help and available commands"),
@@ -1088,7 +1430,7 @@ def main():
                 ("notify_status", "Show notification enabled state"),
             ])
         except Exception:
-            logger.exception("Failed to set bot commands")
+            logger.exception("Failed to set commands")
         await start_background_tasks(_app)
 
     async def _on_stop(_app: Application):
@@ -1097,7 +1439,10 @@ def main():
 
     app.post_init = _on_start
     app.post_shutdown = _on_stop
+    return app
 
+def main():
+    app = build_app()
     logger.info("Starting bot...")
     try:
         app.run_polling()
@@ -1105,17 +1450,4 @@ def main():
         pass
 
 if __name__ == "__main__":
-    # in-memory caches (populated in on_start)
-    START_TIME = datetime.utcnow().isoformat()
-    START_TIME_DT = datetime.utcnow()
-    user_timezones: Dict[int,str] = {}
-    allowed_users: Set[int] = set()
-    baseline: Dict[str,int] = {}
-    league_cache: Dict[str,Any] = {}
-    notif_flag: Dict[str,Any] = {"enabled": True}
-    price_state: Dict[str,str] = {}
-    in_memory_rl: Dict[int,List[int]] = {}
-    try:
-        main()
-    except Exception:
-        logger.exception("Fatal error in main")
+    main()
