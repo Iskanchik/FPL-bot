@@ -1,0 +1,9 @@
+python-telegram-bot[ext]==20.6
+httpx==0.25.2
+beautifulsoup4==4.12.3
+lxml==4.9.3
+fastjsonschema==2.19.1
+tzdata
+loguru==0.7.2
+tenacity==8.2.3
+aiofiles==23.2.1
