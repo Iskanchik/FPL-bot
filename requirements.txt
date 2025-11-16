@@ -1,14 +1,9 @@
-httpx[http2]==0.27.0
+httpx[http2]==0.25.2
 beautifulsoup4==4.12.3
 rapidfuzz==3.6.1
 prometheus_client==0.19.0
 python-dateutil==2.9.0.post0
 
-# Telegram bot
 python-telegram-bot==20.7
-
-# aiohttp for HTTP server (/health + /prices.json)
 aiohttp==3.9.5
-
-# retry logic (bootstrap-safe)
 tenacity==8.2.3
