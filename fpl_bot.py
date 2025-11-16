@@ -1,6 +1,14 @@
 # fpl_bot.py
-# Full-D enterprise rewrite: robust /prices, /price_on, baseline only from bootstrap,
-# monospace WIDTH_LIMIT=40, display-width-aware truncation, improved parser & snapshots.
+# Enterprise-grade FPL Prices Bot (full D rewrite, single-file)
+# Features:
+#  - Baseline snapshots only from bootstrap-static (FPL API)
+#  - /price_on uses bootstrap snapshots with safe autogen (no future dates)
+#  - /prices parses LiveFPL, tolerant parser, dedupe, bootstrap enrichment
+#  - Monospace output limited to WIDTH_LIMIT (display-width aware)
+#  - Robust async handlers, retries, circuit-breaker, rate-limit (Upstash + fallback)
+#  - Background daily snapshot task + supervisor + minimal HTTP health/metrics
+#  - Detailed logging and safe error auditing to Upstash
+#  - Single-file, ready to drop in (requires env vars)
 
 import os
 import sys
@@ -25,6 +33,11 @@ from telegram import Update, __version__ as PTB_VERSION
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # -------------------------
+# STARTUP TIMESTAMP (used by /health)
+# -------------------------
+START_TIME_DT = datetime.utcnow()
+
+# -------------------------
 # CONFIG (ENV)
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -46,8 +59,9 @@ FPL_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
 LIVEFPL_PRICES = "https://www.livefpl.net/prices"
 
 # Formatting limits
-WIDTH_LIMIT = 40  # display width limit for monospace messages
+WIDTH_LIMIT = int(os.getenv("WIDTH_LIMIT", "40"))  # display width limit for monospace messages
 
+# Minimal env validation (fail fast)
 if not BOT_TOKEN or OWNER_ID <= 0 or ALLOWED_GROUP_ID == 0:
     print("BOT_TOKEN, OWNER_ID, ALLOWED_GROUP_ID must be set", file=sys.stderr)
     sys.exit(1)
@@ -75,7 +89,7 @@ def inc_metric(name: str, v: int = 1):
     MET[name] += v
 
 # -------------------------
-# Upstash minimal client (REST)
+# Upstash minimal client (REST) - resilient wrapper
 # -------------------------
 class UpstashClient:
     def __init__(self, base: str, token: str, timeout: int = HTTP_TIMEOUT):
@@ -156,7 +170,7 @@ class UpstashClient:
 _upstash = UpstashClient(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
 # -------------------------
-# HTTP client with retry
+# HTTP client with retry helpers
 # -------------------------
 class HttpClient:
     def __init__(self, timeout=HTTP_TIMEOUT):
@@ -178,7 +192,7 @@ class HttpClient:
 _http = HttpClient()
 
 # -------------------------
-# Bootstrap cache with lock
+# Bootstrap cache with lock (single source for baseline)
 # -------------------------
 _BOOTSTRAP_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None, "elements": [], "el_map": {}, "name_index": {}, "events": []}
 BOOTSTRAP_TTL = BOOTSTRAP_TTL_SECS
@@ -230,6 +244,9 @@ def current_season_date_range() -> Optional[Tuple[datetime, datetime]]:
     except Exception:
         return None
 
+# -------------------------
+# Helpers: team abbreviations + positional mapping
+# -------------------------
 FPL_TEAM_ABBR = {
     1:  "ARS", 2:  "AVL", 3:  "BOU", 4:  "BRE", 5:  "BHA",
     6:  "BUR", 7:  "CHE", 8:  "CRY", 9:  "EVE", 10: "FUL",
@@ -290,7 +307,7 @@ def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_h
     return candidates[0]
 
 # -------------------------
-# Parser: tolerant row extraction + robust hybrid html parse
+# Parser: tolerant row extraction + hybrid html parsing
 # -------------------------
 def sanitize_name(s: Optional[str]) -> str:
     if not s:
@@ -423,7 +440,6 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
                     txt = s.get_text(" ", strip=True)
                     if not txt:
                         continue
-                    # split by common separators
                     for part in re.split(r"\s{2,}|\n+", txt):
                         if part.strip():
                             parsed = _parse_row_tolerant([part.strip()])
@@ -576,7 +592,6 @@ def compose_mono_line(team: str, pos: str, price: str, name: str, emoji: str, tg
     left_max = 10
     price_max = 7
     tgt_max = 7
-    # reserve widths by minimum of left_max and actual width
     reserved = min(left_max, display_width(left)) + 2 + min(price_max, display_width(price)) + 2 + min(tgt_max, display_width(tgtpart))
     name_max = max(6, WIDTH_LIMIT - reserved)
     left_c = clamp_display(left, left_max)
@@ -655,9 +670,8 @@ def format_prices_mono(sections: Dict[str, List[Dict[str, Any]]], el_map: Dict[i
 
 # -------------------------
 # Baseline persistence (bootstrap-only)
-# Keys:
-# - fpl:prices:current
-# - fpl:prices:<YYYY-MM-DD>
+# - fpl:prices:current (hash)
+# - fpl:prices:<YYYY-MM-DD> (hash snapshots)
 # -------------------------
 async def save_baseline_map(new_map: Dict[str,int], date_iso: Optional[str] = None):
     try:
@@ -803,7 +817,7 @@ class PriceDetectorService:
 price_service = PriceDetectorService()
 
 # -------------------------
-# Circuit breaker
+# Circuit breaker (LiveFPL)
 # -------------------------
 class CircuitBreaker:
     def __init__(self, fail_threshold: int = 3, cooldown_seconds: int = 600):
@@ -861,7 +875,7 @@ async def rate_limit_check(user_id: int) -> bool:
         return True
 
 # -------------------------
-# Authorization
+# Authorization (owner + allowed group + whitelist)
 # -------------------------
 _allowed_users: Set[int] = set()
 
@@ -921,7 +935,7 @@ async def send_message_secure(app: Application, text: str, *, silent: bool = Tru
         inc_metric("send_errors")
 
 # -------------------------
-# Handler guard
+# Handler guard decorator (rate-limit + error audit)
 # -------------------------
 def handler_guard(fn):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -949,7 +963,7 @@ def handler_guard(fn):
     return wrapper
 
 # -------------------------
-# Handlers: /help, /prices, /price_on
+# Commands: /help, /prices, /price_on
 # -------------------------
 @handler_guard
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -993,81 +1007,69 @@ async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await fetch_bootstrap_cached()
     drange = current_season_date_range()
     if drange:
-        start_dt, end
-            drange = current_season_date_range()
-    if drange:
         start_dt, end_dt = drange
         if not (start_dt.date() <= req_date <= end_dt.date()):
             await update.message.reply_text(f"Date {date_str} outside current season range.")
             return
-
     tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
     today_local = datetime.utcnow().astimezone(tz_base).date()
     if req_date > today_local:
         await update.message.reply_text(f"Refuse to generate baseline for future date {date_str}.")
         return
-
+    # load or autogen day1
     day1 = await _load_daily_baseline_async(date_str)
     if not day1:
         day1 = await bootstrap_snapshot_for_date(date_str)
         if not day1:
             await update.message.reply_text(f"No baseline for {date_str} and auto-generation failed.")
             return
-
+    # prepare next day
     next_day_dt = req_date + timedelta(days=1)
     next_day = next_day_dt.isoformat()
     if next_day_dt > today_local:
         await update.message.reply_text(f"Cannot compare to future date {next_day}.")
         return
-
     day2 = await _load_daily_baseline_async(next_day)
     if not day2:
         day2 = await bootstrap_snapshot_for_date(next_day)
         if not day2:
             await update.message.reply_text(f"No baseline for {next_day} and auto-generation failed.")
             return
-
     changes = price_service.detect_between_maps(day1, day2)
     if not changes:
         await update.message.reply_text(f"<code>No changes between {date_str} and {next_day}</code>", parse_mode="HTML")
         return
-
     await fetch_bootstrap_cached()
     el_map = _BOOTSTRAP_CACHE.get("el_map", {})
-
     lines = [f"<pre>Price changes {date_str} → {next_day}"]
     for eid, o, n in changes:
         el = el_map.get(int(eid), {})
         nm = el.get("web_name", f"id:{eid}")
-
         tail = f" {o/10:.1f} → {n/10:.1f}"
         tail_w = display_width(tail)
-
         name_max = max(6, WIDTH_LIMIT - tail_w - 1)
         nm_short = shorten_name_for_width(nm, name_max)
-
         space_count = max(1, WIDTH_LIMIT - display_width(nm_short) - tail_w)
         lines.append(f"{nm_short}{' ' * space_count}{tail}")
-
     lines.append("</pre>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-    # -------------------------
-# Background: snapshots & supervisor
+
+# -------------------------
+# Background: daily snapshot & supervisor
 # -------------------------
 _bg_task: Optional[asyncio.Task] = None
 _shutdown = False
 APP_INSTANCE = None
+_supervisor_task: Optional[asyncio.Task] = None
 
 def next_daily_utc5(hour:int, minute:int, now: Optional[datetime]=None) -> datetime:
     if now is None:
         now = datetime.now(timezone.utc)
     tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
     local_now = now.astimezone(tz_base)
-
     target_local = datetime.combine(local_now.date(), dt_time(hour, minute), tzinfo=tz_base)
     if local_now >= target_local:
         target_local = target_local + timedelta(days=1)
-
     return target_local.astimezone(timezone.utc)
 
 async def sleep_until(target_dt_utc: datetime):
@@ -1087,7 +1089,6 @@ async def daily_snapshot_task(app: Application):
                 logger.info("Initial baseline updated with %d changes", len(changes))
         except Exception:
             logger.exception("Initial baseline update failed")
-
         while not _shutdown:
             next_run = next_daily_utc5(6, 0)
             await sleep_until(next_run)
@@ -1101,8 +1102,6 @@ async def daily_snapshot_task(app: Application):
         logger.info("daily_snapshot_task cancelled")
     except Exception:
         logger.exception("daily_snapshot_task crashed")
-
-_supervisor_task: Optional[asyncio.Task] = None
 
 def start_supervisor(loop, tasks_getter, restart_fn, interval=30):
     async def _loop():
@@ -1131,8 +1130,10 @@ async def restart_background_task(name: str):
         if _bg_task and not _bg_task.done():
             _bg_task.cancel()
         _bg_task = asyncio.create_task(daily_snapshot_task(APP_INSTANCE))
-        START_TIME_DT = datetime.utcnow()
 
+# -------------------------
+# HTTP server for health & metrics
+# -------------------------
 async def handle_health(request):
     data = {
         "uptime_seconds": int((datetime.utcnow() - START_TIME_DT).total_seconds()),
@@ -1154,32 +1155,28 @@ async def start_http_server():
     app = web.Application()
     app.router.add_get("/health", handle_health)
     app.router.add_get("/metrics", handle_metrics)
-
     runner = web.AppRunner(app)
     await runner.setup()
-
     site = web.TCPSite(runner, "0.0.0.0", METRICS_PORT)
     await site.start()
-
-    logger.info("HTTP server started on %s", METRICS_PORT)
-
+    logger.info("HTTP server started on port %s", METRICS_PORT)
     while not _shutdown:
         await asyncio.sleep(1)
+
+# -------------------------
+# Lifecycle: start/stop background tasks
+# -------------------------
 async def start_background_tasks(app: Application):
     try:
         await load_allowed_users()
         await fetch_bootstrap_cached()
-
         global _bg_task, _supervisor_task, APP_INSTANCE
         APP_INSTANCE = app
         loop = asyncio.get_event_loop()
-
         if _bg_task is None or _bg_task.done():
             _bg_task = asyncio.create_task(daily_snapshot_task(app))
-
         def tasks_getter():
             return {"daily_snapshot": _bg_task}
-
         _supervisor_task = start_supervisor(loop, tasks_getter, restart_background_task, interval=30)
         loop.create_task(start_http_server())
         logger.info("Background tasks started")
@@ -1189,47 +1186,46 @@ async def start_background_tasks(app: Application):
 async def stop_background_tasks():
     global _bg_task, _supervisor_task, _shutdown
     _shutdown = True
-
     tasks = [_bg_task, _supervisor_task]
     for t in tasks:
         if t:
             t.cancel()
-
     await asyncio.sleep(0.2)
     try:
         await _http.close()
         await _upstash.close()
     except Exception:
         pass
-        async def _noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# -------------------------
+# Async no-op for MessageHandler (prevents NoneType await TypeError)
+# -------------------------
+async def _noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
+# -------------------------
+# App builder and run
+# -------------------------
 def build_app():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("prices", prices_cmd))
     app.add_handler(CommandHandler("price_on", price_on_cmd))
-
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), _noop))
-
     async def _on_start(_app: Application):
         logger.info("Bot started (PTB %s)", PTB_VERSION)
         try:
             await _app.bot.set_my_commands([
-                ("help","Show help"),
-                ("prices","Show price projections"),
-                ("price_on","Show day-to-day price change"),
+                ("help","Show help and commands"),
+                ("prices","Show LiveFPL price projections"),
+                ("price_on","Show changes between days"),
             ])
         except Exception:
             logger.exception("Failed to set commands")
-
         await start_background_tasks(_app)
-
     async def _on_stop(_app: Application):
         logger.info("Bot stopping")
         await stop_background_tasks()
-
     app.post_init = _on_start
     app.post_shutdown = _on_stop
     return app
