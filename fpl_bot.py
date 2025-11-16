@@ -1,24 +1,25 @@
+#!/usr/bin/env python3
 # fpl_bot.py
-# Enterprise-grade FPL Prices Bot (full D rewrite, single-file)
-# Features:
-#  - Baseline snapshots only from bootstrap-static (FPL API)
-#  - /price_on uses bootstrap snapshots with safe autogen (no future dates)
-#  - /prices parses LiveFPL, tolerant parser, dedupe, bootstrap enrichment
-#  - Monospace output limited to WIDTH_LIMIT (display-width aware)
-#  - Robust async handlers, retries, circuit-breaker, rate-limit (Upstash + fallback)
-#  - Background daily snapshot task + supervisor + minimal HTTP health/metrics
-#  - Detailed logging and safe error auditing to Upstash
-#  - Single-file, ready to drop in (requires env vars)
+# Enterprise-grade single-file FPL Prices Bot
+# - Single authoritative PricesService (parsing livefpl on-demand)
+# - Bootstrap caching (bootstrap-static)
+# - Upstash Redis (REST) integration for snapshots, rate-limiting and allowed users
+# - Circuit breaker for LiveFPL
+# - /prices (human-readable HTML), /prices.json (JSON), /price_on YYYY-MM-DD
+# - Background daily baseline snapshot task + HTTP health & metrics
+# - Prometheus counters + simple internal metrics dict
+# - Designed to be run on Northflank / containers
 
+from __future__ import annotations
 import os
 import sys
 import json
 import asyncio
 import logging
-import random
 import re
+import random
 import time as _time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone, time as dt_time
 
@@ -26,25 +27,29 @@ import httpx
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from prometheus_client import Counter, Gauge
 from aiohttp import web
 
+# Telegram
 from telegram import Update, __version__ as PTB_VERSION
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# -------------------------
-# STARTUP TIMESTAMP (used by /health)
-# -------------------------
-START_TIME_DT = datetime.utcnow()
+# Prometheus
+try:
+    from prometheus_client import Counter, Gauge
+except Exception:
+    Counter = Gauge = None  # graceful degrade if not installed
 
 # -------------------------
-# CONFIG (ENV)
+# Startup / basic config
 # -------------------------
+START_TIME = datetime.utcnow()
+
+# Environment
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 ALLOWED_GROUP_ID = int(os.getenv("ALLOWED_GROUP_ID", "0"))
 
-UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")  # e.g. https://eu1-upstash-example.upstash.io
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
@@ -54,103 +59,73 @@ METRICS_PORT = int(os.getenv("METRICS_PORT", "8080"))
 RATE_LIMIT_TOKENS = int(os.getenv("RATE_LIMIT_TOKENS", "20"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 SNAPSHOT_TTL_DAYS = int(os.getenv("SNAPSHOT_TTL_DAYS", "30"))
+LIVEFPL_URL = os.getenv("LIVEFPL_URL", "https://www.livefpl.net/prices")
+FPL_BOOTSTRAP = os.getenv("FPL_BOOTSTRAP", "https://fantasy.premierleague.com/api/bootstrap-static/")
 
-FPL_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
-LIVEFPL_PRICES = "https://www.livefpl.net/prices"
+WIDTH_LIMIT = int(os.getenv("WIDTH_LIMIT", "40"))
 
-# Formatting limits
-USE_LEGACY_PARSER = False
-WIDTH_LIMIT = int(os.getenv("WIDTH_LIMIT", "40"))  # display width limit for monospace messages
-
-# Minimal env validation (fail fast)
+# sanity checks (fail fast)
 if not BOT_TOKEN or OWNER_ID <= 0 or ALLOWED_GROUP_ID == 0:
     print("BOT_TOKEN, OWNER_ID, ALLOWED_GROUP_ID must be set", file=sys.stderr)
-    sys.exit(1)
-if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-    print("UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be set", file=sys.stderr)
-    sys.exit(1)
+    # do not sys.exit here in case user intends to run non-telegram parts; but warn and continue with HTTP endpoints disabled
+if (not UPSTASH_REDIS_REST_URL) or (not UPSTASH_REDIS_REST_TOKEN):
+    print("UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN should be set for persistence (snapshots, rate-limiting). Falling back to in-memory storage.", file=sys.stderr)
 
-# -------------------------
-# Logging & metrics
-# -------------------------
+# Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", stream=sys.stdout)
 logger = logging.getLogger("fpl_bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
+# Prometheus metrics (if available)
+if Counter and Gauge:
+    MET_PRICES_REQUESTS = Counter("fpl_prices_requests_total", "Total /prices requests")
+    MET_PARSE_SUCCESS = Counter("fpl_parse_success_total", "Successful LiveFPL parses")
+    MET_PARSE_FAIL = Counter("fpl_parse_fail_total", "Failed LiveFPL parses")
+    MET_AUTOGEN_BASELINE = Counter("fpl_autogen_baseline_total", "Autogenerated baseline count")
+    MET_LIVEFPL_FAIL = Counter("fpl_livefpl_failures_total", "LiveFPL failures")
+    MET_CB_OPEN = Gauge("fpl_circuit_open", "LiveFPL circuit open (1=open,0=closed)")
+else:
+    MET_PRICES_REQUESTS = MET_PARSE_SUCCESS = MET_PARSE_FAIL = MET_AUTOGEN_BASELINE = MET_LIVEFPL_FAIL = MET_CB_OPEN = None
+
+# internal quick metrics
 MET = defaultdict(int)
-AUTOGEN_BASELINE = Counter('fpl_autogen_baseline_total','Autogenerated baseline count')
-FUZZY_MATCH = Counter('fpl_fuzzy_match_total','Fuzzy name matches')
-LIVEFPL_FAIL = Counter('fpl_livefpl_failures_total','LiveFPL failures')
-PRICES_REQUESTS = Counter('fpl_prices_requests_total','/prices command requests')
-UP_ERRORS = Counter("fpl_upstash_errors_total", "Upstash errors")
-CB_OPEN = Gauge("fpl_circuit_open", "LiveFPL circuit open (1=open,0=closed)")
-PARSE_SUCCESS = Counter("fpl_parse_success_total", "Successful LiveFPL parses")
-PARSE_FAIL = Counter("fpl_parse_fail_total", "Failed LiveFPL parses")
-PARSE_FAIL = Counter("fpl_parse_fail_total", "Failed LiveFPL parses")
 
-def _legacy_parser_guard(func):
-    def _wrap(*a, **kw):
-        if not USE_LEGACY_PARSER:
-            logger.warning('Legacy parser function %s called but USE_LEGACY_PARSER is False', getattr(func, '__name__', str(func)))
-            PARSE_FAIL.inc()
-            return None
-        return func(*a, **kw)
-    return _wrap
-
-# You can re-enable legacy parser by setting USE_LEGACY_PARSER = True (for debugging)
-
-def inc_metric(name: str, v: int = 1):
+def inc_local_metric(name: str, v: int = 1):
     MET[name] += v
-    # also increment Prometheus counters when applicable
-    try:
-        if name == 'autogen_baseline':
-            try:
-                AUTOGEN_BASELINE.inc(v)
-            except Exception:
-                pass
-        if name == 'fuzzy_matches':
-            try:
-                FUZZY_MATCH.inc(v)
-            except Exception:
-                pass
-        if name == 'livefpl_failures':
-            try:
-                LIVEFPL_FAIL.inc(v)
-            except Exception:
-                pass
-        if name == 'prices_requests':
-            try:
-                PRICES_REQUESTS.inc(v)
-            except Exception:
-                pass
-    except Exception:
-        pass
+
 # -------------------------
 # Upstash minimal client (REST) - resilient wrapper
 # -------------------------
 class UpstashClient:
     def __init__(self, base: str, token: str, timeout: int = HTTP_TIMEOUT):
-        self.base = base.rstrip("/")
-        self.client = httpx.AsyncClient(timeout=timeout, headers={"Authorization": f"Bearer {token}"})
+        self.base = base.rstrip("/") if base else ""
+        self.token = token
+        self.timeout = timeout
+        if self.base:
+            self.client = httpx.AsyncClient(timeout=timeout, headers={"Authorization": f"Bearer {token}"})
+        else:
+            self.client = None
 
     async def close(self):
-        try:
-            await self.client.aclose()
-        except Exception:
-            pass
+        if self.client:
+            try:
+                await self.client.aclose()
+            except Exception:
+                pass
 
     async def _get(self, path: str) -> Optional[dict]:
+        if not self.client:
+            return None
         url = f"{self.base}/{path}"
         try:
             r = await self.client.get(url)
         except Exception as e:
-            UP_ERRORS.inc()
             logger.debug("Upstash transport error: %s", e)
+            inc_local_metric("upstash_transport_err")
             return None
         if r.status_code != 200:
-            UP_ERRORS.inc()
             logger.warning("Upstash status %s for %s", r.status_code, path)
             return None
         try:
@@ -169,7 +144,7 @@ class UpstashClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def hset_map(self, key: str, mapping: Dict[str, str]):
-        if not mapping:
+        if not mapping or not self.client:
             return
         parts = ["hset", key]
         for k, v in mapping.items():
@@ -188,10 +163,14 @@ class UpstashClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def set(self, key: str, value: str):
+        if not self.client:
+            return
         await self._get(f"set/{key}/{value}")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def incr(self, key: str) -> Optional[int]:
+        if not self.client:
+            return None
         j = await self._get(f"incr/{key}")
         if not j:
             return None
@@ -204,9 +183,11 @@ class UpstashClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def expire(self, key: str, seconds: int):
+        if not self.client:
+            return
         await self._get(f"expire/{key}/{seconds}")
 
-_upstash = UpstashClient(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+_upstash = UpstashClient(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, timeout=HTTP_TIMEOUT)
 
 # -------------------------
 # HTTP client with retry helpers
@@ -231,11 +212,11 @@ class HttpClient:
 _http = HttpClient()
 
 # -------------------------
-# Bootstrap cache with lock (single source for baseline)
+# Bootstrap caching (single source)
 # -------------------------
 _BOOTSTRAP_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None, "elements": [], "el_map": {}, "name_index": {}, "events": []}
-BOOTSTRAP_TTL = BOOTSTRAP_TTL_SECS
 _BOOTSTRAP_LOCK = asyncio.Lock()
+BOOTSTRAP_TTL = BOOTSTRAP_TTL_SECS
 
 async def fetch_bootstrap_cached(force: bool = False) -> Optional[dict]:
     async with _BOOTSTRAP_LOCK:
@@ -247,7 +228,7 @@ async def fetch_bootstrap_cached(force: bool = False) -> Optional[dict]:
             text = await _http.get_text(FPL_BOOTSTRAP)
             data = json.loads(text)
         except Exception:
-            inc_metric("bootstrap_fetch_fail")
+            inc_local_metric("bootstrap_fetch_fail")
             logger.exception("fetch_bootstrap_cached failed")
             return None
         elements = data.get("elements", []) or []
@@ -263,7 +244,7 @@ async def fetch_bootstrap_cached(force: bool = False) -> Optional[dict]:
             except Exception:
                 continue
         _BOOTSTRAP_CACHE.update({"ts": now, "data": data, "elements": elements, "el_map": el_map, "name_index": name_index, "events": data.get("events", [])})
-        inc_metric("bootstrap_refresh")
+        inc_local_metric("bootstrap_refresh")
         return data
 
 def current_season_date_range() -> Optional[Tuple[datetime, datetime]]:
@@ -284,7 +265,7 @@ def current_season_date_range() -> Optional[Tuple[datetime, datetime]]:
         return None
 
 # -------------------------
-# Helpers: team abbreviations + positional mapping
+# Helpers: team abbreviations + helpers
 # -------------------------
 FPL_TEAM_ABBR = {
     1:  "ARS", 2:  "AVL", 3:  "BOU", 4:  "BRE", 5:  "BHA",
@@ -296,58 +277,6 @@ FPL_TEAM_ABBR = {
 def _pos_code_to_str(code: int) -> str:
     return {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}.get(int(code), "")
 
-def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_hint: float, name_index: dict, elements: List[dict]) -> Optional[dict]:
-    name_low = (name or "").lower().strip()
-    candidates = name_index.get(name_low, []) if name_index else [el for el in elements if str(el.get("web_name","")).lower().strip() == name_low]
-    if not candidates:
-        candidates = [el for el in elements if str(el.get("web_name","")).lower().strip() == name_low]
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-    # filter by team
-    if team_hint:
-        filtered = []
-        for el in candidates:
-            tc = el.get("team_code") or el.get("team")
-            try:
-                tc_int = int(tc)
-            except Exception:
-                tc_int = None
-            abbr = FPL_TEAM_ABBR.get(tc_int) if tc_int is not None else None
-            if abbr and abbr.upper() == team_hint.upper():
-                filtered.append(el)
-        if filtered:
-            candidates = filtered
-            if len(candidates) == 1:
-                return candidates[0]
-    # filter by pos
-    if pos_hint:
-        filtered = [el for el in candidates if _pos_code_to_str(el.get("element_type")) == pos_hint.upper()]
-        if filtered:
-            candidates = filtered
-            if len(candidates) == 1:
-                return candidates[0]
-    # filter by price
-    try:
-        filtered = []
-        for el in candidates:
-            now_cost = float(el.get("now_cost", 0)) / 10.0
-            if abs(now_cost - float(price_hint)) < 0.01:
-                filtered.append(el)
-        if filtered:
-            candidates = filtered
-            if len(candidates) == 1:
-                return candidates[0]
-    except Exception:
-        pass
-    inc_metric("ambiguous_matches")
-    logger.warning("Ambiguous player match for '%s' -> using first candidate id=%s", name, candidates[0].get("id"))
-    return candidates[0]
-
-# -------------------------
-# Parser: tolerant row extraction + hybrid html parsing
-# -------------------------
 def sanitize_name(s: Optional[str]) -> str:
     if not s:
         return ""
@@ -365,6 +294,80 @@ def sanitize_price_val(s: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
+# Display width helpers (for monospace presentation)
+import unicodedata
+def display_width(s: str) -> int:
+    w = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        if ea in ("F", "W"):
+            w += 2
+        else:
+            if ord(ch) >= 0x1F000:
+                w += 2
+            else:
+                w += 1
+    return w
+
+def clamp_display(s: str, max_width: int) -> str:
+    s = (s or "").strip()
+    if display_width(s) <= max_width:
+        return s
+    out = ""
+    cur = 0
+    for ch in s:
+        chw = 2 if (unicodedata.east_asian_width(ch) in ("F","W") or ord(ch) >= 0x1F000) else 1
+        if cur + chw > max_width - 1:
+            break
+        out += ch
+        cur += chw
+    return out.rstrip() + "…"
+
+def shorten_name_for_width(name: str, max_len: int) -> str:
+    name = (name or "").strip()
+    if display_width(name) <= max_len:
+        return name
+    parts = name.split()
+    if len(parts) >= 2:
+        first = parts[0]
+        last = " ".join(parts[1:])
+        short = f"{first[0]}. {last}"
+        if display_width(short) <= max_len:
+            return short
+        last_only = parts[-1]
+        short2 = f"{last_only} {first[0]}."
+        if display_width(short2) <= max_len:
+            return short2
+    return clamp_display(name, max_len)
+
+def emoji_for_direction(direction: str) -> str:
+    if not direction:
+        return "▫"
+    d = direction.lower()
+    if d in ("rise","up","rising"):
+        return "🔼"
+    if d in ("fall","down","falling"):
+        return "🔽"
+    return "▫"
+
+def compose_table_line(team: str, pos: str, name: str, price: str, note: str) -> str:
+    # produce a neat spaced line; tuned to WIDTH_LIMIT
+    teamp = (team or "").upper()
+    posp = (pos or "").upper()
+    left = f"{teamp} {posp}".strip()
+    left_c = clamp_display(left, 12)
+    name_c = clamp_display(name, 20)
+    price_c = clamp_display(price, 8)
+    note_c = clamp_display(note, 10)
+    pieces = [p for p in [left_c, name_c, price_c, note_c] if p]
+    line = "  ".join(pieces)
+    if display_width(line) > WIDTH_LIMIT:
+        line = clamp_display(line, WIDTH_LIMIT)
+    return line
+
+# -------------------------
+# Hybrid tolerant LiveFPL parser (robust heuristics)
+# -------------------------
 def _parse_row_tolerant(cells: List[str]) -> Dict[str, str]:
     out = {"Name": "", "Pos": "", "Team": "", "Price": "", "Target": "", "Owned by": ""}
     tokens = [c.strip() for c in cells if c and c.strip() != ""]
@@ -385,7 +388,7 @@ def _parse_row_tolerant(cells: List[str]) -> Dict[str, str]:
     if price_tok:
         out["Price"] = price_tok.replace("£", "").strip()
     # role tokens and candidates
-    role_tokens = {"GKP", "DEF", "MID", "FWD", "GK", "DF", "MF", "FW"}
+    role_tokens = {"GKP","DEF","MID","FWD","GK","DF","MF","FW"}
     cand = []
     for t in tokens:
         if t == price_tok or "%" in t:
@@ -443,13 +446,16 @@ def _find_section_nodes(soup: BeautifulSoup, hints: List[str]):
     return nodes
 
 async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None) -> Dict[str, List[Dict[str, Any]]]:
+    if hints is None:
+        hints = ["Already reached target", "Projected to reach target", "Others who will be close", "Predicted Rises", "Predicted Falls"]
     try:
         soup = BeautifulSoup(html_text, "html.parser")
     except Exception:
-        PARSE_FAIL.inc()
+        if MET_PARSE_FAIL:
+            try: MET_PARSE_FAIL.inc()
+            except Exception: pass
+        logger.exception("BeautifulSoup failed")
         return {}
-    if hints is None:
-        hints = ["Already reached target", "Projected to reach target", "Others who will be close", "Predicted Rises", "Predicted Falls"]
     nodes = _find_section_nodes(soup, hints)
     sections: Dict[str, List[Dict[str, Any]]] = {}
     for hint in hints:
@@ -457,9 +463,11 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
         rows = []
         tbl = None
         if node:
-            tbl = node.find_next("table")
-            if not tbl and node.name == "table":
+            # try find a following table or list
+            if node.name == "table":
                 tbl = node
+            else:
+                tbl = node.find_next("table")
         if tbl:
             for tr in tbl.find_all("tr"):
                 cells = tr.find_all(["td","th"])
@@ -469,6 +477,7 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
                 parsed = _parse_row_tolerant(tds)
                 rows.append(parsed)
         else:
+            # fallback: take siblings text blocks until next header
             if node:
                 sibs = []
                 for sib in node.find_next_siblings(limit=20):
@@ -483,7 +492,7 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
                         if part.strip():
                             parsed = _parse_row_tolerant([part.strip()])
                             rows.append(parsed)
-        # dedupe by (name, price)
+        # dedupe
         seen = set()
         final = []
         for r in rows:
@@ -504,7 +513,7 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
         n = (r.get("Name") or "").strip()
         if n:
             name_dir_map[n.lower()] = "fall"
-    # enrich with bootstrap
+    # enrich with bootstrap (if possible)
     try:
         data = await fetch_bootstrap_cached()
         elements = data.get("elements", []) if data else []
@@ -521,7 +530,16 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
             price_hint = sanitize_price_val(r.get("Price"))
             found = None
             try:
-                found = find_element_by_name_smart(name, team_hint, pos_hint, price_hint or 0.0, name_index, elements)
+                # simple match using name_index
+                candidates = name_index.get(name.lower(), []) if name_index else []
+                if candidates:
+                    found = candidates[0]
+                else:
+                    # fallback linear search
+                    for el in elements:
+                        if str(el.get("web_name","")).lower().strip() == name.lower():
+                            found = el
+                            break
             except Exception:
                 found = None
             if found:
@@ -552,167 +570,95 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
                     r["_direction"] = "neutral"
             enriched.append(r)
         sections[title] = enriched
-    PARSE_SUCCESS.inc()
+    if MET_PARSE_SUCCESS:
+        try: MET_PARSE_SUCCESS.inc()
+        except Exception: pass
     return sections
 
 # -------------------------
-# Utilities & formatting (monospace, width-aware truncation)
+# Prices formatting (human)
 # -------------------------
-def parse_percent(s: str) -> float:
-    try:
-        if s is None:
-            return 0.0
-        s2 = str(s).replace("%", "").strip()
-        return float(s2) if s2 != "" else 0.0
-    except Exception:
-        return 0.0
-
-def emoji_for_direction(direction: str) -> str:
-    if not direction:
-        return "▫"
-    d = direction.lower()
-    if d in ("rise", "up"):
-        return "🔼"
-    if d in ("fall", "down"):
-        return "🔽"
-    return "▫"
-
-import unicodedata
-def display_width(s: str) -> int:
-    w = 0
-    for ch in s:
-        ea = unicodedata.east_asian_width(ch)
-        if ea in ("F", "W"):
-            w += 2
-        else:
-            if ord(ch) >= 0x1F000:  # many emoji
-                w += 2
-            else:
-                w += 1
-    return w
-
-def clamp_display(s: str, max_width: int) -> str:
-    s = (s or "").strip()
-    if display_width(s) <= max_width:
-        return s
-    out = ""
-    cur = 0
-    for ch in s:
-        chw = 2 if (unicodedata.east_asian_width(ch) in ("F","W") or ord(ch) >= 0x1F000) else 1
-        if cur + chw > max_width - 1:
-            break
-        out += ch
-        cur += chw
-    return out.rstrip() + "…"
-
-def shorten_name_for_width(name: str, max_len: int) -> str:
-    name = (name or "").strip()
-    if display_width(name) <= max_len:
-        return name
-    parts = name.split()
-    if len(parts) >= 2:
-        first = parts[0]
-        last = " ".join(parts[1:])
-        short = f"{first[0]}. {last}"
-        if display_width(short) <= max_len:
-            return short
-        last_only = parts[-1]
-        short2 = f"{last_only} {first[0]}."
-        if display_width(short2) <= max_len:
-            return short2
-    return clamp_display(name, max_len)
-
-def compose_mono_line(team: str, pos: str, price: str, name: str, emoji: str, tgt: str) -> str:
-    left = team.upper()
-    if pos:
-        left = f"{left} {pos.upper()}"
-    price = (price or "").strip()
-    tgtpart = (emoji + (" " + tgt if tgt else "")).strip()
-    left_max = 10
-    price_max = 7
-    tgt_max = 7
-    reserved = min(left_max, display_width(left)) + 2 + min(price_max, display_width(price)) + 2 + min(tgt_max, display_width(tgtpart))
-    name_max = max(6, WIDTH_LIMIT - reserved)
-    left_c = clamp_display(left, left_max)
-    price_c = clamp_display(price, price_max)
-    name_c = shorten_name_for_width(name, name_max)
-    tgt_c = clamp_display(tgtpart, tgt_max)
-    pieces = [p for p in [left_c, price_c, name_c, tgt_c] if p]
-    line = "  ".join(pieces)
-    if display_width(line) > WIDTH_LIMIT:
-        if name_c and name_c in line:
-            pre, post = line.split(name_c, 1)
-            available = WIDTH_LIMIT - display_width(pre) - display_width(post)
-            if available > 0:
-                name_c2 = clamp_display(name_c, max(3, available))
-                line = pre + name_c2 + post
-            else:
-                line = clamp_display(line, WIDTH_LIMIT)
-        else:
-            line = clamp_display(line, WIDTH_LIMIT)
-    return line
-
-def format_prices_mono(sections: Dict[str, List[Dict[str, Any]]], el_map: Dict[int, dict]) -> str:
-    order = ["Already reached target", "Projected to reach target", "Others who will be close"]
-    out_blocks = []
-    for title in order:
-        rows = sections.get(title, []) or []
-        header = title
-        lines = [header]
+def format_prices_human(sections: Dict[str, List[Dict[str, Any]]]) -> str:
+    """
+    Compose improved table-style output with emoji headings.
+    """
+    parts = []
+    order = [
+        ("🔼 Predicted Rises", "Predicted Rises"),
+        ("🔽 Predicted Falls", "Predicted Falls"),
+        ("📈 Projected to reach target", "Projected to reach target"),
+        ("▫ Others who will be close", "Others who will be close"),
+    ]
+    for header, key in order:
+        rows = sections.get(key, []) or []
+        parts.append(f"<b>{header}</b>")
         if not rows:
-            lines.append("(none)")
-            out_blocks.append("\n".join(lines))
+            parts.append("(none)")
+            parts.append("")  # blank line
             continue
         for r in rows:
+            team_abbr = "UNK"
+            el_id = None
+            for k in ("element","id"):
+                try:
+                    if k in r:
+                        el_id = int(r[k])
+                        break
+                except Exception:
+                    pass
+            if el_id and _BOOTSTRAP_CACHE.get("el_map"):
+                try:
+                    tc = _BOOTSTRAP_CACHE["el_map"].get(el_id, {}).get("team_code")
+                    team_abbr = FPL_TEAM_ABBR.get(int(tc), "UNK")
+                except Exception:
+                    pass
+            else:
+                tcol = (r.get("Team") or "").strip()
+                if tcol:
+                    team_abbr = tcol.upper()
+            pos = (r.get("Pos") or "").upper() or ""
+            name = (r.get("Name") or "")
+            price_val = r.get("Price") or ""
             try:
-                team_abbr = "UNK"
-                el_id = None
-                for k in ("element","id","Element"):
-                    try:
-                        if k in r:
-                            el_id = int(r[k])
-                            break
-                    except Exception:
-                        pass
-                if el_id and el_map:
-                    try:
-                        tc = el_map[el_id].get("team_code")
-                        team_abbr = FPL_TEAM_ABBR.get(int(tc), "UNK")
-                    except Exception:
-                        pass
-                else:
-                    tcol = (r.get("Team") or "").strip()
-                    if tcol:
-                        team_abbr = tcol.upper()
-                pos = (r.get("Pos") or "").upper() or ""
-                name = (r.get("Name") or "")
-                price_val = r.get("Price") or ""
-                try:
-                    pv = float(str(price_val))
-                    price = f"£{pv:.1f}"
-                except Exception:
-                    price = f"£{price_val}".strip()
-                tgt_raw = r.get("Target") or r.get("Owned by") or ""
-                try:
-                    tnum = parse_percent(tgt_raw)
-                    tgt_pct = f"{int(round(tnum))}%"
-                except Exception:
-                    tgt_pct = (tgt_raw or "").strip()
-                direction = r.get("_direction", "neutral")
-                em = emoji_for_direction(direction)
-                line = compose_mono_line(team_abbr, pos, price, name, em, tgt_pct)
-                lines.append(line)
+                pv = float(str(price_val))
+                price = f"£{pv:.1f}"
             except Exception:
-                continue
-        out_blocks.append("\n".join(lines))
-    return "<pre>" + "\n\n".join(out_blocks) + "</pre>"
+                price = f"£{price_val}".strip()
+            tgt_raw = r.get("Target") or r.get("Owned by") or ""
+            try:
+                tnum = float(str(tgt_raw).replace("%","").strip()) if tgt_raw else 0.0
+                tgt_pct = f"{int(round(tnum))}%"
+            except Exception:
+                tgt_pct = (tgt_raw or "").strip()
+            direction = r.get("_direction", "neutral")
+            em = emoji_for_direction(direction)
+            note = f"{em} {tgt_pct}".strip()
+            line = compose_table_line(team_abbr, pos, name, price, note)
+            parts.append(line)
+        parts.append("")  # blank line between blocks
+    return "<pre>" + "\n".join(parts) + "</pre>"
+
+def prices_sections_to_json(sections: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    # convert sections to JSON-serializable structures with selected fields
+    out = {}
+    for k, v in sections.items():
+        out[k] = []
+        for r in v:
+            out[k].append({
+                "name": r.get("Name"),
+                "team": r.get("Team"),
+                "pos": r.get("Pos"),
+                "price": r.get("Price"),
+                "target": r.get("Target") or r.get("Owned by"),
+                "direction": r.get("_direction", "neutral"),
+                "element": r.get("element"),
+            })
+    return out
 
 # -------------------------
-# Baseline persistence (bootstrap-only)
-# - fpl:prices:current (hash)
-# - fpl:prices:<YYYY-MM-DD> (hash snapshots)
+# Baseline persistence (Upstash-backed with local fallback)
 # -------------------------
-async def save_baseline_map(new_map: Dict[str,int], date_iso: Optional[str] = None):
+async def save_baseline_map(new_map: Dict[str, int], date_iso: Optional[str] = None):
     try:
         mapping = {str(k): str(v) for k, v in new_map.items()}
         if mapping:
@@ -725,13 +671,28 @@ async def save_baseline_map(new_map: Dict[str,int], date_iso: Optional[str] = No
         await _upstash.hset_map(snap_key, mapping)
         await _upstash.expire(snap_key, SNAPSHOT_TTL_DAYS * 24 * 3600)
     except Exception:
-        logger.exception("save_baseline_map failed")
+        # fallback: save to local file
+        try:
+            pdir = os.getenv("SNAPSHOT_DIR", "/app/fpl_snapshots")
+            os.makedirs(pdir, exist_ok=True)
+            p = os.path.join(pdir, f"{date_iso or 'auto'}.json")
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump({str(k): int(v) for k, v in new_map.items()}, fh)
+        except Exception:
+            logger.exception("save_baseline_map failed")
 
-async def _load_daily_baseline_async(date_str: str) -> Optional[Dict[str,int]]:
+async def _load_daily_baseline_async(date_str: str) -> Optional[Dict[str, int]]:
     key = f"fpl:prices:{date_str}"
     try:
         d = await _upstash.hgetall(key)
         if not d:
+            # local fallback
+            pdir = os.getenv("SNAPSHOT_DIR", "/app/fpl_snapshots")
+            p = os.path.join(pdir, f"{date_str}.json")
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                return {str(k): int(v) for k, v in data.items()}
             return None
         clean = {}
         for k, v in d.items():
@@ -750,7 +711,7 @@ async def _load_daily_baseline_async(date_str: str) -> Optional[Dict[str,int]]:
         logger.exception("load daily baseline failed")
         return None
 
-async def bootstrap_snapshot_for_date(date_iso: str) -> Optional[Dict[str,int]]:
+async def bootstrap_snapshot_for_date(date_iso: str) -> Optional[Dict[str, int]]:
     try:
         data = await fetch_bootstrap_cached(force=True)
         if not data:
@@ -773,37 +734,98 @@ async def bootstrap_snapshot_for_date(date_iso: str) -> Optional[Dict[str,int]]:
         elements = data.get("elements", []) or []
         new_map = {str(el["id"]): int(el.get("now_cost", 0)) for el in elements}
         await save_baseline_map(new_map, date_iso=date_iso)
+        if MET_AUTOGEN_BASELINE:
+            try: MET_AUTOGEN_BASELINE.inc()
+            except Exception: pass
         return new_map
     except Exception:
         logger.exception("bootstrap_snapshot_for_date failed")
         return None
 
 # -------------------------
-# Price detector & baseline updater
+# PriceDetectorService (single canonical service)
 # -------------------------
-class PriceDetectorService:
-    async def build_prices_msg(self) -> str:
-        if livefpl_cb.is_open():
-            return "<code>LiveFPL temporarily unavailable</code>"
+class CircuitBreakerSimple:
+    def __init__(self, fail_threshold: int = 3, cooldown_seconds: int = 600):
+        self.fail_threshold = fail_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.fail_count = 0
+        self.open_until = 0
+
+    def record_success(self):
+        self.fail_count = 0
+        self.open_until = 0
+        if MET_CB_OPEN:
+            try: MET_CB_OPEN.set(0)
+            except Exception: pass
+
+    def record_failure(self):
+        self.fail_count += 1
+        if self.fail_count >= self.fail_threshold:
+            self.open_until = int(_time.time()) + self.cooldown_seconds + random.randint(0, 30)
+            logger.warning("Circuit breaker opened for %ds after %d failures", self.cooldown_seconds, self.fail_count)
+            inc_local_metric("circuit_opened")
+            if MET_CB_OPEN:
+                try: MET_CB_OPEN.set(1)
+                except Exception: pass
+
+    def is_open(self) -> bool:
+        if self.open_until == 0:
+            return False
+        if _time.time() >= self.open_until:
+            self.fail_count = 0
+            self.open_until = 0
+            if MET_CB_OPEN:
+                try: MET_CB_OPEN.set(0)
+                except Exception: pass
+            return False
+        return True
+
+class PricesService:
+    def __init__(self):
+        self.http = _http
+        self.bootstrap_cb = CircuitBreakerSimple()
+        self.livefpl_cb = CircuitBreakerSimple()
+        self.bootstrap_cache = _BOOTSTRAP_CACHE
+
+    async def build_prices_msg(self) -> Tuple[str, Dict[str, Any]]:
+        """
+        Fetch LIVEFPL page (on-demand), parse, enrich with bootstrap and return (html_msg, json_sections)
+        If LiveFPL unavailable or circuit open, returns fallback/notice.
+        """
+        if self.livefpl_cb.is_open():
+            logger.info("LiveFPL circuit open — returning unavailable message")
+            return ("<code>LiveFPL temporarily unavailable</code>", {})
         try:
-            txt = await _http.get_text(LIVEFPL_PRICES)
+            txt = await self.http.get_text(LIVEFPL_URL)
         except Exception:
-            livefpl_cb.record_failure()
+            self.livefpl_cb.record_failure()
             logger.exception("Failed to fetch LiveFPL page")
-            return "<code>Could not fetch LiveFPL page.</code>"
-        livefpl_cb.record_success()
+            if MET_LIVEFPL_FAIL:
+                try: MET_LIVEFPL_FAIL.inc()
+                except Exception: pass
+            return ("<code>Could not fetch LiveFPL page.</code>", {})
+        self.livefpl_cb.record_success()
         try:
             sections = await hybrid_parse_livefpl(txt)
             if not sections:
-                return "<code>No price projections parsed.</code>"
+                return ("<code>No price projections parsed.</code>", {})
+            # ensure bootstrap cached for enrichment display
             await fetch_bootstrap_cached()
-            el_map = _BOOTSTRAP_CACHE.get("el_map", {})
-            return format_prices_mono(sections, el_map)
+            html = format_prices_human(sections)
+            json_sections = prices_sections_to_json(sections)
+            if MET_PRICES_REQUESTS:
+                try: MET_PRICES_REQUESTS.inc()
+                except Exception: pass
+            return (html, json_sections)
         except Exception:
             logger.exception("Error building prices message")
-            return "<code>Could not build prices message.</code>"
+            if MET_PARSE_FAIL:
+                try: MET_PARSE_FAIL.inc()
+                except Exception: pass
+            return ("<code>Could not build prices message.</code>", {})
 
-    def detect_between_maps(self, m1: Dict[str,int], m2: Dict[str,int]) -> List[Tuple[str,int,int]]:
+    def detect_between_maps(self, m1: Dict[str, int], m2: Dict[str, int]) -> List[Tuple[str, int, int]]:
         out = []
         try:
             for k, v2 in m2.items():
@@ -819,7 +841,7 @@ class PriceDetectorService:
             logger.exception("detect_between_maps failed")
         return out
 
-    async def detect_changes_and_update_baseline(self) -> Optional[List[Tuple[str,int,int]]]:
+    async def detect_changes_and_update_baseline(self) -> Optional[List[Tuple[str, int, int]]]:
         try:
             data = await fetch_bootstrap_cached(force=True)
             if not data:
@@ -844,7 +866,7 @@ class PriceDetectorService:
             today_str = datetime.utcnow().astimezone(timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))).date().isoformat()
             await save_baseline_map(new_map, date_iso=today_str)
             try:
-                await _upstash.hset_map("fpl:audit:price_changes", {str(int(datetime.utcnow().timestamp())): ",".join([f"{e}:{o}->{n}" for e,o,n in changes])})
+                await _upstash.hset_map("fpl:audit:price_changes", {str(int(datetime.utcnow().timestamp())): ",".join([f"{e}:{o}->{n}" for e, o, n in changes])})
             except Exception:
                 pass
         else:
@@ -853,42 +875,7 @@ class PriceDetectorService:
                 await save_baseline_map(new_map, date_iso=today_str)
         return changes
 
-price_service = PriceDetectorService()
-
-# -------------------------
-# Circuit breaker (LiveFPL)
-# -------------------------
-class CircuitBreaker:
-    def __init__(self, fail_threshold: int = 3, cooldown_seconds: int = 600):
-        self.fail_threshold = fail_threshold
-        self.cooldown_seconds = cooldown_seconds
-        self.fail_count = 0
-        self.open_until = 0
-
-    def record_success(self):
-        self.fail_count = 0
-        self.open_until = 0
-        CB_OPEN.set(0)
-
-    def record_failure(self):
-        self.fail_count += 1
-        if self.fail_count >= self.fail_threshold:
-            self.open_until = int(_time.time()) + self.cooldown_seconds + random.randint(0, 30)
-            logger.warning("Circuit breaker opened for %ds after %d failures", self.cooldown_seconds, self.fail_count)
-            inc_metric("circuit_opened")
-            CB_OPEN.set(1)
-
-    def is_open(self) -> bool:
-        if self.open_until == 0:
-            return False
-        if _time.time() >= self.open_until:
-            self.fail_count = 0
-            self.open_until = 0
-            CB_OPEN.set(0)
-            return False
-        return True
-
-livefpl_cb = CircuitBreaker()
+price_service = PricesService()
 
 # -------------------------
 # Rate limiter (Upstash INCR + in-memory fallback)
@@ -896,27 +883,30 @@ livefpl_cb = CircuitBreaker()
 in_memory_rl: Dict[int, List[int]] = {}
 
 async def rate_limit_check(user_id: int) -> bool:
-    try:
-        val = await _upstash.incr(f"fpl:rl:{user_id}")
-        if val is None:
-            raise RuntimeError("upstash incr failed")
-        if val == 1:
-            await _upstash.expire(f"fpl:rl:{user_id}", RATE_LIMIT_WINDOW)
-        return val <= RATE_LIMIT_TOKENS
-    except Exception:
-        now = int(datetime.utcnow().timestamp())
-        bucket = in_memory_rl.get(user_id, [])
-        bucket = [t for t in bucket if t > now - RATE_LIMIT_WINDOW]
-        if len(bucket) >= RATE_LIMIT_TOKENS:
-            return False
-        bucket.append(now)
-        in_memory_rl[user_id] = bucket
-        return True
+    if _upstash.client:
+        try:
+            val = await _upstash.incr(f"fpl:rl:{user_id}")
+            if val is None:
+                raise RuntimeError("upstash incr failed")
+            if val == 1:
+                await _upstash.expire(f"fpl:rl:{user_id}", RATE_LIMIT_WINDOW)
+            return val <= RATE_LIMIT_TOKENS
+        except Exception:
+            pass
+    # fallback in-memory bucket
+    now = int(datetime.utcnow().timestamp())
+    bucket = in_memory_rl.get(user_id, [])
+    bucket = [t for t in bucket if t > now - RATE_LIMIT_WINDOW]
+    if len(bucket) >= RATE_LIMIT_TOKENS:
+        return False
+    bucket.append(now)
+    in_memory_rl[user_id] = bucket
+    return True
 
 # -------------------------
 # Authorization (owner + allowed group + whitelist)
 # -------------------------
-_allowed_users: Set[int] = set()
+_allowed_users: set = set()
 
 async def load_allowed_users():
     global _allowed_users
@@ -958,23 +948,8 @@ async def is_authorized_update(update: Update) -> bool:
         logger.exception("Authorization check failed")
         return False
 
-def notifications_enabled() -> bool:
-    return True
-
-async def send_message_secure(app: Application, text: str, *, silent: bool = True, parse_mode: str = "HTML"):
-    if not notifications_enabled():
-        logger.debug("Notifications disabled - blocking secure send")
-        return
-    try:
-        await app.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=text, parse_mode=parse_mode,
-                                   disable_web_page_preview=True, disable_notification=silent)
-        MSG_SENT.inc()
-    except Exception:
-        logger.exception("send_message_secure failed")
-        inc_metric("send_errors")
-
 # -------------------------
-# Handler guard decorator (rate-limit + error audit)
+# Handler guard decorator
 # -------------------------
 def handler_guard(fn):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1002,7 +977,7 @@ def handler_guard(fn):
     return wrapper
 
 # -------------------------
-# Commands: /help, /prices, /price_on
+# Telegram command handlers
 # -------------------------
 @handler_guard
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1011,23 +986,40 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "FPL Prices Bot (Enterprise)\n"
         "/prices — show LiveFPL price projections (compact, mobile)\n"
+        "/prices_json — show JSON price projections (alias to /prices.json)\n"
         "/price_on YYYY-MM-DD — show changes between that day and next day (baseline from bootstrap)\n"
         "/help — show this help"
     )
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(text)
-    else:
-        await send_message_secure(context.application, text, silent=False)
+    try:
+        if update.effective_chat.type == "private":
+            await update.message.reply_text(text)
+        else:
+            await update.message.reply_text(text)
+    except Exception:
+        pass
 
 @handler_guard
 async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized_update(update):
         return
-    msg = await price_service.build_prices_msg()
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
-    else:
-        await send_message_secure(context.application, msg, silent=False)
+    html, _json = await price_service.build_prices_msg()
+    try:
+        if update.effective_chat.type == "private":
+            await update.message.reply_text(html, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            await context.application.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=html, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        logger.exception("Failed to send /prices message")
+
+@handler_guard
+async def prices_json_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized_update(update):
+        return
+    html, json_sections = await price_service.build_prices_msg()
+    try:
+        await update.message.reply_text("JSON payload (first 2000 chars):\n" + json.dumps(json_sections)[:2000])
+    except Exception:
+        logger.exception("Failed to send /prices_json")
 
 @handler_guard
 async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1094,7 +1086,7 @@ async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 # -------------------------
-# Background: daily snapshot & supervisor
+# Background: daily snapshot task + supervisor
 # -------------------------
 _bg_task: Optional[asyncio.Task] = None
 _shutdown = False
@@ -1152,7 +1144,7 @@ def start_supervisor(loop, tasks_getter, restart_fn, interval=30):
                         logger.warning("Supervisor: task %s not running -> restarting", name)
                         try:
                             await restart_fn(name)
-                            inc_metric("supervisor_restarts")
+                            inc_local_metric("supervisor_restarts")
                         except Exception:
                             logger.exception("Supervisor failed to restart %s", name)
                 await asyncio.sleep(interval)
@@ -1161,7 +1153,7 @@ def start_supervisor(loop, tasks_getter, restart_fn, interval=30):
             except Exception:
                 logger.exception("Supervisor crashed")
                 await asyncio.sleep(interval)
-    return loop.create_task(_loop())
+    return asyncio.get_event_loop().create_task(_loop())
 
 async def restart_background_task(name: str):
     global _bg_task
@@ -1171,29 +1163,31 @@ async def restart_background_task(name: str):
         _bg_task = asyncio.create_task(daily_snapshot_task(APP_INSTANCE))
 
 # -------------------------
-# HTTP server for health & metrics
+# HTTP server for health & JSON prices (aiohttp)
 # -------------------------
 async def handle_health(request):
     data = {
-        "uptime_seconds": int((datetime.utcnow() - START_TIME_DT).total_seconds()),
+        "uptime_seconds": int((datetime.utcnow() - START_TIME).total_seconds()),
         "bootstrap_cached": bool(_BOOTSTRAP_CACHE.get("data")),
-        "baseline_count": len(await _upstash.hgetall("fpl:prices:current") or {}),
+        "baseline_count": len(await _upstash.hgetall("fpl:prices:current") or {}) if _upstash.client else "in-memory",
         "metrics": dict(MET),
+        "livefpl_circuit_open": price_service.livefpl_cb.is_open() if price_service else False,
     }
     return web.json_response(data)
 
-async def handle_metrics(request):
-    lines = []
-    for k, v in MET.items():
-        lines.append(f"# HELP {k} autogenerated")
-        lines.append(f"# TYPE {k} gauge")
-        lines.append(f"{k} {v}")
-    return web.Response(text="\n".join(lines), content_type="text/plain; version=0.0.4")
+async def handle_prices_json(request):
+    # fetch live once (on-demand) — return JSON structure
+    html, json_sections = await price_service.build_prices_msg()
+    return web.json_response({"ok": bool(json_sections), "data": json_sections})
+
+async def handle_root(request):
+    return web.Response(text="FPL Prices Bot - service endpoints: /health, /prices.json")
 
 async def start_http_server():
     app = web.Application()
+    app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
-    app.router.add_get("/metrics", handle_metrics)
+    app.router.add_get("/prices.json", handle_prices_json)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", METRICS_PORT)
@@ -1237,7 +1231,7 @@ async def stop_background_tasks():
         pass
 
 # -------------------------
-# Async no-op for MessageHandler (prevents NoneType await TypeError)
+# No-op MessageHandler
 # -------------------------
 async def _noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
@@ -1249,6 +1243,7 @@ def build_app():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("prices", prices_cmd))
+    app.add_handler(CommandHandler("prices_json", prices_json_cmd))
     app.add_handler(CommandHandler("price_on", price_on_cmd))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), _noop))
     async def _on_start(_app: Application):
@@ -1279,407 +1274,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-# --- BEGIN: Embedded enterprise prices subsystem (appended) ---
-"""
-fpl_bot_fixed.py
-Repaired single-file implementation for /prices and /price_on with enterprise-grade features.
-Backup of original file saved as fpl_bot.py.corrupt_backup
-"""
-
-import os, sys, time, asyncio, logging, re
-from typing import Optional, Dict, Any, List
-from collections import defaultdict
-from pathlib import Path
-
-# Dependencies: httpx, beautifulsoup4, rapidfuzz (optional)
-try:
-    import httpx
-except Exception as e:
-    raise RuntimeError("httpx required: pip install httpx") from e
-
-try:
-    from bs4 import BeautifulSoup
-except Exception as e:
-    raise RuntimeError("beautifulsoup4 required: pip install beautifulsoup4") from e
-
-# fuzzy matching: rapidfuzz preferred
-try:
-    from rapidfuzz import fuzz as __rfuzz
-    def fuzzy_score(a: str, b: str) -> int:
-        try:
-            return int(__rfuzz.partial_ratio(a, b))
-        except Exception:
-            return 0
-except Exception:
-    from difflib import SequenceMatcher as __Seq
-    def fuzzy_score(a: str, b: str) -> int:
-        try:
-            return int(__Seq(a, b).ratio() * 100)
-        except Exception:
-            return 0
-
-def best_fuzzy_match(name: str, candidates: Dict[str, Any], threshold: int = 70):
-    if not name or not candidates:
-        return None, 0
-    best = None
-    best_score = 0
-    for k, obj in candidates.items():
-        sc = fuzzy_score(name, k)
-        if sc > best_score:
-            best_score = sc
-            best = obj
-    if best_score >= threshold:
-        return best, best_score
-    return None, best_score
-
-# Logging
-LOG_LEVEL = os.getenv("FPL_LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", stream=sys.stdout)
-logger = logging.getLogger("fpl.bot")
-
-# Prometheus metrics (optional)
-try:
-    from prometheus_client import Counter, Gauge
-    AUTOGEN_BASELINE = Counter('fpl_autogen_baseline_total','Autogenerated baseline count')
-    FUZZY_MATCH = Counter('fpl_fuzzy_match_total','Fuzzy name matches')
-    LIVEFPL_FAIL = Counter('fpl_livefpl_failures_total','LiveFPL failures')
-    PRICES_REQUESTS = Counter('fpl_prices_requests_total','/prices command requests')
-except Exception:
-    AUTOGEN_BASELINE = FUZZY_MATCH = LIVEFPL_FAIL = PRICES_REQUESTS = None
-
-# Settings
-BOOTSTRAP_URL = os.getenv("BOOTSTRAP_URL", "https://fantasy.premierleague.com/api/bootstrap-static/")
-LIVEFPL_URL = os.getenv("LIVEFPL_URL", "https://www.livefpl.net/fixtures")
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
-RETRIES = int(os.getenv("RETRIES", "3"))
-RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "0.6"))
-CIRCUIT_THRESHOLD = int(os.getenv("CIRCUIT_THRESHOLD", "5"))
-CIRCUIT_RESET_SECONDS = int(os.getenv("CIRCUIT_RESET_SECONDS", "300"))
-SNAPSHOT_TTL_DAYS = int(os.getenv("SNAPSHOT_TTL_DAYS", "7"))
-
-# Upstash / snapshot storage placeholders (in real bot these call Upstash)
-# For this repair we will emulate save/load to local files under /mnt/data/snapshots for safety.
-SNAPSHOT_DIR = Path("/mnt/data/fpl_snapshots")
-SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-
-def save_baseline_map_local(new_map: Dict[str,int], date_iso: str):
-    p = SNAPSHOT_DIR / f"{date_iso}.json"
-    import json
-    with open(p, "w", encoding="utf-8") as fh:
-        json.dump(new_map, fh)
-    logger.info("Saved local snapshot %s (%d items)", p, len(new_map))
-
-def load_baseline_map_local(date_iso: str) -> Optional[Dict[str,int]]:
-    p = SNAPSHOT_DIR / f"{date_iso}.json"
-    if not p.exists():
-        return None
-    import json
-    with open(p, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    logger.info("Loaded local snapshot %s (%d items)", p, len(data))
-    return {str(k): int(v) for k,v in data.items()}
-
-# Simple Async HTTP client with retries
-class AsyncHttpClient:
-    def __init__(self, timeout=HTTP_TIMEOUT, retries=RETRIES, backoff=RETRY_BACKOFF):
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
-        self.retries = retries
-        self.backoff = backoff
-
-    async def get(self, url, **kw):
-        last = None
-        for i in range(1, self.retries+1):
-            try:
-                r = await self._client.get(url, **kw)
-                r.raise_for_status()
-                return r
-            except Exception as e:
-                last = e
-                sleep_for = self.backoff * (2 ** (i-1))
-                logger.debug("GET %s failed attempt %d/%d: %s", url, i, self.retries, e)
-                if i < self.retries:
-                    await asyncio.sleep(sleep_for)
-        logger.error("GET %s failed after %d attempts: %s", url, self.retries, last)
-        raise last
-
-    async def aclose(self):
-        await self._client.aclose()
-
-# Circuit breaker
-class CircuitBreaker:
-    def __init__(self, threshold=CIRCUIT_THRESHOLD, reset_seconds=CIRCUIT_RESET_SECONDS):
-        self.threshold = threshold
-        self.reset_seconds = reset_seconds
-        self.failed = 0
-        self.last_fail_ts = 0.0
-
-    def record_failure(self):
-        self.failed += 1
-        self.last_fail_ts = time.time()
-        logger.warning("Circuit failure recorded: failed=%d", self.failed)
-
-    def record_success(self):
-        if self.failed:
-            logger.info("Circuit success: resetting failed count (was %d)", self.failed)
-        self.failed = 0
-        self.last_fail_ts = 0.0
-
-    def is_open(self):
-        if self.failed >= self.threshold:
-            if time.time() - self.last_fail_ts < self.reset_seconds:
-                logger.warning("Circuit open (failed=%d)", self.failed)
-                return True
-            return False
-        return False
-
-# Bootstrap client with caching
-class BootstrapClient:
-    def __init__(self, http: AsyncHttpClient):
-        self.http = http
-        self._cache = None
-        self._ts = 0.0
-        self._ttl = 60*60*12
-
-    async def fetch(self, force=False):
-        now = time.time()
-        if not force and self._cache and (now - self._ts) < self._ttl:
-            return self._cache
-        r = await self.http.get(BOOTSTRAP_URL)
-        data = r.json()
-        elements = data.get("elements", [])
-        players_by_id = {str(p["id"]): p for p in elements}
-        players_by_name = {self._norm_name(p.get("web_name","")): p for p in elements}
-        teams_by_id = {t["id"]: t for t in data.get("teams", [])}
-        self._cache = {"raw": data, "players_by_id": players_by_id, "players_by_name": players_by_name, "teams_by_id": teams_by_id}
-        self._ts = now
-        logger.info("Fetched bootstrap-static (players=%d)", len(players_by_id))
-        return self._cache
-
-    def _norm_name(self, s: str) -> str:
-        if not s:
-            return ""
-        return " ".join("".join(ch for ch in s.lower() if ord(ch) < 128).split())
-
-# Embedded PricesService
-class PricesService:
-    def __init__(self):
-        self.http = AsyncHttpClient()
-        self.bootstrap = BootstrapClient(self.http)
-        self.parser_cb = CircuitBreaker()
-        self.bootstrap_cb = CircuitBreaker()
-    async def close(self):
-        await self.http.aclose()
-
-    async def _fetch_live(self):
-        if self.parser_cb.is_open():
-            raise RuntimeError("LiveFPL circuit open")
-        try:
-            r = await self.http.get(LIVEFPL_URL)
-            self.parser_cb.record_success()
-            return r.text
-        except Exception as e:
-            self.parser_cb.record_failure()
-            if LIVEFPL_FAIL:
-                try: LIVEFPL_FAIL.inc()
-                except Exception: pass
-            raise
-
-    async def parse_live_rows(self, html: str) -> List[Dict[str,Any]]:
-        soup = BeautifulSoup(html, "html.parser")
-        rows = []
-        # collect plausible rows containing price symbol
-        for tr in soup.find_all(["tr","div","li"]):
-            txt = tr.get_text(" ", strip=True)
-            if "£" not in txt:
-                continue
-            # extract name heuristics
-            name_el = tr.select_one(".name") or tr.select_one(".player-name") or tr.find("a") or tr.find("td")
-            name = name_el.get_text(" ", strip=True) if name_el else ""
-            # price
-            m = re.search(r"£\s*([0-9]+(?:\.[0-9]+)?)", txt)
-            price = float(m.group(1)) if m else None
-            # predicted %
-            m2 = re.search(r"([0-9]{1,3})\s*%", txt)
-            pred = float(m2.group(1)) if m2 else None
-            rows.append({"name": name, "price": price, "predicted": pred, "raw": txt[:400]})
-        logger.info("Parsed %d live rows heuristically", len(rows))
-        return rows
-
-    async def get_merged(self, force_bootstrap=False):
-        bs = await self.bootstrap.fetch(force=force_bootstrap)
-        try:
-            html = await self._fetch_live()
-            rows = await self.parse_live_rows(html)
-            merged = []
-            for r in rows:
-                norm = self.bootstrap._norm_name(r.get("name") or "")
-                boot = bs["players_by_name"].get(norm)
-                used_fuzzy = False
-                if not boot:
-                    # contains fallback
-                    for name_key, obj in bs["players_by_name"].items():
-                        if norm and (norm in name_key or name_key in norm):
-                            boot = obj
-                            break
-                if not boot:
-                    best, score = best_fuzzy_match(norm, bs["players_by_name"])
-                    if best:
-                        boot = best
-                        used_fuzzy = True
-                        if FUZZY_MATCH:
-                            try: FUZZY_MATCH.inc()
-                            except Exception: pass
-                item = {
-                    "live_name": r.get("name"),
-                    "price_live": r.get("price"),
-                    "predicted": r.get("predicted"),
-                    "bootstrap_used_fuzzy": used_fuzzy,
-                }
-                if boot:
-                    item.update({
-                        "id": str(boot.get("id")),
-                        "name": boot.get("web_name"),
-                        "team": bs["teams_by_id"].get(boot.get("team"), {}).get("name"),
-                        "price_bootstrap": boot.get("now_cost", 0)/10.0,
-                    })
-                else:
-                    item.update({"id": None, "name": r.get("name") or "UNK", "team": None, "price_bootstrap": None})
-                merged.append(item)
-            return {"ok": True, "merged": merged, "note": None}
-        except Exception as e:
-            logger.exception("LiveFPL fetch/parse failed: %s", e)
-            # fallback to bootstrap top players
-            players = list(bs["players_by_id"].values())[:50]
-            fallback = []
-            for p in players:
-                fallback.append({
-                    "id": str(p["id"]),
-                    "name": p.get("web_name"),
-                    "team": bs["teams_by_id"].get(p.get("team"), {}).get("name"),
-                    "price_bootstrap": p.get("now_cost",0)/10.0,
-                    "price_live": None,
-                    "predicted": None,
-                })
-            if LIVEFPL_FAIL:
-                try: LIVEFPL_FAIL.inc()
-                except Exception: pass
-            return {"ok": False, "merged": fallback, "note": "livefpl_unavailable"}
-
-    def _format_price(self, p):
-        if p is None:
-            return "—"
-        if abs(p - round(p)) < 1e-9:
-            return f"£{int(round(p))}"
-        return f"£{p:.1f}"
-
-    def _format_pct(self, v):
-        if v is None:
-            return "—"
-        return f"{v:.0f}%"
-
-    def _render_block(self, title, items, limit=6):
-        if not items:
-            return ""
-        lines = [f"{title}"]
-        for it in items[:limit]:
-            name = it.get("name") or it.get("live_name") or "UNK"
-            team = (it.get("team") or "")[:6]
-            pl = self._format_price(it.get("price_live"))
-            pb = self._format_price(it.get("price_bootstrap"))
-            pct = self._format_pct(it.get("predicted"))
-            lines.append(f"{name:20.20} {team:6.6} {pl:8} {pb:8} {pct:6}")
-        return "\n".join(lines)
-
-    async def prices_text(self, force_bootstrap_refresh=False):
-        res = await self.get_merged(force_bootstrap=force_bootstrap_refresh)
-        merged = res["merged"]
-        # grouping heuristics
-        rises = [x for x in merged if x.get("predicted") and x.get("predicted") >= 60]
-        falls = [x for x in merged if x.get("predicted") and x.get("predicted") <= 40]
-        projected = [x for x in merged if x.get("predicted") and 40 < x.get("predicted") < 60]
-        others = [x for x in merged if x not in rises and x not in falls and x not in projected]
-        parts = []
-        if res.get("note"):
-            parts.append(f"_Note: {res['note']}_\n")
-        for block in [
-            ("🔼 Rises (predicted/high confidence)", rises),
-            ("🔽 Falls (predicted/high confidence)", falls),
-            ("Projected to reach target", projected),
-            ("Others who will be close", others),
-        ]:
-            txt = self._render_block(block[0], block[1])
-            if txt:
-                parts.append(txt)
-        if PRICES_REQUESTS:
-            try: PRICES_REQUESTS.inc()
-            except Exception: pass
-        return "\n\n".join(parts) or "No data available"
-
-    async def price_on_text(self, date_str: str):
-        # try to load historical snapshot; if missing, autogenerate from bootstrap (safe for past dates)
-        try:
-            # validate date
-            from datetime import datetime, timezone, timedelta
-            req_date = datetime.fromisoformat(date_str).date()
-            # refuse future date
-            tz = timezone.utc
-            today = datetime.utcnow().date()
-            if req_date > today:
-                return f"<code>Refuse to create baseline for future date {date_str}</code>"
-        except Exception:
-            return "<code>Invalid date format. Use YYYY-MM-DD</code>"
-
-        snap = load_baseline_map_local(date_str)
-        if snap is None:
-            # autogenerate
-            bs = await self.bootstrap.fetch(force=False)
-            elements = bs["raw"].get("elements", []) if bs and "raw" in bs else []
-            new_map = {str(el["id"]): int(el.get("now_cost", 0)) for el in elements}
-            # save
-            save_baseline_map_local(new_map, date_str)
-            if AUTOGEN_BASELINE:
-                try: AUTOGEN_BASELINE.inc()
-                except Exception: pass
-            snap = new_map
-        # produce simple listing of first 20 players from snapshot
-        out = [f"Price-on {date_str} (generated from bootstrap if needed):"]
-        count = 0
-        for pid, cost in list(snap.items())[:20]:
-            cost_f = cost / 10.0
-            # find name from bootstrap mapping
-            bs = await self.bootstrap.fetch()
-            pname = bs["players_by_id"].get(str(pid), {}).get("web_name", "UNK")
-            out.append(f"{pname:20.20} {self._format_price(cost_f)}")
-            count += 1
-        return "\n".join(out)
-
-# Singleton service
-_SERVICE: Optional[PricesService] = None
-async def get_service():
-    global _SERVICE
-    if _SERVICE is None:
-        _SERVICE = PricesService()
-    return _SERVICE
-
-# Integration wrappers for bot handlers
-async def handle_prices_command(force_refresh: bool=False):
-    svc = await get_service()
-    try:
-        return await svc.prices_text(force_bootstrap_refresh=force_refresh)
-    except Exception as e:
-        logger.exception("handle_prices_command failed")
-        return f"Error: {e}"
-
-async def handle_price_on_command(date_str: str):
-    svc = await get_service()
-    try:
-        return await svc.price_on_text(date_str)
-    except Exception as e:
-        logger.exception("handle_price_on_command failed")
-        return f"Error: {e}"
-
-# Simple CLI test
-# --- END: Embedded enterprise prices subsystem ---
