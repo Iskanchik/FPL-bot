@@ -1,8 +1,6 @@
 # fpl_bot.py
-# Enterprise-focused FPL Prices Bot (subset: /prices, /price_on, /help)
-# Changes for "C" level: robust /prices and /price_on, baseline-only-from-bootstrap,
-# width-aware monospace formatting, protection vs future-date baseline generation,
-# bootstrap cache lock, parser improvements, dedupe, truncation/shortening.
+# Full-D enterprise rewrite: robust /prices, /price_on, baseline only from bootstrap,
+# monospace WIDTH_LIMIT=40, display-width-aware truncation, improved parser & snapshots.
 
 import os
 import sys
@@ -48,7 +46,7 @@ FPL_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
 LIVEFPL_PRICES = "https://www.livefpl.net/prices"
 
 # Formatting limits
-WIDTH_LIMIT = 40  # max display width for monospace lines
+WIDTH_LIMIT = 40  # display width limit for monospace messages
 
 if not BOT_TOKEN or OWNER_ID <= 0 or ALLOWED_GROUP_ID == 0:
     print("BOT_TOKEN, OWNER_ID, ALLOWED_GROUP_ID must be set", file=sys.stderr)
@@ -77,7 +75,7 @@ def inc_metric(name: str, v: int = 1):
     MET[name] += v
 
 # -------------------------
-# Upstash REST client (minimal, resilient)
+# Upstash minimal client (REST)
 # -------------------------
 class UpstashClient:
     def __init__(self, base: str, token: str, timeout: int = HTTP_TIMEOUT):
@@ -107,8 +105,7 @@ class UpstashClient:
         except Exception:
             return None
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
-           retry=retry_if_exception_type(httpx.TransportError))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def hgetall(self, key: str) -> Dict[str, str]:
         j = await self._get(f"hgetall/{key}")
         if not j:
@@ -117,8 +114,7 @@ class UpstashClient:
             return {k: str(v) for k, v in j["result"].items()}
         return {k: str(v) for k, v in (j or {}).items()}
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
-           retry=retry_if_exception_type(httpx.TransportError))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def hset_map(self, key: str, mapping: Dict[str, str]):
         if not mapping:
             return
@@ -128,8 +124,7 @@ class UpstashClient:
         path = "/".join(parts)
         await self._get(path)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
-           retry=retry_if_exception_type(httpx.TransportError))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def get(self, key: str) -> Optional[str]:
         j = await self._get(f"get/{key}")
         if not j:
@@ -138,13 +133,11 @@ class UpstashClient:
             return None if j["result"] is None else str(j["result"])
         return None
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
-           retry=retry_if_exception_type(httpx.TransportError))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def set(self, key: str, value: str):
         await self._get(f"set/{key}/{value}")
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
-           retry=retry_if_exception_type(httpx.TransportError))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def incr(self, key: str) -> Optional[int]:
         j = await self._get(f"incr/{key}")
         if not j:
@@ -156,8 +149,7 @@ class UpstashClient:
                 return None
         return None
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4),
-           retry=retry_if_exception_type(httpx.TransportError))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=4), retry=retry_if_exception_type(httpx.TransportError))
     async def expire(self, key: str, seconds: int):
         await self._get(f"expire/{key}/{seconds}")
 
@@ -170,8 +162,7 @@ class HttpClient:
     def __init__(self, timeout=HTTP_TIMEOUT):
         self._client = httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "FPL-Enterprise-Bot/1.0"})
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=6),
-           retry=retry_if_exception_type((httpx.TransportError, httpx.ReadTimeout)))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=6), retry=retry_if_exception_type((httpx.TransportError, httpx.ReadTimeout)))
     async def get_text(self, url: str) -> Optional[str]:
         r = await self._client.get(url)
         if r.status_code != 200:
@@ -187,7 +178,7 @@ class HttpClient:
 _http = HttpClient()
 
 # -------------------------
-# Bootstrap cache + helpers (with lock)
+# Bootstrap cache with lock
 # -------------------------
 _BOOTSTRAP_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None, "elements": [], "el_map": {}, "name_index": {}, "events": []}
 BOOTSTRAP_TTL = BOOTSTRAP_TTL_SECS
@@ -299,7 +290,7 @@ def find_element_by_name_smart(name: str, team_hint: str, pos_hint: str, price_h
     return candidates[0]
 
 # -------------------------
-# Robust parser: tolerant row + hybrid html parse
+# Parser: tolerant row extraction + robust hybrid html parse
 # -------------------------
 def sanitize_name(s: Optional[str]) -> str:
     if not s:
@@ -319,18 +310,17 @@ def sanitize_price_val(s: Optional[str]) -> Optional[float]:
         return None
 
 def _parse_row_tolerant(cells: List[str]) -> Dict[str, str]:
-    # improved tolerant parser: extract price, percents, pos, team, and name even if order is messy
     out = {"Name": "", "Pos": "", "Team": "", "Price": "", "Target": "", "Owned by": ""}
     tokens = [c.strip() for c in cells if c and c.strip() != ""]
     if not tokens:
         return out
-    # detect percents anywhere
+    # percents
     perc = [t for t in tokens if "%" in t]
     if perc:
         out["Owned by"] = perc[-1]
         if len(perc) >= 2:
             out["Target"] = perc[-2]
-    # detect price token: find first token that looks like price or startswith £
+    # price token
     price_tok = ""
     for t in tokens:
         if "£" in t or re.match(r"^\d+(\.\d+)?$", t):
@@ -338,46 +328,37 @@ def _parse_row_tolerant(cells: List[str]) -> Dict[str, str]:
             break
     if price_tok:
         out["Price"] = price_tok.replace("£", "").strip()
-    # try to extract role tokens and team abbreviation tokens
+    # role tokens and candidates
     role_tokens = {"GKP", "DEF", "MID", "FWD", "GK", "DF", "MF", "FW"}
-    candidates = []
+    cand = []
     for t in tokens:
         if t == price_tok or "%" in t:
             continue
-        # if token contains role (e.g., "DEF") or single 3-letter team code -> handle
         if any(rt in t for rt in role_tokens):
             parts = t.split()
             for p in parts:
                 pu = p.upper()
                 if pu in role_tokens and not out["Pos"]:
                     out["Pos"] = pu
+                elif re.match(r"^\d+(\.\d+)?$", p) and not out["Price"]:
+                    out["Price"] = p
                 else:
-                    candidates.append(p)
+                    cand.append(p)
             continue
-        # team-like short alpha
-        if len(t) <= 4 and t.isalpha() and t.isupper():
-            if not out["Team"]:
-                out["Team"] = t.upper()
-            else:
-                candidates.append(t)
-            continue
-        candidates.append(t)
-    # Heuristic: if first candidate ends with ',' or contains ',' split to name parts
-    if candidates:
-        # join cand and then try to strip trailing annotations like "(injury)" or "*"
-        joined = " ".join(candidates)
-        joined = re.sub(r"\s*\(.*?\)", "", joined)  # remove parentheses
+        cand.append(t)
+    if cand:
+        joined = " ".join(cand)
+        joined = re.sub(r"\s*\(.*?\)", "", joined)
         joined = joined.replace("*", "").strip()
         out["Name"] = sanitize_name(joined)
     else:
-        # fallback: find first token that looks like a name (contains letters)
         for t in tokens:
             if t == price_tok or "%" in t:
                 break
             if re.search(r"[A-Za-zА-Яа-я]", t):
                 out["Name"] = sanitize_name(t)
                 break
-    # fallback team from later cells if still empty
+    # fallback team
     if not out["Team"] and len(cells) >= 2:
         c1 = cells[1].strip()
         if len(c1) <= 4 and c1.isalpha():
@@ -390,8 +371,7 @@ def _parse_row_tolerant(cells: List[str]) -> Dict[str, str]:
 
 def _find_section_nodes(soup: BeautifulSoup, hints: List[str]):
     nodes = {}
-    # broadened candidate search to include more tags
-    candidates = soup.find_all(["h1","h2", "h3", "h4", "strong", "caption", "p", "div", "section"])
+    candidates = soup.find_all(["h1","h2","h3","h4","strong","caption","p","div","section"])
     for hint in hints:
         hint_low = hint.lower()
         node = None
@@ -425,10 +405,8 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
             if not tbl and node.name == "table":
                 tbl = node
         if tbl:
-            # parse table robustly: sometimes header rows are present
             for tr in tbl.find_all("tr"):
-                # get all td and also fallback to th if td absent
-                cells = tr.find_all(["td", "th"])
+                cells = tr.find_all(["td","th"])
                 tds = [td.get_text(" ", strip=True) for td in cells]
                 if not tds:
                     continue
@@ -436,25 +414,21 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
                 rows.append(parsed)
         else:
             if node:
-                # parse adjacent list items or paragraphs
                 sibs = []
                 for sib in node.find_next_siblings(limit=20):
-                    if sib.name in ("h2","h3","h4") or (hasattr(sib,"get") and sib.get("id")):
+                    if sib.name and sib.name.startswith("h"):
                         break
                     sibs.append(sib)
                 for s in sibs:
-                    if s.name == "li":
-                        txt = s.get_text(" ", strip=True)
-                        parsed = _parse_row_tolerant([txt])
-                        rows.append(parsed)
-                    elif s.name in ("p","div"):
-                        txt = s.get_text(" ", strip=True)
-                        # split by line breaks if multiple entries
-                        for part in re.split(r"\n+", txt):
-                            if part.strip():
-                                parsed = _parse_row_tolerant([part.strip()])
-                                rows.append(parsed)
-        # dedupe by name + price (case-insensitive)
+                    txt = s.get_text(" ", strip=True)
+                    if not txt:
+                        continue
+                    # split by common separators
+                    for part in re.split(r"\s{2,}|\n+", txt):
+                        if part.strip():
+                            parsed = _parse_row_tolerant([part.strip()])
+                            rows.append(parsed)
+        # dedupe by (name, price)
         seen = set()
         final = []
         for r in rows:
@@ -465,7 +439,7 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
             if (r.get("Name") or "").strip():
                 final.append(r)
         sections[hint] = final
-    # rises/falls mapping
+    # rises/falls map
     name_dir_map = {}
     for r in sections.get("Predicted Rises", []) or []:
         n = (r.get("Name") or "").strip()
@@ -475,7 +449,7 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
         n = (r.get("Name") or "").strip()
         if n:
             name_dir_map[n.lower()] = "fall"
-    # enrich with bootstrap (best-effort)
+    # enrich with bootstrap
     try:
         data = await fetch_bootstrap_cached()
         elements = data.get("elements", []) if data else []
@@ -527,7 +501,7 @@ async def hybrid_parse_livefpl(html_text: str, hints: Optional[List[str]] = None
     return sections
 
 # -------------------------
-# Utilities & formatting (monospace, width limit, name shortening, display width estimate)
+# Utilities & formatting (monospace, width-aware truncation)
 # -------------------------
 def parse_percent(s: str) -> float:
     try:
@@ -548,7 +522,6 @@ def emoji_for_direction(direction: str) -> str:
         return "🔽"
     return "▫"
 
-# approximate display width: count wide characters as 2 (CJK, emoji heuristics)
 import unicodedata
 def display_width(s: str) -> int:
     w = 0
@@ -557,8 +530,7 @@ def display_width(s: str) -> int:
         if ea in ("F", "W"):
             w += 2
         else:
-            # heuristic: many emoji sit in ranges > 0x1F000
-            if ord(ch) >= 0x1F000:
+            if ord(ch) >= 0x1F000:  # many emoji
                 w += 2
             else:
                 w += 1
@@ -568,12 +540,11 @@ def clamp_display(s: str, max_width: int) -> str:
     s = (s or "").strip()
     if display_width(s) <= max_width:
         return s
-    # build truncated piece by piece
     out = ""
     cur = 0
     for ch in s:
         chw = 2 if (unicodedata.east_asian_width(ch) in ("F","W") or ord(ch) >= 0x1F000) else 1
-        if cur + chw > max_width - 1:  # reserve 1 for ellipsis
+        if cur + chw > max_width - 1:
             break
         out += ch
         cur += chw
@@ -590,40 +561,31 @@ def shorten_name_for_width(name: str, max_len: int) -> str:
         short = f"{first[0]}. {last}"
         if display_width(short) <= max_len:
             return short
-        # try last + initial
         last_only = parts[-1]
         short2 = f"{last_only} {first[0]}."
         if display_width(short2) <= max_len:
             return short2
-    # fallback to clamp_display
     return clamp_display(name, max_len)
 
 def compose_mono_line(team: str, pos: str, price: str, name: str, emoji: str, tgt: str) -> str:
-    # dynamic allocation to respect WIDTH_LIMIT (in display width)
     left = team.upper()
     if pos:
         left = f"{left} {pos.upper()}"
     price = (price or "").strip()
     tgtpart = (emoji + (" " + tgt if tgt else "")).strip()
-    # reserve minimal widths
     left_max = 10
     price_max = 7
     tgt_max = 7
-    # compute name_max based on display widths reserved
+    # reserve widths by minimum of left_max and actual width
     reserved = min(left_max, display_width(left)) + 2 + min(price_max, display_width(price)) + 2 + min(tgt_max, display_width(tgtpart))
-    # give separators 4 visible chars approx
     name_max = max(6, WIDTH_LIMIT - reserved)
     left_c = clamp_display(left, left_max)
     price_c = clamp_display(price, price_max)
     name_c = shorten_name_for_width(name, name_max)
     tgt_c = clamp_display(tgtpart, tgt_max)
     pieces = [p for p in [left_c, price_c, name_c, tgt_c] if p]
-    # join with two spaces for readability
     line = "  ".join(pieces)
-    # final clamp to WIDTH_LIMIT by display width
     if display_width(line) > WIDTH_LIMIT:
-        # greedily trim name part
-        # find name index
         if name_c and name_c in line:
             pre, post = line.split(name_c, 1)
             available = WIDTH_LIMIT - display_width(pre) - display_width(post)
@@ -631,7 +593,6 @@ def compose_mono_line(team: str, pos: str, price: str, name: str, emoji: str, tg
                 name_c2 = clamp_display(name_c, max(3, available))
                 line = pre + name_c2 + post
             else:
-                # fallback full truncation
                 line = clamp_display(line, WIDTH_LIMIT)
         else:
             line = clamp_display(line, WIDTH_LIMIT)
@@ -652,7 +613,7 @@ def format_prices_mono(sections: Dict[str, List[Dict[str, Any]]], el_map: Dict[i
             try:
                 team_abbr = "UNK"
                 el_id = None
-                for k in ("element", "id", "Element"):
+                for k in ("element","id","Element"):
                     try:
                         if k in r:
                             el_id = int(r[k])
@@ -693,10 +654,10 @@ def format_prices_mono(sections: Dict[str, List[Dict[str, Any]]], el_map: Dict[i
     return "<pre>" + "\n\n".join(out_blocks) + "</pre>"
 
 # -------------------------
-# Persistence keys & helpers (baseline only from bootstrap)
+# Baseline persistence (bootstrap-only)
 # Keys:
-# - fpl:prices:current          (hash)
-# - fpl:prices:<YYYY-MM-DD>    (hash snapshots)
+# - fpl:prices:current
+# - fpl:prices:<YYYY-MM-DD>
 # -------------------------
 async def save_baseline_map(new_map: Dict[str,int], date_iso: Optional[str] = None):
     try:
@@ -737,13 +698,10 @@ async def _load_daily_baseline_async(date_str: str) -> Optional[Dict[str,int]]:
         return None
 
 async def bootstrap_snapshot_for_date(date_iso: str) -> Optional[Dict[str,int]]:
-    # Only allow autogeneration for dates up to 'today' in configured timezone and within current season
     try:
-        # ensure bootstrap cache loaded
         data = await fetch_bootstrap_cached(force=True)
         if not data:
             return None
-        # date safety checks
         try:
             req_date = datetime.fromisoformat(date_iso).date()
         except Exception:
@@ -753,7 +711,6 @@ async def bootstrap_snapshot_for_date(date_iso: str) -> Optional[Dict[str,int]]:
         if req_date > today_local:
             logger.warning("Refuse to create baseline for future date %s (today %s)", date_iso, today_local.isoformat())
             return None
-        # ensure in season
         drange = current_season_date_range()
         if drange:
             start_dt, end_dt = drange
@@ -762,7 +719,6 @@ async def bootstrap_snapshot_for_date(date_iso: str) -> Optional[Dict[str,int]]:
                 return None
         elements = data.get("elements", []) or []
         new_map = {str(el["id"]): int(el.get("now_cost", 0)) for el in elements}
-        # Save snapshot for requested date
         await save_baseline_map(new_map, date_iso=date_iso)
         return new_map
     except Exception:
@@ -770,11 +726,10 @@ async def bootstrap_snapshot_for_date(date_iso: str) -> Optional[Dict[str,int]]:
         return None
 
 # -------------------------
-# Price detector service
+# Price detector & baseline updater
 # -------------------------
 class PriceDetectorService:
     async def build_prices_msg(self) -> str:
-        # LiveFPL-driven for projections; circuit breaker prevents repeated failures
         if livefpl_cb.is_open():
             return "<code>LiveFPL temporarily unavailable</code>"
         try:
@@ -788,7 +743,7 @@ class PriceDetectorService:
             sections = await hybrid_parse_livefpl(txt)
             if not sections:
                 return "<code>No price projections parsed.</code>"
-            await fetch_bootstrap_cached()  # ensure bootstrap data ready for enrichment/teams
+            await fetch_bootstrap_cached()
             el_map = _BOOTSTRAP_CACHE.get("el_map", {})
             return format_prices_mono(sections, el_map)
         except Exception:
@@ -812,7 +767,6 @@ class PriceDetectorService:
         return out
 
     async def detect_changes_and_update_baseline(self) -> Optional[List[Tuple[str,int,int]]]:
-        # Build current baseline from bootstrap and compare to stored fpl:prices:current
         try:
             data = await fetch_bootstrap_cached(force=True)
             if not data:
@@ -834,7 +788,6 @@ class PriceDetectorService:
             old_map = {}
         changes = self.detect_between_maps(old_map, new_map)
         if changes:
-            # save as current and snapshot for today
             today_str = datetime.utcnow().astimezone(timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))).date().isoformat()
             await save_baseline_map(new_map, date_iso=today_str)
             try:
@@ -842,7 +795,6 @@ class PriceDetectorService:
             except Exception:
                 pass
         else:
-            # if no baseline existed, save one
             if not old_map:
                 today_str = datetime.utcnow().astimezone(timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))).date().isoformat()
                 await save_baseline_map(new_map, date_iso=today_str)
@@ -886,7 +838,7 @@ class CircuitBreaker:
 livefpl_cb = CircuitBreaker()
 
 # -------------------------
-# Rate limiter (Upstash incr + in-memory fallback)
+# Rate limiter (Upstash INCR + in-memory fallback)
 # -------------------------
 in_memory_rl: Dict[int, List[int]] = {}
 
@@ -909,7 +861,7 @@ async def rate_limit_check(user_id: int) -> bool:
         return True
 
 # -------------------------
-# Authorization (simple owner + group + whitelist)
+# Authorization
 # -------------------------
 _allowed_users: Set[int] = set()
 
@@ -941,7 +893,6 @@ async def is_authorized_update(update: Update) -> bool:
         uid = int(user.id)
         if uid == OWNER_ID and chat.type == "private":
             return True
-        # allowed group: add to whitelist as side effect
         if chat.id == ALLOWED_GROUP_ID:
             if uid not in _allowed_users:
                 _allowed_users.add(uid)
@@ -970,7 +921,7 @@ async def send_message_secure(app: Application, text: str, *, silent: bool = Tru
         inc_metric("send_errors")
 
 # -------------------------
-# Handler guard decorator
+# Handler guard
 # -------------------------
 def handler_guard(fn):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1005,7 +956,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized_update(update):
         return
     text = (
-        "FPL Prices Bot (Enterprise — subset)\n"
+        "FPL Prices Bot (Enterprise)\n"
         "/prices — show LiveFPL price projections (compact, mobile)\n"
         "/price_on YYYY-MM-DD — show changes between that day and next day (baseline from bootstrap)\n"
         "/help — show this help\n"
@@ -1039,62 +990,69 @@ async def price_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
         return
-    # ensure date is within current season range
-    await fetch_bootstrap_cached()  # ensure events are loaded
+    await fetch_bootstrap_cached()
     drange = current_season_date_range()
+    if drange:
+        start_dt, end
+            drange = current_season_date_range()
     if drange:
         start_dt, end_dt = drange
         if not (start_dt.date() <= req_date <= end_dt.date()):
             await update.message.reply_text(f"Date {date_str} outside current season range.")
             return
-    # do not allow generating baseline for future dates
+
     tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
     today_local = datetime.utcnow().astimezone(tz_base).date()
     if req_date > today_local:
         await update.message.reply_text(f"Refuse to generate baseline for future date {date_str}.")
         return
-    # load snapshot strictly from Upstash; if absent, generate from bootstrap and save (only allowed for dates <= today and in-season)
+
     day1 = await _load_daily_baseline_async(date_str)
     if not day1:
         day1 = await bootstrap_snapshot_for_date(date_str)
         if not day1:
             await update.message.reply_text(f"No baseline for {date_str} and auto-generation failed.")
             return
+
     next_day_dt = req_date + timedelta(days=1)
     next_day = next_day_dt.isoformat()
-    if next_day_dt.date() > today_local:
-        # don't generate snapshot for next day if it's future
+    if next_day_dt > today_local:
         await update.message.reply_text(f"Cannot compare to future date {next_day}.")
         return
+
     day2 = await _load_daily_baseline_async(next_day)
     if not day2:
         day2 = await bootstrap_snapshot_for_date(next_day)
         if not day2:
             await update.message.reply_text(f"No baseline for {next_day} and auto-generation failed.")
             return
+
     changes = price_service.detect_between_maps(day1, day2)
     if not changes:
         await update.message.reply_text(f"<code>No changes between {date_str} and {next_day}</code>", parse_mode="HTML")
         return
-    # show changes in monospace with width limit (use display width aware shortening)
-    await fetch_bootstrap_cached()  # ensure el_map
+
+    await fetch_bootstrap_cached()
     el_map = _BOOTSTRAP_CACHE.get("el_map", {})
+
     lines = [f"<pre>Price changes {date_str} → {next_day}"]
     for eid, o, n in changes:
         el = el_map.get(int(eid), {})
         nm = el.get("web_name", f"id:{eid}")
-        # allocate space: leaving room for "  4.4 → 4.5" etc
+
         tail = f" {o/10:.1f} → {n/10:.1f}"
         tail_w = display_width(tail)
+
         name_max = max(6, WIDTH_LIMIT - tail_w - 1)
         nm_short = shorten_name_for_width(nm, name_max)
-        # pad to align visually with spaces (no strict byte ljust; keep monospace look)
-        lines.append(f"{nm_short}{' ' * max(1, WIDTH_LIMIT - display_width(nm_short) - tail_w)}{tail}")
+
+        space_count = max(1, WIDTH_LIMIT - display_width(nm_short) - tail_w)
+        lines.append(f"{nm_short}{' ' * space_count}{tail}")
+
     lines.append("</pre>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-# -------------------------
-# Background: daily snapshot & supervisor
+    # -------------------------
+# Background: snapshots & supervisor
 # -------------------------
 _bg_task: Optional[asyncio.Task] = None
 _shutdown = False
@@ -1105,9 +1063,11 @@ def next_daily_utc5(hour:int, minute:int, now: Optional[datetime]=None) -> datet
         now = datetime.now(timezone.utc)
     tz_base = timezone(timedelta(hours=PRICE_CHANGE_UTC_PLUS))
     local_now = now.astimezone(tz_base)
+
     target_local = datetime.combine(local_now.date(), dt_time(hour, minute), tzinfo=tz_base)
     if local_now >= target_local:
         target_local = target_local + timedelta(days=1)
+
     return target_local.astimezone(timezone.utc)
 
 async def sleep_until(target_dt_utc: datetime):
@@ -1127,6 +1087,7 @@ async def daily_snapshot_task(app: Application):
                 logger.info("Initial baseline updated with %d changes", len(changes))
         except Exception:
             logger.exception("Initial baseline update failed")
+
         while not _shutdown:
             next_run = next_daily_utc5(6, 0)
             await sleep_until(next_run)
@@ -1160,7 +1121,7 @@ def start_supervisor(loop, tasks_getter, restart_fn, interval=30):
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception("Supervisor crashed loop")
+                logger.exception("Supervisor crashed")
                 await asyncio.sleep(interval)
     return loop.create_task(_loop())
 
@@ -1170,11 +1131,7 @@ async def restart_background_task(name: str):
         if _bg_task and not _bg_task.done():
             _bg_task.cancel()
         _bg_task = asyncio.create_task(daily_snapshot_task(APP_INSTANCE))
-
-# -------------------------
-# HTTP server for health/metrics
-# -------------------------
-START_TIME_DT = datetime.utcnow()
+        START_TIME_DT = datetime.utcnow()
 
 async def handle_health(request):
     data = {
@@ -1197,28 +1154,32 @@ async def start_http_server():
     app = web.Application()
     app.router.add_get("/health", handle_health)
     app.router.add_get("/metrics", handle_metrics)
+
     runner = web.AppRunner(app)
     await runner.setup()
+
     site = web.TCPSite(runner, "0.0.0.0", METRICS_PORT)
     await site.start()
-    logger.info("HTTP server started on port %s", METRICS_PORT)
+
+    logger.info("HTTP server started on %s", METRICS_PORT)
+
     while not _shutdown:
         await asyncio.sleep(1)
-
-# -------------------------
-# Lifecycle: start/stop background tasks
-# -------------------------
 async def start_background_tasks(app: Application):
     try:
         await load_allowed_users()
         await fetch_bootstrap_cached()
+
         global _bg_task, _supervisor_task, APP_INSTANCE
         APP_INSTANCE = app
         loop = asyncio.get_event_loop()
+
         if _bg_task is None or _bg_task.done():
             _bg_task = asyncio.create_task(daily_snapshot_task(app))
+
         def tasks_getter():
             return {"daily_snapshot": _bg_task}
+
         _supervisor_task = start_supervisor(loop, tasks_getter, restart_background_task, interval=30)
         loop.create_task(start_http_server())
         logger.info("Background tasks started")
@@ -1228,47 +1189,47 @@ async def start_background_tasks(app: Application):
 async def stop_background_tasks():
     global _bg_task, _supervisor_task, _shutdown
     _shutdown = True
+
     tasks = [_bg_task, _supervisor_task]
     for t in tasks:
         if t:
             t.cancel()
+
     await asyncio.sleep(0.2)
     try:
         await _http.close()
         await _upstash.close()
     except Exception:
         pass
-
-# -------------------------
-# Async no-op for MessageHandler (prevents TypeError from sync lambda)
-# -------------------------
-async def _noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async def _noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
-# -------------------------
-# App builder and run
-# -------------------------
 def build_app():
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("prices", prices_cmd))
     app.add_handler(CommandHandler("price_on", price_on_cmd))
-    # use async no-op to avoid TypeError: object NoneType can't be used in 'await' expression
+
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), _noop))
+
     async def _on_start(_app: Application):
         logger.info("Bot started (PTB %s)", PTB_VERSION)
         try:
             await _app.bot.set_my_commands([
-                ("help","Show help and commands"),
-                ("prices","Show LiveFPL price projections"),
-                ("price_on","Show changes between days"),
+                ("help","Show help"),
+                ("prices","Show price projections"),
+                ("price_on","Show day-to-day price change"),
             ])
         except Exception:
             logger.exception("Failed to set commands")
+
         await start_background_tasks(_app)
+
     async def _on_stop(_app: Application):
         logger.info("Bot stopping")
         await stop_background_tasks()
+
     app.post_init = _on_start
     app.post_shutdown = _on_stop
     return app
